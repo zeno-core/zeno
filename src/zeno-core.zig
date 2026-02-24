@@ -16,3 +16,14 @@ test "step 1 facade exposes the migration skeleton" {
     _ = official;
     _ = types;
 }
+
+test "core facade excludes logical collection contract types" {
+    const testing = @import("std").testing;
+
+    try testing.expect(!@hasDecl(types, "HashWrite"));
+    try testing.expect(!@hasDecl(types, "HashGetAllResult"));
+    try testing.expect(!@hasDecl(types, "SetMembersResult"));
+    try testing.expect(!@hasDecl(types, "ListRangeResult"));
+    try testing.expect(!@hasDecl(types, "ZSetRangeResult"));
+    try testing.expect(!@hasDecl(types, "LogicalScanPageResult"));
+}

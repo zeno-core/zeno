@@ -27,3 +27,15 @@ test "core facade excludes logical collection contract types" {
     try testing.expect(!@hasDecl(types, "ZSetRangeResult"));
     try testing.expect(!@hasDecl(types, "LogicalScanPageResult"));
 }
+
+test "package root exposes only the contract facades" {
+    const testing = @import("std").testing;
+
+    try testing.expect(@hasDecl(@This(), "public"));
+    try testing.expect(@hasDecl(@This(), "official"));
+    try testing.expect(@hasDecl(@This(), "types"));
+    try testing.expect(!@hasDecl(@This(), "engine"));
+    try testing.expect(!@hasDecl(@This(), "runtime"));
+    try testing.expect(!@hasDecl(@This(), "storage"));
+    try testing.expect(!@hasDecl(@This(), "internal"));
+}

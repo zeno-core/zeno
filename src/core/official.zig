@@ -23,9 +23,9 @@ pub const Error = engine_db.EngineError;
 
 /// Scans the next prefix page inside a consistent read view.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(1) in the finalized skeleton.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Does not allocate in the finalized skeleton; returns `error.NotImplemented`.
 pub fn scan_prefix_from_in_view(
     view: *const ReadView,
     allocator: std.mem.Allocator,
@@ -38,9 +38,9 @@ pub fn scan_prefix_from_in_view(
 
 /// Scans the next range page inside a consistent read view.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(1) in the finalized skeleton.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Does not allocate in the finalized skeleton; returns `error.NotImplemented`.
 pub fn scan_range_from_in_view(
     view: *const ReadView,
     allocator: std.mem.Allocator,
@@ -53,9 +53,9 @@ pub fn scan_range_from_in_view(
 
 /// Applies one checked batch under the official advanced contract.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(1) in the finalized skeleton.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Does not allocate in the finalized skeleton; returns `error.NotImplemented`.
 pub fn apply_checked_batch(db: *Database, batch: CheckedBatch) Error!void {
     return engine_db.apply_checked_batch(db, batch);
 }

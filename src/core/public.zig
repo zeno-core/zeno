@@ -14,18 +14,18 @@ pub const Error = engine_db.EngineError;
 
 /// Creates an in-memory engine handle.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(s), where `s` is the runtime shard count.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Allocates the engine handle and runtime state from `allocator`.
 pub fn create(allocator: std.mem.Allocator) Error!*Database {
     return engine_db.create(allocator);
 }
 
 /// Opens an engine handle from the provided runtime options.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(s), where `s` is the runtime shard count, when persistence is not requested.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Allocates the engine handle and runtime state from `allocator` when persistence is not requested.
 pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) Error!*Database {
     return engine_db.open(allocator, options);
 }

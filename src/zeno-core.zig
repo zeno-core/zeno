@@ -1,4 +1,4 @@
-//! Stable facade root for the zeno-core package skeleton.
+//! Stable facade root for the zeno-core package.
 //! Cost: O(1) module reexports only.
 //! Allocator: Does not allocate.
 
@@ -11,7 +11,7 @@ pub const official = @import("core/official.zig");
 /// Public access point for core-facing types.
 pub const types = @import("core/types.zig");
 
-test "step 1 facade exposes the migration skeleton" {
+test "package root exposes contract modules" {
     _ = public;
     _ = official;
     _ = types;

@@ -10,7 +10,7 @@ const storage_wal = @import("../storage/wal.zig");
 /// Number of shards in the runtime execution state.
 pub const NUM_SHARDS: usize = runtime_shard.NUM_SHARDS;
 
-/// Runtime counters kept local to engine state during the migration.
+/// Runtime counters kept local to engine state.
 pub const RuntimeCounters = struct {
     ops_put_total: std.atomic.Value(u64),
     ops_get_total: std.atomic.Value(u64),

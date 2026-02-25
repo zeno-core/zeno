@@ -9,7 +9,7 @@ const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
 const write = @import("write.zig");
 
-/// Shared error set for the step 3 engine skeleton.
+/// Shared error set for engine contract operations.
 pub const EngineError = error{
     NotImplemented,
     OutOfMemory,
@@ -34,9 +34,9 @@ pub const Database = struct {
 
     /// Writes a consistent checkpoint of engine-owned state.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1) until checkpoint persistence is implemented.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate; returns `error.NotImplemented` until checkpoint persistence is implemented.
     pub fn checkpoint(self: *Database) EngineError!void {
         return lifecycle.checkpoint(self);
     }
@@ -60,7 +60,7 @@ pub const Database = struct {
     ///
     /// Ownership: Clones `value` into engine-owned storage before the call returns.
     ///
-    /// Thread Safety: Safe for concurrent use with other point operations; acquires one shard-exclusive lock internally.
+    /// Thread Safety: Safe for concurrent use with other point operations; acquires the global visibility gate exclusively before taking one shard-exclusive lock.
     pub fn put(self: *Database, key: []const u8, value: *const types.Value) EngineError!void {
         return write.put(&self.state, key, value);
     }
@@ -71,16 +71,16 @@ pub const Database = struct {
     ///
     /// Allocator: Does not allocate; frees engine-owned key and value storage when the key exists.
     ///
-    /// Thread Safety: Safe for concurrent use with other point operations; acquires one shard-exclusive lock internally.
+    /// Thread Safety: Safe for concurrent use with other point operations; acquires the global visibility gate exclusively before taking one shard-exclusive lock.
     pub fn delete(self: *Database, key: []const u8) bool {
         return write.delete(&self.state, key);
     }
 
     /// Sets or clears key expiration at an absolute unix-second timestamp.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1) until expiration semantics are implemented.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate; returns `error.NotImplemented` until expiration semantics are implemented.
     pub fn expire_at(self: *Database, key: []const u8, unix_seconds: ?i64) EngineError!bool {
         _ = self;
         _ = key;
@@ -90,9 +90,9 @@ pub const Database = struct {
 
     /// Returns Redis-style TTL for one plain key.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1) until expiration semantics are implemented.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate; returns `error.NotImplemented` until expiration semantics are implemented.
     pub fn ttl(self: *const Database, key: []const u8) EngineError!i64 {
         _ = self;
         _ = key;
@@ -101,11 +101,11 @@ pub const Database = struct {
 
     /// Performs a full prefix scan over the current visible state.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1) until scan behavior is implemented.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate; returns `error.NotImplemented` until scan behavior is implemented.
     ///
-    /// Ownership: No result is returned in the step 3 skeleton.
+    /// Ownership: Does not return a result until scan behavior is implemented.
     pub fn scan_prefix(
         self: *const Database,
         allocator: std.mem.Allocator,
@@ -119,11 +119,11 @@ pub const Database = struct {
 
     /// Performs a full range scan over the current visible state.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1) until scan behavior is implemented.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate; returns `error.NotImplemented` until scan behavior is implemented.
     ///
-    /// Ownership: No result is returned in the step 3 skeleton.
+    /// Ownership: Does not return a result until scan behavior is implemented.
     pub fn scan_range(
         self: *const Database,
         allocator: std.mem.Allocator,
@@ -137,9 +137,9 @@ pub const Database = struct {
 
     /// Applies one plain atomic batch.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1) until batch execution is implemented.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate; returns `error.NotImplemented` until batch execution is implemented.
     pub fn apply_batch(self: *Database, writes: []const types.PutWrite) EngineError!void {
         _ = self;
         _ = writes;
@@ -148,20 +148,23 @@ pub const Database = struct {
 
     /// Opens one consistent read view.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(1).
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Does not allocate.
+    ///
+    /// Ownership: Returns a `ReadView` that borrows the engine runtime state until `deinit` is called.
+    ///
+    /// Thread Safety: Acquires the shared side of the global visibility gate and keeps it held for the lifetime of the returned `ReadView`.
     pub fn read_view(self: *Database) EngineError!types.ReadView {
-        _ = self;
-        return error.NotImplemented;
+        return read.read_view(&self.state);
     }
 };
 
 /// Creates an in-memory engine handle.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(s), where `s` is the runtime shard count.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Allocates the engine handle and runtime state from `allocator`.
 pub fn create(allocator: std.mem.Allocator) EngineError!*Database {
     return lifecycle.create(allocator);
 }
@@ -229,11 +232,27 @@ test "put overwrites existing plain value" {
     try testing.expectEqualStrings("updated", stored.string);
 }
 
+test "read view holds the visibility gate until released" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close();
+
+    var view = try db.read_view();
+    defer if (view.active) view.deinit();
+
+    try testing.expect(!db.state.visibility_gate.try_lock_exclusive());
+
+    view.deinit();
+    try testing.expect(db.state.visibility_gate.try_lock_exclusive());
+    db.state.visibility_gate.unlock_exclusive();
+}
+
 /// Scans the next prefix page inside a consistent read view.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(1) until scan behavior is implemented.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Does not allocate; returns `error.NotImplemented` until scan behavior is implemented.
 ///
 /// Ownership: `cursor` is borrowed when present and is never consumed by this call.
 pub fn scan_prefix_from_in_view(
@@ -253,9 +272,9 @@ pub fn scan_prefix_from_in_view(
 
 /// Scans the next range page inside a consistent read view.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(1) until scan behavior is implemented.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Does not allocate; returns `error.NotImplemented` until scan behavior is implemented.
 ///
 /// Ownership: `cursor` is borrowed when present and is never consumed by this call.
 pub fn scan_range_from_in_view(
@@ -275,9 +294,9 @@ pub fn scan_range_from_in_view(
 
 /// Applies one checked batch under the official advanced contract.
 ///
-/// Time Complexity: O(1) in the step 3 skeleton.
+/// Time Complexity: O(1) until checked-batch execution is implemented.
 ///
-/// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+/// Allocator: Does not allocate; returns `error.NotImplemented` until checked-batch execution is implemented.
 pub fn apply_checked_batch(db: *Database, batch: types.CheckedBatch) EngineError!void {
     _ = db;
     _ = batch;

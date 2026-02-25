@@ -1,6 +1,6 @@
 //! Lifecycle ownership boundary for engine open, create, close, and checkpoint work.
 //! Cost: O(s) for runtime-state setup and teardown, where `s` is the shard count.
-//! Allocator: Uses explicit allocators for engine-handle ownership; storage I/O remains unimplemented in step 5.
+//! Allocator: Uses explicit allocators for engine-handle ownership; storage I/O remains partially unimplemented.
 
 const std = @import("std");
 const engine_db = @import("db.zig");
@@ -30,7 +30,7 @@ pub fn create(allocator: std.mem.Allocator) engine_db.EngineError!*engine_db.Dat
 ///
 /// Time Complexity: O(s) when no persistence is requested, where `s` is the runtime shard count.
 ///
-/// Allocator: Allocates the engine handle from `allocator`; storage-owned persistence remains unimplemented in step 5.
+/// Allocator: Allocates the engine handle from `allocator`; storage-owned persistence remains partially unimplemented.
 pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) engine_db.EngineError!*engine_db.Database {
     var db = try create(allocator);
     errdefer db.close();
@@ -71,9 +71,9 @@ pub fn close(db: *engine_db.Database) void {
 
 /// Writes one consistent checkpoint through the storage-owned snapshot boundary.
 ///
-/// Time Complexity: O(1) in the step 5 skeleton.
+/// Time Complexity: O(1) until snapshot persistence is implemented.
 ///
-/// Allocator: Does not allocate in the step 5 skeleton; returns `error.NotImplemented` when snapshot persistence is requested.
+/// Allocator: Does not allocate; returns `error.NotImplemented` when snapshot persistence is requested.
 pub fn checkpoint(db: *engine_db.Database) engine_db.EngineError!void {
     const snapshot_path = db.state.snapshot_path orelse return error.NotImplemented;
     _ = storage_snapshot.write(&db.state, db.allocator, snapshot_path, 0) catch return error.NotImplemented;

@@ -9,7 +9,7 @@ const types = @import("types.zig");
 /// Public database handle for the general engine contract.
 pub const Database = engine_db.Database;
 
-/// Public error set used by the step 3 facade skeleton.
+/// Public error set used by the engine contract.
 pub const Error = engine_db.EngineError;
 
 /// Creates an in-memory engine handle.

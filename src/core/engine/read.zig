@@ -8,7 +8,7 @@ const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
 
-/// Clones the current plain value for `key` when present.
+/// Clones the current plain value for `key` while relying on an already-held visibility window.
 ///
 /// Time Complexity: O(n^2 + k + v), where `n` is `key.len` for shard routing, `k` is hash-map lookup work, and `v` is the size of the cloned value tree.
 ///
@@ -16,8 +16,12 @@ const types = @import("../types.zig");
 ///
 /// Ownership: Returns a value owned by the caller when non-null. The caller must later call `deinit` with the same allocator.
 ///
-/// Thread Safety: Acquires the selected shard's shared lock while reading and cloning the stored value.
-pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocator, key: []const u8) engine_db.EngineError!?types.Value {
+/// Thread Safety: Requires a surrounding visibility window and acquires the selected shard's shared lock while reading and cloning the stored value.
+fn clone_plain_value_no_visibility(
+    state: *const runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) engine_db.EngineError!?types.Value {
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
 
@@ -27,4 +31,38 @@ pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocat
 
     const stored = shard.values.getPtr(key) orelse return null;
     return try stored.clone(allocator);
+}
+
+/// Opens one consistent read window over the current visible engine state.
+///
+/// Time Complexity: O(1).
+///
+/// Allocator: Does not allocate.
+///
+/// Ownership: Returns a handle that borrows the runtime state and visibility gate until `deinit` is called.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate and keeps it held for the lifetime of the returned `ReadView`.
+pub fn read_view(state: *const runtime_state.DatabaseState) types.ReadView {
+    const visibility_gate = @constCast(&state.visibility_gate);
+    visibility_gate.lock_shared();
+    return .{
+        .runtime_state = state,
+        .visibility_gate = visibility_gate,
+    };
+}
+
+/// Clones the current plain value for `key` under the shared visibility gate.
+///
+/// Time Complexity: O(n^2 + k + v), where `n` is `key.len` for shard routing, `k` is hash-map lookup work, and `v` is the size of the cloned value tree.
+///
+/// Allocator: Allocates the returned cloned value through `allocator` when the key exists.
+///
+/// Ownership: Returns a value owned by the caller when non-null. The caller must later call `deinit` with the same allocator.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate before taking the selected shard's shared lock.
+pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocator, key: []const u8) engine_db.EngineError!?types.Value {
+    const visibility_gate = @constCast(&state.visibility_gate);
+    visibility_gate.lock_shared();
+    defer visibility_gate.unlock_shared();
+    return clone_plain_value_no_visibility(state, allocator, key);
 }

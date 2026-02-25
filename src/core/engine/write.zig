@@ -8,7 +8,7 @@ const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
 
-/// Maximum accepted plain-key length for step 1 point operations.
+/// Maximum accepted plain-key length for plain point operations.
 pub const MAX_KEY_LEN: usize = 4_096;
 
 /// Inserts or replaces one plain key/value pair.
@@ -19,9 +19,12 @@ pub const MAX_KEY_LEN: usize = 4_096;
 ///
 /// Ownership: Clones `value` into shard-owned storage before the call returns.
 ///
-/// Thread Safety: Acquires the selected shard's exclusive lock while mutating stored state.
+/// Thread Safety: Acquires the exclusive side of the global visibility gate before taking the selected shard's exclusive lock.
 pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const types.Value) engine_db.EngineError!void {
     if (key.len == 0 or key.len > MAX_KEY_LEN) return error.KeyTooLarge;
+
+    state.visibility_gate.lock_exclusive();
+    defer state.visibility_gate.unlock_exclusive();
 
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
@@ -58,8 +61,11 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
 ///
 /// Ownership: Releases shard-owned key and value storage when the key exists.
 ///
-/// Thread Safety: Acquires the selected shard's exclusive lock while mutating stored state.
+/// Thread Safety: Acquires the exclusive side of the global visibility gate before taking the selected shard's exclusive lock.
 pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) bool {
+    state.visibility_gate.lock_exclusive();
+    defer state.visibility_gate.unlock_exclusive();
+
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
 

@@ -41,6 +41,17 @@ pub const VisibilityGate = struct {
         self.lock.lock();
     }
 
+    /// Attempts to acquire exclusive visibility access without blocking.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    ///
+    /// Thread Safety: Thread-safe; returns whether the exclusive side of the runtime visibility gate was acquired.
+    pub fn try_lock_exclusive(self: *VisibilityGate) bool {
+        return self.lock.tryLock();
+    }
+
     /// Releases exclusive visibility access for write-side coordination.
     ///
     /// Time Complexity: O(1).

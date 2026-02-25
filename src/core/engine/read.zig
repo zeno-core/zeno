@@ -37,17 +37,17 @@ fn clone_plain_value_no_visibility(
 ///
 /// Time Complexity: O(1).
 ///
-/// Allocator: Does not allocate.
+/// Allocator: May allocate through the read-view token registry.
 ///
 /// Ownership: Returns a handle that borrows the runtime state and visibility gate until `deinit` is called.
 ///
 /// Thread Safety: Acquires the shared side of the global visibility gate and keeps it held for the lifetime of the returned `ReadView`.
-pub fn read_view(state: *const runtime_state.DatabaseState) types.ReadView {
+pub fn read_view(state: *const runtime_state.DatabaseState) engine_db.EngineError!types.ReadView {
     const visibility_gate = @constCast(&state.visibility_gate);
     visibility_gate.lock_shared();
-    return .{
-        .runtime_state = state,
-        .visibility_gate = visibility_gate,
+    return types.ReadView.init(state, visibility_gate, @constCast(&state.active_read_views)) catch {
+        visibility_gate.unlock_shared();
+        return error.OutOfMemory;
     };
 }
 

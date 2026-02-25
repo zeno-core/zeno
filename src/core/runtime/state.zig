@@ -37,6 +37,7 @@ pub const DatabaseState = struct {
     snapshot_path: ?[]const u8 = null,
     shards: [NUM_SHARDS]runtime_shard.Shard,
     counters: RuntimeCounters,
+    active_read_views: std.atomic.Value(usize),
 
     /// Initializes runtime state for one engine handle.
     ///
@@ -53,6 +54,7 @@ pub const DatabaseState = struct {
             .snapshot_path = snapshot_path,
             .shards = undefined,
             .counters = RuntimeCounters.init(),
+            .active_read_views = std.atomic.Value(usize).init(0),
         };
         for (&state.shards) |*shard| {
             shard.* = runtime_shard.Shard.init(base_allocator);

@@ -14,6 +14,7 @@ pub const EngineError = error{
     NotImplemented,
     OutOfMemory,
     KeyTooLarge,
+    ActiveReadViews,
 };
 
 /// Central engine handle coordinated by the future engine layer.
@@ -27,9 +28,11 @@ pub const Database = struct {
     ///
     /// Allocator: Does not allocate.
     ///
+    /// Ownership: Returns `error.ActiveReadViews` when any `ReadView` handles are still active.
+    ///
     /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle.
-    pub fn close(self: *Database) void {
-        lifecycle.close(self);
+    pub fn close(self: *Database) EngineError!void {
+        return lifecycle.close(self);
     }
 
     /// Writes a consistent checkpoint of engine-owned state.
@@ -182,7 +185,7 @@ test "create initializes runtime-owned database state" {
     const testing = std.testing;
 
     const db = try create(testing.allocator);
-    defer db.close();
+    defer db.close() catch unreachable;
 
     try testing.expectEqual(@as(usize, runtime_state.NUM_SHARDS), db.state.shards.len);
     try testing.expect(db.state.snapshot_path == null);
@@ -192,7 +195,7 @@ test "plain point operations store clone and delete values" {
     const testing = std.testing;
 
     const db = try create(testing.allocator);
-    defer db.close();
+    defer db.close() catch unreachable;
 
     const original = types.Value{ .string = "hello" };
     try db.put("alpha", &original);
@@ -218,7 +221,7 @@ test "put overwrites existing plain value" {
     const testing = std.testing;
 
     const db = try create(testing.allocator);
-    defer db.close();
+    defer db.close() catch unreachable;
 
     const first = types.Value{ .integer = 7 };
     try db.put("counter", &first);
@@ -236,16 +239,49 @@ test "read view holds the visibility gate until released" {
     const testing = std.testing;
 
     const db = try create(testing.allocator);
-    defer db.close();
+    defer db.close() catch unreachable;
 
     var view = try db.read_view();
-    defer if (view.active) view.deinit();
+    defer if (view.token_id != 0) view.deinit();
 
     try testing.expect(!db.state.visibility_gate.try_lock_exclusive());
 
     view.deinit();
     try testing.expect(db.state.visibility_gate.try_lock_exclusive());
     db.state.visibility_gate.unlock_exclusive();
+}
+
+test "read view copies release the visibility gate only once" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close();
+
+    var view = try db.read_view();
+    var copied = view;
+    defer copied.deinit();
+    defer view.deinit();
+
+    try testing.expectEqual(@as(usize, 1), db.state.active_read_views.load(.monotonic));
+    try testing.expect(!db.state.visibility_gate.try_lock_exclusive());
+
+    view.deinit();
+
+    try testing.expectEqual(@as(usize, 0), db.state.active_read_views.load(.monotonic));
+    try testing.expect(db.state.visibility_gate.try_lock_exclusive());
+    db.state.visibility_gate.unlock_exclusive();
+}
+
+test "close fails while a read view is still active" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    try testing.expectError(error.ActiveReadViews, db.close());
 }
 
 /// Scans the next prefix page inside a consistent read view.

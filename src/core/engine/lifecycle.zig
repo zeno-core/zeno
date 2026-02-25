@@ -33,7 +33,7 @@ pub fn create(allocator: std.mem.Allocator) engine_db.EngineError!*engine_db.Dat
 /// Allocator: Allocates the engine handle from `allocator`; storage-owned persistence remains partially unimplemented.
 pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) engine_db.EngineError!*engine_db.Database {
     var db = try create(allocator);
-    errdefer db.close();
+    errdefer db.close() catch unreachable;
     db.state.snapshot_path = options.snapshot_path;
 
     if (options.snapshot_path) |snapshot_path| {
@@ -63,8 +63,11 @@ pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) engine
 ///
 /// Allocator: Does not allocate.
 ///
+/// Ownership: Returns `error.ActiveReadViews` when any `ReadView` handles still borrow this database.
+///
 /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle.
-pub fn close(db: *engine_db.Database) void {
+pub fn close(db: *engine_db.Database) engine_db.EngineError!void {
+    if (db.state.active_read_views.load(.monotonic) != 0) return error.ActiveReadViews;
     db.state.deinit();
     db.allocator.destroy(db);
 }
@@ -110,7 +113,7 @@ test "create initializes runtime state without storage handles" {
     const testing = std.testing;
 
     const db = try create(testing.allocator);
-    defer close(db);
+    defer close(db) catch unreachable;
 
     try testing.expect(db.state.wal == null);
     try testing.expect(db.state.snapshot_path == null);

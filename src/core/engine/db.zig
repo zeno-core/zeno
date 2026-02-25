@@ -1,16 +1,19 @@
-//! Engine coordination center for the zeno-core facade skeleton.
-//! Cost: O(1) dispatch plus O(s) runtime-state setup and teardown, where `s` is the shard count.
-//! Allocator: Uses explicit allocators to own the engine handle and runtime state; semantic operations still return `error.NotImplemented`.
+//! Engine coordination center for the zeno-core facade.
+//! Cost: O(1) dispatch plus downstream runtime and storage work.
+//! Allocator: Uses explicit allocators to own the engine handle, runtime state, and caller-visible cloned values.
 
 const std = @import("std");
 const lifecycle = @import("lifecycle.zig");
+const read = @import("read.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
+const write = @import("write.zig");
 
 /// Shared error set for the step 3 engine skeleton.
 pub const EngineError = error{
     NotImplemented,
     OutOfMemory,
+    KeyTooLarge,
 };
 
 /// Central engine handle coordinated by the future engine layer.
@@ -40,39 +43,37 @@ pub const Database = struct {
 
     /// Reads one key from the engine contract surface.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(n^2 + k + v), where `n` is `key.len` for shard routing, `k` is hash-map lookup work, and `v` is cloned value size when the key exists.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Allocates the returned cloned value through `allocator` when the key exists.
     ///
-    /// Ownership: No value is returned in the step 3 skeleton.
+    /// Ownership: Returns a caller-owned cloned value when non-null. The caller must later call `deinit` with `allocator`.
     pub fn get(self: *const Database, allocator: std.mem.Allocator, key: []const u8) EngineError!?types.Value {
-        _ = self;
-        _ = allocator;
-        _ = key;
-        return error.NotImplemented;
+        return read.get(&self.state, allocator, key);
     }
 
     /// Writes one plain key/value pair through the engine contract surface.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(n^2 + k + v), where `n` is `key.len` for shard routing, `k` is hash-map lookup or insert work, and `v` is cloned value size.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+    /// Allocator: Clones owned key and value storage through the engine base allocator.
+    ///
+    /// Ownership: Clones `value` into engine-owned storage before the call returns.
+    ///
+    /// Thread Safety: Safe for concurrent use with other point operations; acquires one shard-exclusive lock internally.
     pub fn put(self: *Database, key: []const u8, value: *const types.Value) EngineError!void {
-        _ = self;
-        _ = key;
-        _ = value;
-        return error.NotImplemented;
+        return write.put(&self.state, key, value);
     }
 
     /// Deletes one plain key from the engine contract surface.
     ///
-    /// Time Complexity: O(1) in the step 3 skeleton.
+    /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is hash-map lookup and removal work.
     ///
-    /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
-    pub fn delete(self: *Database, key: []const u8) EngineError!bool {
-        _ = self;
-        _ = key;
-        return error.NotImplemented;
+    /// Allocator: Does not allocate; frees engine-owned key and value storage when the key exists.
+    ///
+    /// Thread Safety: Safe for concurrent use with other point operations; acquires one shard-exclusive lock internally.
+    pub fn delete(self: *Database, key: []const u8) bool {
+        return write.delete(&self.state, key);
     }
 
     /// Sets or clears key expiration at an absolute unix-second timestamp.
@@ -184,16 +185,62 @@ test "create initializes runtime-owned database state" {
     try testing.expect(db.state.snapshot_path == null);
 }
 
+test "plain point operations store clone and delete values" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close();
+
+    const original = types.Value{ .string = "hello" };
+    try db.put("alpha", &original);
+
+    {
+        var first_read = (try db.get(testing.allocator, "alpha")).?;
+        defer first_read.deinit(testing.allocator);
+
+        try testing.expectEqualStrings("hello", first_read.string);
+    }
+
+    var second_read = (try db.get(testing.allocator, "alpha")).?;
+    defer second_read.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("hello", second_read.string);
+
+    try testing.expect(db.delete("alpha"));
+    try testing.expect(!db.delete("alpha"));
+    try testing.expect((try db.get(testing.allocator, "alpha")) == null);
+}
+
+test "put overwrites existing plain value" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close();
+
+    const first = types.Value{ .integer = 7 };
+    try db.put("counter", &first);
+
+    const second = types.Value{ .string = "updated" };
+    try db.put("counter", &second);
+
+    var stored = (try db.get(testing.allocator, "counter")).?;
+    defer stored.deinit(testing.allocator);
+
+    try testing.expectEqualStrings("updated", stored.string);
+}
+
 /// Scans the next prefix page inside a consistent read view.
 ///
 /// Time Complexity: O(1) in the step 3 skeleton.
 ///
 /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+///
+/// Ownership: `cursor` is borrowed when present and is never consumed by this call.
 pub fn scan_prefix_from_in_view(
     view: *const types.ReadView,
     allocator: std.mem.Allocator,
     prefix: []const u8,
-    cursor: ?types.ScanCursor,
+    cursor: ?*const types.ScanCursor,
     limit: usize,
 ) EngineError!types.ScanPageResult {
     _ = view;
@@ -209,11 +256,13 @@ pub fn scan_prefix_from_in_view(
 /// Time Complexity: O(1) in the step 3 skeleton.
 ///
 /// Allocator: Does not allocate in the step 3 skeleton; returns `error.NotImplemented`.
+///
+/// Ownership: `cursor` is borrowed when present and is never consumed by this call.
 pub fn scan_range_from_in_view(
     view: *const types.ReadView,
     allocator: std.mem.Allocator,
     range: types.KeyRange,
-    cursor: ?types.ScanCursor,
+    cursor: ?*const types.ScanCursor,
     limit: usize,
 ) EngineError!types.ScanPageResult {
     _ = view;

@@ -26,11 +26,13 @@ pub const Error = engine_db.EngineError;
 /// Time Complexity: O(1) in the finalized skeleton.
 ///
 /// Allocator: Does not allocate in the finalized skeleton; returns `error.NotImplemented`.
+///
+/// Ownership: `cursor` is borrowed when present and is never consumed by this call.
 pub fn scan_prefix_from_in_view(
     view: *const ReadView,
     allocator: std.mem.Allocator,
     prefix: []const u8,
-    cursor: ?types.ScanCursor,
+    cursor: ?*const types.ScanCursor,
     limit: usize,
 ) Error!types.ScanPageResult {
     return engine_db.scan_prefix_from_in_view(view, allocator, prefix, cursor, limit);
@@ -41,11 +43,13 @@ pub fn scan_prefix_from_in_view(
 /// Time Complexity: O(1) in the finalized skeleton.
 ///
 /// Allocator: Does not allocate in the finalized skeleton; returns `error.NotImplemented`.
+///
+/// Ownership: `cursor` is borrowed when present and is never consumed by this call.
 pub fn scan_range_from_in_view(
     view: *const ReadView,
     allocator: std.mem.Allocator,
     range: types.KeyRange,
-    cursor: ?types.ScanCursor,
+    cursor: ?*const types.ScanCursor,
     limit: usize,
 ) Error!types.ScanPageResult {
     return engine_db.scan_range_from_in_view(view, allocator, range, cursor, limit);

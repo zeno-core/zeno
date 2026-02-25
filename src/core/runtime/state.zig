@@ -1,6 +1,6 @@
 //! Runtime-owned database state for shards, visibility coordination, and local counters.
 //! Cost: O(s) initialization and teardown over the shard count.
-//! Allocator: Uses explicit allocators only for owning the enclosing engine handle; this state itself does not allocate in step 4.
+//! Allocator: Uses the engine base allocator for shard-owned key/value storage and engine-owned resources.
 
 const std = @import("std");
 const runtime_shard = @import("shard.zig");
@@ -8,7 +8,7 @@ const runtime_visibility = @import("visibility.zig");
 const storage_wal = @import("../storage/wal.zig");
 
 /// Number of shards in the runtime execution state.
-pub const NUM_SHARDS: usize = 64;
+pub const NUM_SHARDS: usize = runtime_shard.NUM_SHARDS;
 
 /// Runtime counters kept local to engine state during the migration.
 pub const RuntimeCounters = struct {
@@ -42,7 +42,7 @@ pub const DatabaseState = struct {
     ///
     /// Time Complexity: O(s), where `s` is `NUM_SHARDS`.
     ///
-    /// Allocator: Does not allocate in the step 4 skeleton.
+    /// Allocator: Does not allocate during state construction; stores `base_allocator` so shards can later allocate owned key/value data.
     ///
     /// Thread Safety: Must be called before the state is shared across threads.
     pub fn init(base_allocator: std.mem.Allocator, snapshot_path: ?[]const u8) DatabaseState {
@@ -55,7 +55,7 @@ pub const DatabaseState = struct {
             .counters = RuntimeCounters.init(),
         };
         for (&state.shards) |*shard| {
-            shard.* = runtime_shard.Shard.init();
+            shard.* = runtime_shard.Shard.init(base_allocator);
         }
         return state;
     }
@@ -64,7 +64,7 @@ pub const DatabaseState = struct {
     ///
     /// Time Complexity: O(s), where `s` is `NUM_SHARDS`.
     ///
-    /// Allocator: Does not allocate in the step 4 skeleton.
+    /// Allocator: Does not allocate; frees shard-owned key/value storage and closes the optional WAL.
     ///
     /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the enclosing engine handle.
     pub fn deinit(self: *DatabaseState) void {

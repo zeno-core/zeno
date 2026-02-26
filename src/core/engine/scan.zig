@@ -3,7 +3,10 @@
 //! Allocator: Uses explicit allocators for owned scan entries, sorting buffers, and continuation cursors.
 
 const std = @import("std");
+const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
+const read_view_mod = @import("../types/read_view.zig");
+const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
 
@@ -100,6 +103,7 @@ fn collect_entries_no_visibility(
     state: *const runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
     query: ScanQuery,
+    now: i64,
 ) !std.ArrayList(types.ScanEntry) {
     var entries = std.ArrayList(types.ScanEntry).empty;
     errdefer {
@@ -114,6 +118,7 @@ fn collect_entries_no_visibility(
         var iterator = shard.values.iterator();
         while (iterator.next()) |entry| {
             if (!key_matches_query(entry.key_ptr.*, query)) continue;
+            if (!expiration.key_is_visible_unlocked(shard, entry.key_ptr.*, now)) continue;
             try entries.append(allocator, try clone_entry(allocator, entry.key_ptr.*, entry.value_ptr));
         }
     }
@@ -210,9 +215,10 @@ pub fn scan_prefix(
     const visibility_gate = @constCast(&state.visibility_gate);
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
+    const now = runtime_shard.unix_now();
     _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
 
-    const entries = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix });
+    const entries = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix }, now);
     return .{
         .entries = entries,
         .allocator = allocator,
@@ -236,9 +242,10 @@ pub fn scan_range(
     const visibility_gate = @constCast(&state.visibility_gate);
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
+    const now = runtime_shard.unix_now();
     _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
 
-    const entries = try collect_entries_no_visibility(state, allocator, .{ .range = range });
+    const entries = try collect_entries_no_visibility(state, allocator, .{ .range = range }, now);
     return .{
         .entries = entries,
         .allocator = allocator,
@@ -262,9 +269,10 @@ pub fn scan_prefix_from_in_view(
     limit: usize,
 ) error_mod.EngineError!types.ScanPageResult {
     const state = try runtime_state_from_view(view);
+    const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
     _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
 
-    var entries = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix });
+    var entries = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix }, opened_at_unix_seconds);
     return collect_page_from_entries(allocator, &entries, cursor, limit);
 }
 
@@ -285,8 +293,9 @@ pub fn scan_range_from_in_view(
     limit: usize,
 ) error_mod.EngineError!types.ScanPageResult {
     const state = try runtime_state_from_view(view);
+    const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
     _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
 
-    var entries = try collect_entries_no_visibility(state, allocator, .{ .range = range });
+    var entries = try collect_entries_no_visibility(state, allocator, .{ .range = range }, opened_at_unix_seconds);
     return collect_page_from_entries(allocator, &entries, cursor, limit);
 }

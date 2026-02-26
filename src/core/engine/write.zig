@@ -3,7 +3,10 @@
 //! Allocator: Uses the engine base allocator for owned key bytes and nested stored values.
 
 const std = @import("std");
+const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
+const internal_mutate = @import("../internal/mutate.zig");
+const internal_ttl_index = @import("../internal/ttl_index.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
@@ -50,6 +53,7 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
         try shard.values.put(allocator, owned_key, cloned);
     }
 
+    internal_ttl_index.clear_ttl_entry(shard, key);
     _ = state.counters.ops_put_total.fetchAdd(1, .monotonic);
 }
 
@@ -72,11 +76,20 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) bool {
     shard.lock.lock();
     defer shard.lock.unlock();
 
-    const removed = shard.values.fetchRemove(key) orelse return false;
-    state.base_allocator.free(removed.key);
+    if (!internal_mutate.key_exists_unlocked(shard, key)) {
+        internal_ttl_index.clear_ttl_entry(shard, key);
+        return false;
+    }
 
-    var owned_value = removed.value;
-    owned_value.deinit(state.base_allocator);
+    const now = runtime_shard.unix_now();
+    if (!expiration.key_is_visible_unlocked(shard, key, now)) {
+        _ = internal_mutate.remove_stored_value_unlocked(shard, state.base_allocator, key);
+        internal_ttl_index.clear_ttl_entry(shard, key);
+        return false;
+    }
+
+    _ = internal_mutate.remove_stored_value_unlocked(shard, state.base_allocator, key);
+    internal_ttl_index.clear_ttl_entry(shard, key);
 
     _ = state.counters.ops_delete_total.fetchAdd(1, .monotonic);
     return true;

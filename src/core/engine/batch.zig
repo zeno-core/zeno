@@ -3,10 +3,12 @@
 //! Allocator: Uses explicit allocators for planning scratch and prepared batch-owned value clones.
 
 const std = @import("std");
+const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
 const internal_batch_plan = @import("../internal/batch_plan.zig");
 const internal_mutate = @import("../internal/mutate.zig");
 const internal_codec = @import("../internal/codec.zig");
+const internal_ttl_index = @import("../internal/ttl_index.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
@@ -95,19 +97,26 @@ fn validate_guards(
 /// Allocator: Does not allocate.
 ///
 /// Thread Safety: Requires the caller to hold the exclusive side of the visibility gate for the full guard-evaluation window.
-fn guard_holds(state: *runtime_state.DatabaseState, guard: types.CheckedBatchGuard) bool {
+fn guard_holds(state: *runtime_state.DatabaseState, guard: types.CheckedBatchGuard, now: i64) bool {
     return switch (guard) {
         .key_exists => |key| blk: {
             const shard_idx = runtime_shard.get_shard_index(key);
-            break :blk internal_mutate.key_exists_unlocked(&state.shards[shard_idx], key);
+            const shard = &state.shards[shard_idx];
+            if (!internal_mutate.key_exists_unlocked(shard, key)) break :blk false;
+            break :blk expiration.key_is_visible_unlocked(shard, key, now);
         },
         .key_not_exists => |key| blk: {
             const shard_idx = runtime_shard.get_shard_index(key);
-            break :blk !internal_mutate.key_exists_unlocked(&state.shards[shard_idx], key);
+            const shard = &state.shards[shard_idx];
+            if (!internal_mutate.key_exists_unlocked(shard, key)) break :blk true;
+            break :blk !expiration.key_is_visible_unlocked(shard, key, now);
         },
         .key_value_equals => |guarded| blk: {
             const shard_idx = runtime_shard.get_shard_index(guarded.key);
-            break :blk internal_mutate.stored_value_equals_unlocked(&state.shards[shard_idx], guarded.key, guarded.value);
+            const shard = &state.shards[shard_idx];
+            if (!internal_mutate.key_exists_unlocked(shard, guarded.key)) break :blk false;
+            if (!expiration.key_is_visible_unlocked(shard, guarded.key, now)) break :blk false;
+            break :blk internal_mutate.stored_value_equals_unlocked(shard, guarded.key, guarded.value);
         },
     };
 }
@@ -130,8 +139,9 @@ fn apply_plan(
     state.visibility_gate.lock_exclusive();
     defer state.visibility_gate.unlock_exclusive();
 
+    const now = runtime_shard.unix_now();
     for (guards) |guard| {
-        if (!guard_holds(state, guard)) return error.GuardFailed;
+        if (!guard_holds(state, guard, now)) return error.GuardFailed;
     }
 
     var prepared = try std.ArrayList(PreparedWrite).initCapacity(allocator, plan.writes.len);
@@ -175,6 +185,7 @@ fn apply_plan(
             write.owned_insert_key,
             write.new_value,
         );
+        internal_ttl_index.clear_ttl_entry(&state.shards[write.shard_idx], write.key);
         write.transferred = true;
     }
 

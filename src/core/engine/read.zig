@@ -3,6 +3,7 @@
 //! Allocator: Uses explicit allocators only for returning owned cloned values to callers.
 
 const std = @import("std");
+const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
@@ -21,6 +22,7 @@ fn clone_plain_value_no_visibility(
     state: *const runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
     key: []const u8,
+    now: i64,
 ) error_mod.EngineError!?types.Value {
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
@@ -30,6 +32,7 @@ fn clone_plain_value_no_visibility(
     _ = state.counters.ops_get_total.fetchAdd(1, .monotonic);
 
     const stored = shard.values.getPtr(key) orelse return null;
+    if (!expiration.key_is_visible_unlocked(shard, key, now)) return null;
     return try stored.clone(allocator);
 }
 
@@ -45,7 +48,12 @@ fn clone_plain_value_no_visibility(
 pub fn read_view(state: *const runtime_state.DatabaseState) error_mod.EngineError!types.ReadView {
     const visibility_gate = @constCast(&state.visibility_gate);
     visibility_gate.lock_shared();
-    return types.ReadView.init(state, visibility_gate, @constCast(&state.active_read_views)) catch {
+    return types.ReadView.init(
+        state,
+        visibility_gate,
+        @constCast(&state.active_read_views),
+        runtime_shard.unix_now(),
+    ) catch {
         visibility_gate.unlock_shared();
         return error.OutOfMemory;
     };
@@ -64,5 +72,6 @@ pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocat
     const visibility_gate = @constCast(&state.visibility_gate);
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
-    return clone_plain_value_no_visibility(state, allocator, key);
+    const now = runtime_shard.unix_now();
+    return clone_plain_value_no_visibility(state, allocator, key, now);
 }

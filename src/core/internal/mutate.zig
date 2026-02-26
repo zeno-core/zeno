@@ -86,6 +86,24 @@ pub fn apply_owned_put_assume_capacity_unlocked(
     shard.values.putAssumeCapacityNoClobber(owned_insert_key.?, value);
 }
 
+/// Removes one stored key/value pair when present.
+///
+/// Time Complexity: O(k + v), where `k` is `key.len` and `v` is teardown cost for the removed value.
+///
+/// Allocator: Does not allocate; frees owned key and nested value storage through `allocator`.
+pub fn remove_stored_value_unlocked(
+    shard: *runtime_shard.Shard,
+    allocator: std.mem.Allocator,
+    key: []const u8,
+) bool {
+    const removed = shard.values.fetchRemove(key) orelse return false;
+    allocator.free(removed.key);
+
+    var owned_value = removed.value;
+    owned_value.deinit(allocator);
+    return true;
+}
+
 /// Returns whether two values are physically equal by full content.
 ///
 /// Time Complexity: O(v), where `v` is the combined compared value tree size.

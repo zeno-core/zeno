@@ -5,9 +5,12 @@
 const std = @import("std");
 const batch_ops = @import("batch.zig");
 const error_mod = @import("error.zig");
+const expiration = @import("expiration.zig");
 const internal_codec = @import("../internal/codec.zig");
+const internal_ttl_index = @import("../internal/ttl_index.zig");
 const lifecycle = @import("lifecycle.zig");
 const read = @import("read.zig");
+const runtime_shard = @import("../runtime/shard.zig");
 const scan_ops = @import("scan.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
@@ -80,25 +83,26 @@ pub const Database = struct {
 
     /// Sets or clears key expiration at an absolute unix-second timestamp.
     ///
-    /// Time Complexity: O(1) until expiration semantics are implemented.
+    /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is shard-local lookup plus optional TTL metadata update work.
     ///
-    /// Allocator: Does not allocate; returns `error.NotImplemented` until expiration semantics are implemented.
+    /// Allocator: Uses the engine base allocator only when inserting a new TTL entry.
+    ///
+    /// Thread Safety: Safe for concurrent use with reads and scans; acquires the global visibility gate exclusively before taking one shard-exclusive lock.
     pub fn expire_at(self: *Database, key: []const u8, unix_seconds: ?i64) EngineError!bool {
-        _ = self;
-        _ = key;
-        _ = unix_seconds;
-        return error.NotImplemented;
+        const updated = try expiration.expire_at(&self.state, key, unix_seconds);
+        _ = self.state.counters.ops_expire_total.fetchAdd(1, .monotonic);
+        return updated;
     }
 
     /// Returns Redis-style TTL for one plain key.
     ///
-    /// Time Complexity: O(1) until expiration semantics are implemented.
+    /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is shard-local lookup plus optional expired-key cleanup work.
     ///
-    /// Allocator: Does not allocate; returns `error.NotImplemented` until expiration semantics are implemented.
+    /// Allocator: Does not allocate.
+    ///
+    /// Thread Safety: Acquires the shared side of the global visibility gate before taking one shard-exclusive lock for TTL reads and lazy cleanup.
     pub fn ttl(self: *const Database, key: []const u8) EngineError!i64 {
-        _ = self;
-        _ = key;
-        return error.NotImplemented;
+        return expiration.ttl(@constCast(&self.state), key);
     }
 
     /// Performs a full prefix scan over the current visible state.
@@ -180,6 +184,24 @@ pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) Engine
     return lifecycle.open(allocator, options);
 }
 
+fn set_ttl_for_test(db: *Database, key: []const u8, expire_at_seconds: i64) !void {
+    const shard_idx = runtime_shard.get_shard_index(key);
+    const shard = &db.state.shards[shard_idx];
+
+    shard.lock.lock();
+    defer shard.lock.unlock();
+    try internal_ttl_index.set_ttl_entry(shard, key, expire_at_seconds);
+}
+
+fn has_ttl_for_test(db: *Database, key: []const u8) bool {
+    const shard_idx = runtime_shard.get_shard_index(key);
+    const shard = &db.state.shards[shard_idx];
+
+    shard.lock.lockShared();
+    defer shard.lock.unlockShared();
+    return internal_ttl_index.get_expire_at(shard, key) != null;
+}
+
 test "create initializes runtime-owned database state" {
     const testing = std.testing;
 
@@ -232,6 +254,73 @@ test "put overwrites existing plain value" {
     defer stored.deinit(testing.allocator);
 
     try testing.expectEqualStrings("updated", stored.string);
+}
+
+test "expire_at returns false for missing keys and increments the expire counter" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    try testing.expect(!try db.expire_at("missing", runtime_shard.unix_now() + 30));
+    try testing.expectEqual(@as(u64, 1), db.state.counters.ops_expire_total.load(.monotonic));
+}
+
+test "expire_at null clears existing ttl while keeping the stored value" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .string = "value" };
+    try db.put("ttl:key", &value);
+
+    const expire_at_seconds = runtime_shard.unix_now() + 30;
+    try testing.expect(try db.expire_at("ttl:key", expire_at_seconds));
+    const ttl_before_clear = try db.ttl("ttl:key");
+    try testing.expect(ttl_before_clear >= 0);
+    try testing.expect(ttl_before_clear <= 30);
+
+    try testing.expect(try db.expire_at("ttl:key", null));
+    try testing.expectEqual(@as(i64, -1), try db.ttl("ttl:key"));
+
+    var stored = (try db.get(testing.allocator, "ttl:key")).?;
+    defer stored.deinit(testing.allocator);
+    try testing.expectEqualStrings("value", stored.string);
+}
+
+test "expire_at at or before now deletes the key immediately" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 9 };
+    try db.put("gone", &value);
+
+    try testing.expect(try db.expire_at("gone", runtime_shard.unix_now()));
+    try testing.expect((try db.get(testing.allocator, "gone")) == null);
+    try testing.expectEqual(@as(i64, -2), try db.ttl("gone"));
+    try testing.expect(!has_ttl_for_test(db, "gone"));
+}
+
+test "ttl eagerly cleans up expired keys while get remains lazily invisible" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .string = "stale" };
+    try db.put("stale:key", &value);
+    try set_ttl_for_test(db, "stale:key", runtime_shard.unix_now() - 1);
+
+    try testing.expect(has_ttl_for_test(db, "stale:key"));
+    try testing.expect((try db.get(testing.allocator, "stale:key")) == null);
+    try testing.expect(has_ttl_for_test(db, "stale:key"));
+
+    try testing.expectEqual(@as(i64, -2), try db.ttl("stale:key"));
+    try testing.expect(!has_ttl_for_test(db, "stale:key"));
+    try testing.expect((try db.get(testing.allocator, "stale:key")) == null);
 }
 
 test "read view holds the visibility gate until released" {
@@ -385,6 +474,153 @@ test "apply_checked_batch validates guard keys and expected values" {
     }));
 }
 
+test "put and delete clear prior ttl metadata" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const first = types.Value{ .integer = 1 };
+    try db.put("ttl:put", &first);
+    try set_ttl_for_test(db, "ttl:put", runtime_shard.unix_now() + 30);
+
+    const replacement = types.Value{ .integer = 2 };
+    try db.put("ttl:put", &replacement);
+    try testing.expectEqual(@as(i64, -1), try db.ttl("ttl:put"));
+    try testing.expect(!has_ttl_for_test(db, "ttl:put"));
+
+    try set_ttl_for_test(db, "ttl:put", runtime_shard.unix_now() + 30);
+    try testing.expect(db.delete("ttl:put"));
+    try testing.expect(!has_ttl_for_test(db, "ttl:put"));
+    try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:put"));
+}
+
+test "delete returns false for expired keys that are already invisible" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("ttl:expired-delete", &value);
+    try set_ttl_for_test(db, "ttl:expired-delete", runtime_shard.unix_now() - 1);
+
+    try testing.expect(!db.delete("ttl:expired-delete"));
+    try testing.expect((try db.get(testing.allocator, "ttl:expired-delete")) == null);
+    try testing.expect(!has_ttl_for_test(db, "ttl:expired-delete"));
+}
+
+test "batch writes clear prior ttl metadata" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const original = types.Value{ .integer = 1 };
+    try db.put("ttl:batch", &original);
+    try db.put("ttl:checked", &original);
+    try set_ttl_for_test(db, "ttl:batch", runtime_shard.unix_now() + 30);
+    try set_ttl_for_test(db, "ttl:checked", runtime_shard.unix_now() + 30);
+
+    const batch_value = types.Value{ .integer = 2 };
+    try db.apply_batch(&.{
+        .{ .key = "ttl:batch", .value = &batch_value },
+    });
+    try testing.expectEqual(@as(i64, -1), try db.ttl("ttl:batch"));
+    try testing.expect(!has_ttl_for_test(db, "ttl:batch"));
+
+    const checked_value = types.Value{ .integer = 3 };
+    try apply_checked_batch(db, .{
+        .writes = &.{
+            .{ .key = "ttl:checked", .value = &checked_value },
+        },
+        .guards = &.{
+            .{ .key_exists = "ttl:checked" },
+        },
+    });
+    try testing.expectEqual(@as(i64, -1), try db.ttl("ttl:checked"));
+    try testing.expect(!has_ttl_for_test(db, "ttl:checked"));
+}
+
+test "checked batch guards treat expired keys as absent" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const stale = types.Value{ .integer = 1 };
+    try db.put("ttl:guarded", &stale);
+    try set_ttl_for_test(db, "ttl:guarded", runtime_shard.unix_now() - 1);
+
+    const fresh = types.Value{ .integer = 2 };
+    try apply_checked_batch(db, .{
+        .writes = &.{
+            .{ .key = "ttl:target", .value = &fresh },
+        },
+        .guards = &.{
+            .{ .key_not_exists = "ttl:guarded" },
+        },
+    });
+
+    var target = (try db.get(testing.allocator, "ttl:target")).?;
+    defer target.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 2), target.integer);
+
+    try testing.expectError(error.GuardFailed, apply_checked_batch(db, .{
+        .writes = &.{
+            .{ .key = "ttl:another", .value = &fresh },
+        },
+        .guards = &.{
+            .{ .key_exists = "ttl:guarded" },
+        },
+    }));
+
+    try testing.expectError(error.GuardFailed, apply_checked_batch(db, .{
+        .writes = &.{
+            .{ .key = "ttl:another", .value = &fresh },
+        },
+        .guards = &.{
+            .{ .key_value_equals = .{
+                .key = "ttl:guarded",
+                .value = &stale,
+            } },
+        },
+    }));
+}
+
+test "checked batch uses one expiration timestamp across all guards" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const pathological_key = try testing.allocator.alloc(u8, write.MAX_KEY_LEN);
+    defer testing.allocator.free(pathological_key);
+    @memset(pathological_key, '{');
+
+    const original = types.Value{ .integer = 1 };
+    try db.put(pathological_key, &original);
+    try testing.expect(try db.expire_at(pathological_key, runtime_shard.unix_now() + 2));
+
+    const guards = try testing.allocator.alloc(types.CheckedBatchGuard, 128);
+    defer testing.allocator.free(guards);
+    for (guards) |*guard| {
+        guard.* = .{ .key_exists = pathological_key };
+    }
+
+    const replacement = types.Value{ .integer = 2 };
+    try apply_checked_batch(db, .{
+        .writes = &.{
+            .{ .key = "ttl:guard-window", .value = &replacement },
+        },
+        .guards = guards,
+    });
+
+    var stored = (try db.get(testing.allocator, "ttl:guard-window")).?;
+    defer stored.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 2), stored.integer);
+}
+
 test "scan_prefix returns lexicographically ordered owned entries" {
     const testing = std.testing;
 
@@ -406,6 +642,36 @@ test "scan_prefix returns lexicographically ordered owned entries" {
     try testing.expectEqualStrings("alpha:1", result.entries.items[1].key);
     try testing.expectEqual(@as(i64, 1), result.entries.items[0].value.integer);
     try testing.expectEqual(@as(i64, 2), result.entries.items[1].value.integer);
+}
+
+test "scan operations omit expired keys while preserving lexicographic order" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const a = types.Value{ .integer = 1 };
+    const b = types.Value{ .integer = 2 };
+    const c = types.Value{ .integer = 3 };
+    try db.put("alpha", &a);
+    try db.put("beta", &b);
+    try db.put("gamma", &c);
+    try set_ttl_for_test(db, "beta", runtime_shard.unix_now() - 1);
+
+    var prefix_result = try db.scan_prefix(testing.allocator, "");
+    defer prefix_result.deinit();
+    try testing.expectEqual(@as(usize, 2), prefix_result.entries.items.len);
+    try testing.expectEqualStrings("alpha", prefix_result.entries.items[0].key);
+    try testing.expectEqualStrings("gamma", prefix_result.entries.items[1].key);
+
+    var range_result = try db.scan_range(testing.allocator, .{
+        .start = "a",
+        .end = "z",
+    });
+    defer range_result.deinit();
+    try testing.expectEqual(@as(usize, 2), range_result.entries.items.len);
+    try testing.expectEqualStrings("alpha", range_result.entries.items[0].key);
+    try testing.expectEqualStrings("gamma", range_result.entries.items[1].key);
 }
 
 test "scan_range uses inclusive start and exclusive end" {
@@ -465,6 +731,90 @@ test "scan_prefix_from_in_view paginates in key order" {
     try testing.expectEqual(@as(usize, 1), second_page.entries.items.len);
     try testing.expect(second_page.borrow_next_cursor() == null);
     try testing.expectEqualStrings("alpha:2", second_page.entries.items[0].key);
+}
+
+test "scan_prefix_from_in_view omits keys expired before the view opens" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const one = types.Value{ .integer = 1 };
+    const two = types.Value{ .integer = 2 };
+    const three = types.Value{ .integer = 3 };
+    try db.put("alpha", &one);
+    try db.put("alpha:1", &two);
+    try db.put("alpha:2", &three);
+    try set_ttl_for_test(db, "alpha", runtime_shard.unix_now() - 1);
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    var first_page = try scan_prefix_from_in_view(&view, testing.allocator, "alpha", null, 1);
+    defer first_page.deinit();
+    try testing.expectEqual(@as(usize, 1), first_page.entries.items.len);
+    try testing.expectEqualStrings("alpha:1", first_page.entries.items[0].key);
+
+    var cursor = first_page.take_next_cursor().?;
+    defer cursor.deinit();
+    const cursor_view = cursor.as_cursor().?;
+    var second_page = try scan_prefix_from_in_view(&view, testing.allocator, "alpha", &cursor_view, 1);
+    defer second_page.deinit();
+    try testing.expectEqual(@as(usize, 1), second_page.entries.items.len);
+    try testing.expectEqualStrings("alpha:2", second_page.entries.items[0].key);
+}
+
+test "read view freezes expiration time at open" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 7 };
+    try db.put("alpha", &value);
+    try testing.expect(try db.expire_at("alpha", runtime_shard.unix_now() + 1));
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    std.Thread.sleep(1100 * std.time.ns_per_ms);
+
+    var in_view = try scan_prefix_from_in_view(&view, testing.allocator, "alpha", null, 10);
+    defer in_view.deinit();
+    try testing.expectEqual(@as(usize, 1), in_view.entries.items.len);
+    try testing.expectEqualStrings("alpha", in_view.entries.items[0].key);
+
+    var plain = try db.scan_prefix(testing.allocator, "alpha");
+    defer plain.deinit();
+    try testing.expectEqual(@as(usize, 0), plain.entries.items.len);
+}
+
+test "ttl does not deadlock under an active read view and defers cleanup" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 7 };
+    try db.put("ttl:view", &value);
+    try testing.expect(try db.expire_at("ttl:view", runtime_shard.unix_now() + 1));
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    std.Thread.sleep(1100 * std.time.ns_per_ms);
+
+    try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:view"));
+    try testing.expect(has_ttl_for_test(db, "ttl:view"));
+
+    var in_view = try scan_prefix_from_in_view(&view, testing.allocator, "ttl:view", null, 10);
+    defer in_view.deinit();
+    try testing.expectEqual(@as(usize, 1), in_view.entries.items.len);
+
+    view.deinit();
+    try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:view"));
+    try testing.expect(!has_ttl_for_test(db, "ttl:view"));
+    try testing.expect((try db.get(testing.allocator, "ttl:view")) == null);
 }
 
 test "scan page can promote one borrowed continuation cursor into owned storage" {

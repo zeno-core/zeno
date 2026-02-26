@@ -12,6 +12,7 @@ const ReadViewToken = struct {
     runtime_state: *const anyopaque,
     visibility_gate: *runtime_visibility.VisibilityGate,
     active_read_views: *ReadViewCounter,
+    opened_at_unix_seconds: i64,
 };
 
 var next_read_view_token_id = std.atomic.Value(u64).init(1);
@@ -31,6 +32,7 @@ fn register_read_view_token(
     runtime_state: *const anyopaque,
     visibility_gate: *runtime_visibility.VisibilityGate,
     active_read_views: *ReadViewCounter,
+    opened_at_unix_seconds: i64,
 ) std.mem.Allocator.Error!u64 {
     const token_id = next_read_view_token_id.fetchAdd(1, .monotonic);
     read_view_tokens_mutex.lock();
@@ -39,6 +41,7 @@ fn register_read_view_token(
         .runtime_state = runtime_state,
         .visibility_gate = visibility_gate,
         .active_read_views = active_read_views,
+        .opened_at_unix_seconds = opened_at_unix_seconds,
     });
     return token_id;
 }
@@ -89,8 +92,9 @@ pub const ReadView = struct {
         runtime_state: *const anyopaque,
         visibility_gate: *runtime_visibility.VisibilityGate,
         active_read_views: *ReadViewCounter,
+        opened_at_unix_seconds: i64,
     ) std.mem.Allocator.Error!ReadView {
-        const token_id = try register_read_view_token(runtime_state, visibility_gate, active_read_views);
+        const token_id = try register_read_view_token(runtime_state, visibility_gate, active_read_views, opened_at_unix_seconds);
         _ = active_read_views.fetchAdd(1, .monotonic);
         return .{
             .token_id = token_id,
@@ -128,3 +132,15 @@ pub const ReadView = struct {
         self.token_id = 0;
     }
 };
+
+/// Resolves the read-view timestamp captured when the handle was created.
+///
+/// Time Complexity: O(1) expected.
+///
+/// Allocator: Does not allocate.
+///
+/// Ownership: Returns the borrowed timestamp only while the registry token is still active.
+pub fn resolve_opened_at_unix_seconds(view: *const ReadView) ?i64 {
+    const token = get_read_view_token(view.token_id) orelse return null;
+    return token.opened_at_unix_seconds;
+}

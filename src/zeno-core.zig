@@ -2,6 +2,8 @@
 //! Cost: O(1) module reexports only.
 //! Allocator: Does not allocate.
 
+const std = @import("std");
+
 /// General public engine contract facade.
 pub const public = @import("core/public.zig");
 
@@ -18,7 +20,7 @@ test "package root exposes contract modules" {
 }
 
 test "core facade excludes logical collection contract types" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
 
     try testing.expect(!@hasDecl(types, "HashWrite"));
     try testing.expect(!@hasDecl(types, "HashGetAllResult"));
@@ -29,7 +31,7 @@ test "core facade excludes logical collection contract types" {
 }
 
 test "package root exposes only the contract facades" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
 
     try testing.expect(@hasDecl(@This(), "public"));
     try testing.expect(@hasDecl(@This(), "official"));

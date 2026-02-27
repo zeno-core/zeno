@@ -13,6 +13,7 @@ const read = @import("read.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const scan_ops = @import("scan.zig");
 const runtime_state = @import("../runtime/state.zig");
+const storage_wal = @import("../storage/wal.zig");
 const types = @import("../types.zig");
 const write = @import("write.zig");
 
@@ -74,10 +75,10 @@ pub const Database = struct {
     ///
     /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is hash-map lookup and removal work.
     ///
-    /// Allocator: Does not allocate; frees engine-owned key and value storage when the key exists.
+    /// Allocator: Frees engine-owned key and value storage when the key exists and may allocate delegated WAL record scratch when durability is enabled.
     ///
-    /// Thread Safety: Safe for concurrent use with other point operations; acquires the global visibility gate exclusively before taking one shard-exclusive lock.
-    pub fn delete(self: *Database, key: []const u8) bool {
+    /// Thread Safety: Safe for concurrent use with other point operations; acquires the global visibility gate exclusively before taking one shard-exclusive lock and appends the live DELETE record inside that same visibility window.
+    pub fn delete(self: *Database, key: []const u8) EngineError!bool {
         return write.delete(&self.state, key);
     }
 
@@ -85,7 +86,7 @@ pub const Database = struct {
     ///
     /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is shard-local lookup plus optional TTL metadata update work.
     ///
-    /// Allocator: Uses the engine base allocator only when inserting a new TTL entry.
+    /// Allocator: Uses the engine base allocator when inserting a new TTL entry and may allocate delegated WAL record scratch for durable live mutations.
     ///
     /// Thread Safety: Safe for concurrent use with reads and scans; acquires the global visibility gate exclusively before taking one shard-exclusive lock.
     pub fn expire_at(self: *Database, key: []const u8, unix_seconds: ?i64) EngineError!bool {
@@ -100,7 +101,7 @@ pub const Database = struct {
     ///
     /// Allocator: Does not allocate.
     ///
-    /// Thread Safety: Acquires the shared side of the global visibility gate before taking one shard-exclusive lock for TTL reads and lazy cleanup.
+    /// Thread Safety: Acquires the shared side of the global visibility gate before taking one shard shared lock for TTL reads and only attempts lazy cleanup afterward if the exclusive visibility gate can be acquired immediately.
     pub fn ttl(self: *const Database, key: []const u8) EngineError!i64 {
         return expiration.ttl(@constCast(&self.state), key);
     }
@@ -143,7 +144,7 @@ pub const Database = struct {
     ///
     /// Time Complexity: O(n + b + v), where `n` is `writes.len`, `b` is total serialized value bytes measured during planning, and `v` is total cloned value size for prepared writes.
     ///
-    /// Allocator: Uses the engine base allocator for committed values and temporary planner scratch while validating and preparing the batch.
+    /// Allocator: Uses the engine base allocator for committed values and temporary planner scratch plus temporary WAL batch-view storage while validating and preparing the batch.
     ///
     /// Ownership: Clones all surviving write values into engine-owned storage before making the batch visible.
     ///
@@ -179,7 +180,7 @@ pub fn create(allocator: std.mem.Allocator) EngineError!*Database {
 ///
 /// Time Complexity: O(s), where `s` is the runtime shard count, when persistence is not requested.
 ///
-/// Allocator: Allocates the engine handle from `allocator` when persistence is not requested.
+/// Allocator: Allocates the engine handle from `allocator`; persistence-backed open paths remain partially unimplemented.
 pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) EngineError!*Database {
     return lifecycle.open(allocator, options);
 }
@@ -200,6 +201,34 @@ fn has_ttl_for_test(db: *Database, key: []const u8) bool {
     shard.lock.lockShared();
     defer shard.lock.unlockShared();
     return internal_ttl_index.get_expire_at(shard, key) != null;
+}
+
+var noop_replay_ctx: u8 = 0;
+
+fn noop_replay_put(ctx: *anyopaque, key: []const u8, value: *const types.Value) !void {
+    _ = ctx;
+    _ = key;
+    _ = value;
+}
+
+fn noop_replay_delete(ctx: *anyopaque, key: []const u8) !void {
+    _ = ctx;
+    _ = key;
+}
+
+fn noop_replay_expire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void {
+    _ = ctx;
+    _ = key;
+    _ = expire_at_sec;
+}
+
+fn attach_test_wal(db: *Database, path: []const u8, fsync_mode: types.FsyncMode) !void {
+    db.state.wal = try storage_wal.open(path, .{ .fsync_mode = fsync_mode }, .{
+        .ctx = &noop_replay_ctx,
+        .put = noop_replay_put,
+        .delete = noop_replay_delete,
+        .expire = noop_replay_expire,
+    }, db.allocator);
 }
 
 test "create initializes runtime-owned database state" {
@@ -233,8 +262,8 @@ test "plain point operations store clone and delete values" {
 
     try testing.expectEqualStrings("hello", second_read.string);
 
-    try testing.expect(db.delete("alpha"));
-    try testing.expect(!db.delete("alpha"));
+    try testing.expect(try db.delete("alpha"));
+    try testing.expect(!try db.delete("alpha"));
     try testing.expect((try db.get(testing.allocator, "alpha")) == null);
 }
 
@@ -254,6 +283,49 @@ test "put overwrites existing plain value" {
     defer stored.deinit(testing.allocator);
 
     try testing.expectEqualStrings("updated", stored.string);
+}
+
+test "put leaves state unchanged when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-put-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+    try attach_test_wal(db, path, .none);
+
+    const value = types.Value{ .string = "value" };
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, db.put("wal:put", &value));
+    try testing.expect((try db.get(testing.allocator, "wal:put")) == null);
+}
+
+test "delete returns a durability error and keeps the key when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-delete-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("wal:delete", &value);
+    try attach_test_wal(db, path, .none);
+
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, db.delete("wal:delete"));
+
+    var stored = (try db.get(testing.allocator, "wal:delete")).?;
+    defer stored.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 1), stored.integer);
 }
 
 test "expire_at returns false for missing keys and increments the expire counter" {
@@ -302,6 +374,77 @@ test "expire_at at or before now deletes the key immediately" {
     try testing.expect((try db.get(testing.allocator, "gone")) == null);
     try testing.expectEqual(@as(i64, -2), try db.ttl("gone"));
     try testing.expect(!has_ttl_for_test(db, "gone"));
+}
+
+test "expire_at future leaves ttl unchanged when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-expire-future-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("wal:expire-future", &value);
+    try set_ttl_for_test(db, "wal:expire-future", runtime_shard.unix_now() + 30);
+    try attach_test_wal(db, path, .none);
+
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, db.expire_at("wal:expire-future", runtime_shard.unix_now() + 90));
+    try testing.expect(has_ttl_for_test(db, "wal:expire-future"));
+    try testing.expect((try db.ttl("wal:expire-future")) <= 30);
+}
+
+test "expire_at immediate delete leaves key visible when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-expire-delete-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 9 };
+    try db.put("wal:expire-delete", &value);
+    try attach_test_wal(db, path, .none);
+
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, db.expire_at("wal:expire-delete", runtime_shard.unix_now()));
+
+    var stored = (try db.get(testing.allocator, "wal:expire-delete")).?;
+    defer stored.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 9), stored.integer);
+    try testing.expectEqual(@as(i64, -1), try db.ttl("wal:expire-delete"));
+}
+
+test "expire_at null leaves ttl intact when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-expire-clear-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("wal:expire-clear", &value);
+    try set_ttl_for_test(db, "wal:expire-clear", runtime_shard.unix_now() + 30);
+    try attach_test_wal(db, path, .none);
+
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, db.expire_at("wal:expire-clear", null));
+    try testing.expect(has_ttl_for_test(db, "wal:expire-clear"));
+    try testing.expect((try db.ttl("wal:expire-clear")) >= 0);
 }
 
 test "ttl eagerly cleans up expired keys while get remains lazily invisible" {
@@ -415,6 +558,31 @@ test "apply_batch keeps the final value in declared key order" {
     try testing.expectEqual(@as(i64, 2), beta.integer);
 }
 
+test "apply_batch leaves survivor writes unapplied when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-batch-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+    try attach_test_wal(db, path, .none);
+
+    const one = types.Value{ .integer = 1 };
+    const two = types.Value{ .integer = 2 };
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, db.apply_batch(&.{
+        .{ .key = "wal:batch:one", .value = &one },
+        .{ .key = "wal:batch:two", .value = &two },
+    }));
+
+    try testing.expect((try db.get(testing.allocator, "wal:batch:one")) == null);
+    try testing.expect((try db.get(testing.allocator, "wal:batch:two")) == null);
+}
+
 test "apply_checked_batch keeps state unchanged when a guard fails" {
     const testing = std.testing;
 
@@ -442,6 +610,40 @@ test "apply_checked_batch keeps state unchanged when a guard fails" {
 
     try testing.expectEqualStrings("original", guarded.string);
     try testing.expect((try db.get(testing.allocator, "other")) == null);
+}
+
+test "apply_checked_batch leaves survivor writes unapplied when wal append fails" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-checked-batch-failure.wal", .{tmp.sub_path});
+    defer testing.allocator.free(path);
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const existing = types.Value{ .integer = 1 };
+    try db.put("wal:guard", &existing);
+    try attach_test_wal(db, path, .none);
+
+    const target = types.Value{ .integer = 2 };
+    storage_wal.test_hooks.failNextWrite();
+    try testing.expectError(error.PersistenceIoFailure, apply_checked_batch(db, .{
+        .writes = &.{
+            .{ .key = "wal:checked-target", .value = &target },
+        },
+        .guards = &.{
+            .{ .key_exists = "wal:guard" },
+        },
+    }));
+
+    try testing.expect((try db.get(testing.allocator, "wal:checked-target")) == null);
+
+    var guarded = (try db.get(testing.allocator, "wal:guard")).?;
+    defer guarded.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 1), guarded.integer);
 }
 
 test "apply_checked_batch validates guard keys and expected values" {
@@ -490,7 +692,7 @@ test "put and delete clear prior ttl metadata" {
     try testing.expect(!has_ttl_for_test(db, "ttl:put"));
 
     try set_ttl_for_test(db, "ttl:put", runtime_shard.unix_now() + 30);
-    try testing.expect(db.delete("ttl:put"));
+    try testing.expect(try db.delete("ttl:put"));
     try testing.expect(!has_ttl_for_test(db, "ttl:put"));
     try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:put"));
 }
@@ -505,7 +707,7 @@ test "delete returns false for expired keys that are already invisible" {
     try db.put("ttl:expired-delete", &value);
     try set_ttl_for_test(db, "ttl:expired-delete", runtime_shard.unix_now() - 1);
 
-    try testing.expect(!db.delete("ttl:expired-delete"));
+    try testing.expect(!try db.delete("ttl:expired-delete"));
     try testing.expect((try db.get(testing.allocator, "ttl:expired-delete")) == null);
     try testing.expect(!has_ttl_for_test(db, "ttl:expired-delete"));
 }

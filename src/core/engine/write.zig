@@ -3,6 +3,7 @@
 //! Allocator: Uses the engine base allocator for owned key bytes and nested stored values.
 
 const std = @import("std");
+const durability = @import("durability.zig");
 const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
 const internal_mutate = @import("../internal/mutate.zig");
@@ -18,11 +19,11 @@ pub const MAX_KEY_LEN: usize = 4_096;
 ///
 /// Time Complexity: O(n^2 + k + v), where `n` is `key.len` for shard routing, `k` is hash-map lookup or insert work, and `v` is cloned value size.
 ///
-/// Allocator: Clones owned key and value storage through `state.base_allocator` when inserting or replacing an entry.
+/// Allocator: Clones owned key and value storage through `state.base_allocator` and may allocate delegated WAL serialization scratch when durability is enabled.
 ///
 /// Ownership: Clones `value` into shard-owned storage before the call returns.
 ///
-/// Thread Safety: Acquires the exclusive side of the global visibility gate before taking the selected shard's exclusive lock.
+/// Thread Safety: Acquires the exclusive side of the global visibility gate, then the selected shard's exclusive lock, and may append to the shared WAL before publishing the in-memory mutation.
 pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const types.Value) error_mod.EngineError!void {
     if (key.len == 0 or key.len > MAX_KEY_LEN) return error.KeyTooLarge;
 
@@ -38,9 +39,18 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
     const allocator = state.base_allocator;
     if (shard.values.getPtr(key)) |stored| {
         const cloned = try value.clone(allocator);
+        errdefer {
+            var owned_value = cloned;
+            owned_value.deinit(allocator);
+        }
+
+        try durability.append_put_if_enabled(state, key, value);
+
         stored.deinit(allocator);
         stored.* = cloned;
     } else {
+        try shard.values.ensureUnusedCapacity(allocator, 1);
+
         const owned_key = try allocator.dupe(u8, key);
         errdefer allocator.free(owned_key);
 
@@ -50,7 +60,9 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
             owned_value.deinit(allocator);
         }
 
-        try shard.values.put(allocator, owned_key, cloned);
+        try durability.append_put_if_enabled(state, key, value);
+
+        shard.values.putAssumeCapacityNoClobber(owned_key, cloned);
     }
 
     internal_ttl_index.clear_ttl_entry(shard, key);
@@ -61,12 +73,12 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
 ///
 /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is hash-map lookup and removal work.
 ///
-/// Allocator: Does not allocate; frees owned key and nested value storage through `state.base_allocator` when the key exists.
+/// Allocator: Frees owned key and nested value storage through `state.base_allocator` when the key exists and may allocate delegated WAL record scratch when durability is enabled.
 ///
-/// Ownership: Releases shard-owned key and value storage when the key exists.
+/// Ownership: Releases shard-owned key and value storage only after the WAL append succeeds when the key exists and is still TTL-visible.
 ///
-/// Thread Safety: Acquires the exclusive side of the global visibility gate before taking the selected shard's exclusive lock.
-pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) bool {
+/// Thread Safety: Acquires the exclusive side of the global visibility gate, then the selected shard's exclusive lock, and appends the DELETE record inside that same visibility window before publishing the removal.
+pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.EngineError!bool {
     state.visibility_gate.lock_exclusive();
     defer state.visibility_gate.unlock_exclusive();
 
@@ -87,6 +99,8 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) bool {
         internal_ttl_index.clear_ttl_entry(shard, key);
         return false;
     }
+
+    try durability.append_delete_if_enabled(state, key);
 
     _ = internal_mutate.remove_stored_value_unlocked(shard, state.base_allocator, key);
     internal_ttl_index.clear_ttl_entry(shard, key);

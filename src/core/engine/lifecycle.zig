@@ -46,7 +46,6 @@ pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) error_
             .put = replay_put,
             .delete = replay_delete,
             .expire = replay_expire,
-            .prune_shard = replay_prune_shard,
         });
         db.state.wal = storage_wal.open(wal_path, .{
             .fsync_mode = options.fsync_mode,
@@ -100,13 +99,6 @@ fn replay_expire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void {
     _ = ctx;
     _ = key;
     _ = expire_at_sec;
-    return error.NotImplemented;
-}
-
-fn replay_prune_shard(ctx: *anyopaque, shard_idx: u8, prefix: []const u8) !void {
-    _ = ctx;
-    _ = shard_idx;
-    _ = prefix;
     return error.NotImplemented;
 }
 

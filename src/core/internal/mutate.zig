@@ -157,14 +157,14 @@ pub fn values_equal(left: *const types.Value, right: *const types.Value) bool {
 }
 
 test "validate_key rejects empty and oversized keys" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
 
     try testing.expectError(error.EmptyKey, validate_key(""));
     try testing.expectError(error.KeyTooLarge, validate_key(&[_]u8{'a'} ** (codec.MAX_KEY_LEN + 1)));
 }
 
 test "values_equal compares nested values by content" {
-    const testing = @import("std").testing;
+    const testing = std.testing;
     const allocator = testing.allocator;
 
     var left_entries = std.StringHashMapUnmanaged(types.Value){};

@@ -3,6 +3,7 @@
 //! Allocator: Uses explicit allocators for planning scratch and prepared batch-owned value clones.
 
 const std = @import("std");
+const durability = @import("durability.zig");
 const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
 const internal_batch_plan = @import("../internal/batch_plan.zig");
@@ -125,11 +126,11 @@ fn guard_holds(state: *runtime_state.DatabaseState, guard: types.CheckedBatchGua
 ///
 /// Time Complexity: O(g + n + v), where `g` is `guards.len`, `n` is `plan.writes.len`, and `v` is total cloned value size for prepared writes.
 ///
-/// Allocator: Uses `allocator` for temporary prepared-write metadata and uses the engine base allocator for committed keys and values.
+/// Allocator: Uses `allocator` for temporary prepared-write metadata and WAL batch views, and uses the engine base allocator for committed keys and values.
 ///
 /// Ownership: Clones all surviving write values before making any mutation visible, then transfers prepared ownership into runtime state on success.
 ///
-/// Thread Safety: Acquires the exclusive side of the global visibility gate for the full guard-check, reservation, and apply window.
+/// Thread Safety: Acquires the exclusive side of the global visibility gate for the full guard-check, reservation, WAL-append, and publish window.
 fn apply_plan(
     state: *runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
@@ -177,6 +178,17 @@ fn apply_plan(
         try state.shards[shard_idx].values.ensureUnusedCapacity(state.base_allocator, count);
     }
 
+    const wal_writes = try allocator.alloc(durability.PutBatchWrite, plan.writes.len);
+    defer allocator.free(wal_writes);
+    for (plan.writes, 0..) |write, index| {
+        wal_writes[index] = .{
+            .key = write.key,
+            .value = write.value,
+        };
+    }
+
+    try durability.append_put_batch_if_enabled(state, allocator, wal_writes);
+
     for (prepared.items) |*write| {
         internal_mutate.apply_owned_put_assume_capacity_unlocked(
             &state.shards[write.shard_idx],
@@ -196,7 +208,7 @@ fn apply_plan(
 ///
 /// Time Complexity: O(n + b + v), where `n` is `writes.len`, `b` is total serialized value bytes measured during planning, and `v` is total cloned value size for prepared writes.
 ///
-/// Allocator: Uses `allocator` for planning scratch and temporary prepared-write metadata, and uses the engine base allocator for batch-owned values committed to runtime state.
+/// Allocator: Uses `allocator` for planning scratch, temporary prepared-write metadata, and temporary WAL batch views, and uses the engine base allocator for batch-owned values committed to runtime state.
 ///
 /// Ownership: Clones all surviving write values into engine-owned storage before making the batch visible.
 ///
@@ -215,7 +227,7 @@ pub fn apply_batch(
 ///
 /// Time Complexity: O(g + n + b + v), where `g` is `batch.guards.len`, `n` is surviving write count, `b` is total serialized value bytes measured during planning, and `v` is total cloned value size for prepared writes.
 ///
-/// Allocator: Uses `allocator` for planning scratch and temporary prepared-write metadata, and uses the engine base allocator for batch-owned values committed to runtime state.
+/// Allocator: Uses `allocator` for planning scratch, temporary prepared-write metadata, and temporary WAL batch views, and uses the engine base allocator for batch-owned values committed to runtime state.
 ///
 /// Ownership: Clones all surviving write values into engine-owned storage before making the batch visible.
 ///

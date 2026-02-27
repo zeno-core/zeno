@@ -1,7 +1,8 @@
 //! Expiration-semantics ownership boundary for TTL-visible behavior.
 //! Cost: O(k) over one routed key, where `k` is key length for shard routing plus shard-local hash-map work.
-//! Allocator: Uses the shard base allocator only when inserting new TTL metadata.
+//! Allocator: Uses the shard base allocator for TTL metadata ownership and may allocate delegated WAL serialization scratch for durable live mutations.
 
+const durability = @import("durability.zig");
 const error_mod = @import("error.zig");
 const internal_mutate = @import("../internal/mutate.zig");
 const internal_ttl_index = @import("../internal/ttl_index.zig");
@@ -37,9 +38,9 @@ pub fn is_expired(expire_at_seconds: i64, now: i64) bool {
 ///
 /// Time Complexity: O(n^2 + k), where `n` is `key.len` for shard routing and `k` is hash-map lookup and update work.
 ///
-/// Allocator: Uses the shard base allocator only when inserting a new TTL entry.
+/// Allocator: Uses the shard base allocator when preparing a new TTL entry and may allocate delegated WAL record scratch for durable live mutations.
 ///
-/// Thread Safety: Acquires the exclusive side of the global visibility gate before taking the target shard's exclusive lock.
+/// Thread Safety: Acquires the exclusive side of the global visibility gate before taking the target shard's exclusive lock, then appends the matching live WAL record inside that same window before publishing the TTL change.
 pub fn expire_at(
     state: *runtime_state.DatabaseState,
     key: []const u8,
@@ -70,15 +71,22 @@ pub fn expire_at(
 
     if (unix_seconds) |expire_at_seconds| {
         if (expire_at_seconds <= now) {
+            try durability.append_delete_if_enabled(state, key);
             _ = internal_mutate.remove_stored_value_unlocked(shard, state.base_allocator, key);
             internal_ttl_index.clear_ttl_entry(shard, key);
             return true;
         }
 
-        try internal_ttl_index.set_ttl_entry(shard, key, expire_at_seconds);
+        var prepared_ttl = try internal_ttl_index.prepare_set_ttl_entry(shard, key);
+        errdefer prepared_ttl.deinit(state.base_allocator);
+
+        try durability.append_expire_if_enabled(state, key, expire_at_seconds);
+        internal_ttl_index.apply_prepared_set_ttl_entry_unlocked(shard, key, expire_at_seconds, prepared_ttl);
         return true;
     }
 
+    const stored = shard.values.getPtr(key).?;
+    try durability.append_put_if_enabled(state, key, stored);
     internal_ttl_index.clear_ttl_entry(shard, key);
     return true;
 }

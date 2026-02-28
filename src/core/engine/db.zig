@@ -241,6 +241,176 @@ test "create initializes runtime-owned database state" {
     try testing.expect(db.state.snapshot_path == null);
 }
 
+test "open with snapshot path remains unsupported during wal-only recovery step" {
+    const testing = std.testing;
+
+    try testing.expectError(error.NotImplemented, open(testing.allocator, .{
+        .snapshot_path = "snapshot.rdb",
+    }));
+}
+
+test "wal-only open replays recovered keys deletes and ttl metadata without incrementing counters" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-open-replay.wal", .{tmp.sub_path});
+    defer testing.allocator.free(wal_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .wal_path = wal_path,
+            .fsync_mode = .none,
+        });
+        defer db.close() catch unreachable;
+
+        const alpha = types.Value{ .string = "alive" };
+        const beta = types.Value{ .string = "gone" };
+        const gamma = types.Value{ .integer = 9 };
+        try db.put("alpha", &alpha);
+        try db.put("beta", &beta);
+        try db.put("gamma", &gamma);
+        try testing.expect(try db.delete("beta"));
+        try testing.expect(try db.expire_at("gamma", runtime_shard.unix_now() + 60));
+    }
+
+    const reopened = try open(testing.allocator, .{
+        .wal_path = wal_path,
+        .fsync_mode = .none,
+    });
+    defer reopened.close() catch unreachable;
+
+    var alpha = (try reopened.get(testing.allocator, "alpha")).?;
+    defer alpha.deinit(testing.allocator);
+    try testing.expectEqualStrings("alive", alpha.string);
+    try testing.expect((try reopened.get(testing.allocator, "beta")) == null);
+    try testing.expect((try reopened.ttl("gamma")) >= 0);
+
+    try testing.expectEqual(@as(u64, 0), reopened.state.counters.ops_put_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), reopened.state.counters.ops_delete_total.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), reopened.state.counters.ops_expire_total.load(.monotonic));
+}
+
+test "wal-only restart preserves committed batch semantics" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-batch-restart.wal", .{tmp.sub_path});
+    defer testing.allocator.free(wal_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .wal_path = wal_path,
+            .fsync_mode = .none,
+        });
+        defer db.close() catch unreachable;
+
+        const one = types.Value{ .integer = 1 };
+        const two = types.Value{ .integer = 2 };
+        const three = types.Value{ .integer = 3 };
+        try db.apply_batch(&.{
+            .{ .key = "alpha", .value = &one },
+            .{ .key = "beta", .value = &two },
+            .{ .key = "alpha", .value = &three },
+        });
+    }
+
+    const reopened = try open(testing.allocator, .{
+        .wal_path = wal_path,
+        .fsync_mode = .none,
+    });
+    defer reopened.close() catch unreachable;
+
+    var alpha = (try reopened.get(testing.allocator, "alpha")).?;
+    defer alpha.deinit(testing.allocator);
+    var beta = (try reopened.get(testing.allocator, "beta")).?;
+    defer beta.deinit(testing.allocator);
+
+    try testing.expectEqual(@as(i64, 3), alpha.integer);
+    try testing.expectEqual(@as(i64, 2), beta.integer);
+}
+
+test "recovered expired ttl metadata remains invisible after wal-only restart" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-expired-restart.wal", .{tmp.sub_path});
+    defer testing.allocator.free(wal_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .wal_path = wal_path,
+            .fsync_mode = .none,
+        });
+        defer db.close() catch unreachable;
+
+        const value = types.Value{ .integer = 7 };
+        try db.put("alpha", &value);
+        try testing.expect(try db.expire_at("alpha", runtime_shard.unix_now() + 1));
+    }
+
+    std.Thread.sleep(1100 * std.time.ns_per_ms);
+
+    const reopened = try open(testing.allocator, .{
+        .wal_path = wal_path,
+        .fsync_mode = .none,
+    });
+    defer reopened.close() catch unreachable;
+
+    try testing.expect((try reopened.get(testing.allocator, "alpha")) == null);
+    try testing.expectEqual(@as(i64, -2), try reopened.ttl("alpha"));
+
+    var scan = try reopened.scan_prefix(testing.allocator, "alpha");
+    defer scan.deinit();
+    try testing.expectEqual(@as(usize, 0), scan.entries.items.len);
+}
+
+test "truncated batch tail does not become visible after wal-only reopen" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-truncated-batch.wal", .{tmp.sub_path});
+    defer testing.allocator.free(wal_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .wal_path = wal_path,
+            .fsync_mode = .none,
+        });
+        defer db.close() catch unreachable;
+
+        const one = types.Value{ .integer = 1 };
+        const two = types.Value{ .integer = 2 };
+        try db.apply_batch(&.{
+            .{ .key = "alpha", .value = &one },
+            .{ .key = "beta", .value = &two },
+        });
+    }
+
+    {
+        const file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
+        defer file.close();
+        const size = try file.getEndPos();
+        try file.setEndPos(size - 1);
+    }
+
+    const reopened = try open(testing.allocator, .{
+        .wal_path = wal_path,
+        .fsync_mode = .none,
+    });
+    defer reopened.close() catch unreachable;
+
+    try testing.expect((try reopened.get(testing.allocator, "alpha")) == null);
+    try testing.expect((try reopened.get(testing.allocator, "beta")) == null);
+}
+
 test "plain point operations store clone and delete values" {
     const testing = std.testing;
 
@@ -531,6 +701,29 @@ test "close fails while a read view is still active" {
     defer view.deinit();
 
     try testing.expectError(error.ActiveReadViews, db.close());
+}
+
+test "close surfaces final wal flush failure for batched async mode" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-close-fsync.wal", .{tmp.sub_path});
+    defer testing.allocator.free(wal_path);
+
+    const db = try open(testing.allocator, .{
+        .wal_path = wal_path,
+        .fsync_mode = .batched_async,
+        .fsync_interval_ms = 60_000,
+    });
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("alpha", &value);
+
+    storage_wal.test_hooks.failNextFsync();
+    try testing.expectError(error.WalFlushFailed, db.close());
 }
 
 test "apply_batch keeps the final value in declared key order" {

@@ -138,6 +138,14 @@ const ReplayBatchState = struct {
     }
 };
 
+/// Tracks one pending committed batch while compaction decides whether to retain or drop it as one unit.
+const CompactBatchState = struct {
+    begin_offset: u64,
+    begin_lsn: u64,
+    member_record_count: u32,
+    seen_mutations: u32,
+};
+
 /// Replays one WAL file into the provided physical applier.
 ///
 /// Records with `lsn <= min_lsn` are skipped after validation. Committed batches
@@ -268,6 +276,95 @@ pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: std.fs.File,
     return result;
 }
 
+/// Rewrites the accepted WAL prefix into `dst_file`, dropping records with `lsn <= max_lsn_inclusive`.
+///
+/// Standalone records newer than the cutoff are preserved. Committed batches are
+/// retained or dropped as a whole based on the `COMMIT` record LSN. Partial or
+/// structurally invalid trailing batches stop the copy at the corresponding
+/// `BEGIN` record so compaction never emits partial batch fragments.
+///
+/// Time Complexity: O(n + m), where `n` is WAL bytes scanned and `m` is retained bytes rewritten.
+///
+/// Allocator: Uses `allocator` for reusable scan scratch and temporary copied-record buffers.
+///
+/// Ownership: Borrows `src_file` and `dst_file` for the duration of the rewrite only.
+pub fn compact_up_to_lsn(
+    allocator: std.mem.Allocator,
+    src_file: std.fs.File,
+    dst_file: std.fs.File,
+    max_lsn_inclusive: u64,
+) !void {
+    try src_file.seekTo(0);
+
+    var record = std.ArrayList(u8).init(allocator);
+    defer record.deinit();
+    var key_buf = std.ArrayList(u8).init(allocator);
+    defer key_buf.deinit();
+    var val_buf = std.ArrayList(u8).init(allocator);
+    defer val_buf.deinit();
+    var pending_batch: ?CompactBatchState = null;
+    var pending_bytes = std.ArrayList(u8).init(allocator);
+    defer pending_bytes.deinit();
+
+    while (true) {
+        const scanned = try scan_next_record(src_file, &key_buf, &val_buf);
+        switch (scanned.class) {
+            .eof => break,
+            .partial_eof, .corrupt => break,
+            .valid => {},
+        }
+        const record_item = scanned.record.?;
+        const batch_is_pending = pending_batch != null;
+
+        if (batch_is_pending and record_item.tag == tag_batch_begin) break;
+        if (!batch_is_pending and record_item.tag == tag_batch_commit) break;
+        if (batch_is_pending and !is_mutation_tag(record_item.tag) and record_item.tag != tag_batch_commit) break;
+
+        try load_record_bytes(src_file, &record, record_item.start_offset, record_item.end_offset);
+        defer maybe_drop_replay_scratch(allocator, &key_buf, &val_buf, record_item.key.len, record_item.value.len);
+
+        switch (record_item.payload) {
+            .batch_begin => |member_record_count| {
+                std.debug.assert(!batch_is_pending);
+                pending_batch = .{
+                    .begin_offset = record_item.start_offset,
+                    .begin_lsn = record_item.lsn,
+                    .member_record_count = member_record_count,
+                    .seen_mutations = 0,
+                };
+                pending_bytes.clearRetainingCapacity();
+                try pending_bytes.appendSlice(record.items);
+            },
+            .batch_commit => |commit| {
+                if (!batch_is_pending) break;
+                const batch = pending_batch.?;
+                if (commit.begin_lsn != batch.begin_lsn or
+                    commit.member_record_count != batch.member_record_count or
+                    batch.seen_mutations != batch.member_record_count)
+                {
+                    break;
+                }
+
+                try pending_bytes.appendSlice(record.items);
+                if (record_item.lsn > max_lsn_inclusive) {
+                    try dst_file.writeAll(pending_bytes.items);
+                }
+                pending_batch = null;
+                pending_bytes.clearRetainingCapacity();
+            },
+            else => {
+                if (batch_is_pending) {
+                    pending_batch.?.seen_mutations += 1;
+                    if (pending_batch.?.seen_mutations > pending_batch.?.member_record_count) break;
+                    try pending_bytes.appendSlice(record.items);
+                } else if (record_item.lsn > max_lsn_inclusive) {
+                    try dst_file.writeAll(record.items);
+                }
+            },
+        }
+    }
+}
+
 /// Truncates the WAL file to `offset` and seeks to the new end.
 ///
 /// Time Complexity: O(1) CPU work plus filesystem truncate latency.
@@ -298,6 +395,26 @@ fn maybe_drop_replay_scratch(
         val_buf.deinit();
         val_buf.* = std.ArrayList(u8).init(allocator);
     }
+}
+
+/// Copies one validated WAL record byte range into `buf` so compaction can rewrite it without borrowing scan scratch.
+///
+/// Time Complexity: O(n), where `n` is `end_offset - start_offset`.
+///
+/// Allocator: Resizes `buf` through its owned allocator; caller retains ownership of the copied bytes.
+fn load_record_bytes(
+    file: std.fs.File,
+    buf: *std.ArrayList(u8),
+    start_offset: u64,
+    end_offset: u64,
+) !void {
+    const restore_offset = try file.getPos();
+    defer file.seekTo(restore_offset) catch {};
+
+    const record_len: usize = @intCast(end_offset - start_offset);
+    try buf.resize(record_len);
+    try file.seekTo(start_offset);
+    if ((try file.readAll(buf.items)) != record_len) return error.EndOfStream;
 }
 
 /// Applies one validated physical replay mutation to the target applier.

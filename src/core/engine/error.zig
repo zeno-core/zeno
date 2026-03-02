@@ -7,6 +7,7 @@ pub const EngineError = error{
     NotImplemented,
     OutOfMemory,
     KeyTooLarge,
+    NoSnapshotPath,
     ActiveReadViews,
     ValueTooLarge,
     ValueTooDeep,
@@ -25,6 +26,7 @@ pub const EngineError = error{
 pub fn map_persistence_error(err: anyerror) EngineError {
     return switch (err) {
         error.OutOfMemory => error.OutOfMemory,
+        error.NoSnapshotPath => error.NoSnapshotPath,
         error.WalFlushFailed => error.WalFlushFailed,
         error.SnapshotCorrupted => error.SnapshotCorrupted,
         error.NotImplemented => error.NotImplemented,

@@ -30,8 +30,6 @@ pub const Database = struct {
     ///
     /// Time Complexity: O(s), where `s` is the runtime shard count.
     ///
-    /// Allocator: Does not allocate.
-    ///
     /// Ownership: Returns `error.ActiveReadViews` when any `ReadView` handles are still active.
     ///
     /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle.
@@ -41,9 +39,18 @@ pub const Database = struct {
 
     /// Writes a consistent checkpoint of engine-owned state.
     ///
-    /// Time Complexity: O(1) until checkpoint persistence is implemented.
+    /// Time Complexity: O(s + n + m), where:
+    ///  - `s` is the runtime shard count,
+    ///  - `n` is snapshot serialization work
+    ///  - `m` is WAL compaction scan and rewrite work when durability is enabled
     ///
-    /// Allocator: Does not allocate; returns `error.NotImplemented` until checkpoint persistence is implemented.
+    /// Allocator: Uses explicit allocator paths for snapshot serialization scratch and optional WAL compaction scratch.
+    ///
+    /// Ownership: Returns `error.NoSnapshotPath` when `snapshot_path` was not configured for this engine handle.
+    ///
+    /// Thread Safety: Not safe to call concurrently with other mutation of the same engine handle.
+    /// Writers are blocked globally during the brief checkpoint barrier and during each
+    /// shard-serialization window, while active read traffic may delay completion.
     pub fn checkpoint(self: *Database) EngineError!void {
         return lifecycle.checkpoint(self);
     }
@@ -258,6 +265,23 @@ fn attach_test_wal(db: *Database, path: []const u8, fsync_mode: types.FsyncMode)
         .delete = noop_replay_delete,
         .expire = noop_replay_expire,
     }, db.allocator);
+}
+
+const CheckpointThreadState = struct {
+    db: *Database,
+    barrier_attempted: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    barrier_acquired: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    finished: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    checkpoint_error: ?EngineError = null,
+};
+
+fn run_checkpoint_in_thread(state: *CheckpointThreadState) void {
+    state.db.checkpoint() catch |err| {
+        state.checkpoint_error = err;
+        state.finished.store(true, .release);
+        return;
+    };
+    state.finished.store(true, .release);
 }
 
 test "create initializes runtime-owned database state" {
@@ -562,6 +586,147 @@ test "open purges expired keys recovered from snapshot and wal replay" {
     try testing.expectEqual(@as(u64, 0), reopened.state.counters.ops_put_total.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), reopened.state.counters.ops_delete_total.load(.monotonic));
     try testing.expectEqual(@as(u64, 0), reopened.state.counters.ops_expire_total.load(.monotonic));
+}
+
+test "checkpoint without a configured snapshot path returns no snapshot path" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    try testing.expectError(error.NoSnapshotPath, db.checkpoint());
+}
+
+test "checkpoint writes a snapshot and reopens the same visible state" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-checkpoint.snapshot", .{tmp.sub_path});
+    defer testing.allocator.free(snapshot_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .snapshot_path = snapshot_path,
+        });
+        defer db.close() catch unreachable;
+
+        const alpha_value = types.Value{ .string = "hello" };
+        const beta_value = types.Value{ .integer = 7 };
+        try db.put("alpha", &alpha_value);
+        try db.put("beta", &beta_value);
+        try db.expire_at("beta", runtime_shard.unix_now() + 60);
+        try db.checkpoint();
+    }
+
+    const reopened = try open(testing.allocator, .{
+        .snapshot_path = snapshot_path,
+    });
+    defer reopened.close() catch unreachable;
+
+    var alpha = (try reopened.get(testing.allocator, "alpha")).?;
+    defer alpha.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello", alpha.string);
+
+    var beta = (try reopened.get(testing.allocator, "beta")).?;
+    defer beta.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 7), beta.integer);
+    try testing.expect((try reopened.ttl("beta")) > 0);
+}
+
+test "checkpoint preserves post-snapshot wal delta on reopen" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-delta.snapshot", .{tmp.sub_path});
+    defer testing.allocator.free(snapshot_path);
+    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-delta.wal", .{tmp.sub_path});
+    defer testing.allocator.free(wal_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .snapshot_path = snapshot_path,
+            .wal_path = wal_path,
+            .fsync_mode = .none,
+        });
+        defer db.close() catch unreachable;
+
+        const alpha_value = types.Value{ .integer = 1 };
+        const beta_value = types.Value{ .integer = 2 };
+        try db.put("alpha", &alpha_value);
+        try db.checkpoint();
+        try db.put("beta", &beta_value);
+        try db.delete("alpha");
+    }
+
+    const reopened = try open(testing.allocator, .{
+        .snapshot_path = snapshot_path,
+        .wal_path = wal_path,
+        .fsync_mode = .none,
+    });
+    defer reopened.close() catch unreachable;
+
+    try testing.expect((try reopened.get(testing.allocator, "alpha")) == null);
+
+    var beta = (try reopened.get(testing.allocator, "beta")).?;
+    defer beta.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 2), beta.integer);
+}
+
+test "checkpoint stays compatible with an active read view" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-read-view.snapshot", .{tmp.sub_path});
+    defer testing.allocator.free(snapshot_path);
+
+    const db = try open(std.heap.page_allocator, .{
+        .snapshot_path = snapshot_path,
+    });
+    defer db.close() catch unreachable;
+
+    const alpha_value = types.Value{ .string = "hello" };
+    try db.put("alpha", &alpha_value);
+
+    var view = try db.read_view();
+    errdefer view.deinit();
+    var checkpoint_state = CheckpointThreadState{
+        .db = db,
+    };
+    var barrier_probe = lifecycle.CheckpointBarrierTestProbe{
+        .attempted = &checkpoint_state.barrier_attempted,
+        .acquired = &checkpoint_state.barrier_acquired,
+    };
+    lifecycle.set_checkpoint_barrier_test_probe_for_test(&barrier_probe);
+    defer lifecycle.set_checkpoint_barrier_test_probe_for_test(null);
+    const checkpoint_thread = try std.Thread.spawn(.{}, run_checkpoint_in_thread, .{&checkpoint_state});
+
+    while (!checkpoint_state.barrier_attempted.load(.acquire)) {
+        std.Thread.sleep(std.time.ns_per_ms);
+    }
+    try testing.expect(!checkpoint_state.barrier_acquired.load(.acquire));
+    try testing.expect(!checkpoint_state.finished.load(.acquire));
+
+    view.deinit();
+    checkpoint_thread.join();
+
+    try testing.expect(checkpoint_state.barrier_acquired.load(.acquire));
+    try testing.expect(checkpoint_state.finished.load(.acquire));
+    try testing.expect(checkpoint_state.checkpoint_error == null);
+
+    const reopened = try open(testing.allocator, .{
+        .snapshot_path = snapshot_path,
+    });
+    defer reopened.close() catch unreachable;
+
+    var alpha = (try reopened.get(testing.allocator, "alpha")).?;
+    defer alpha.deinit(testing.allocator);
+    try testing.expectEqualStrings("hello", alpha.string);
 }
 
 test "wal-only restart preserves committed batch semantics" {

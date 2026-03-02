@@ -1,7 +1,7 @@
 //! Storage-owned snapshot read and write for the current runtime state shape.
 //! Time Complexity: Snapshot write and load are O(n + b), where `n` is retained key and TTL entry count and `b` is total serialized bytes.
 //! Allocator: Uses explicit allocators for temporary write sorting, full-file load buffers, decode scratch, and temporary loaded shard state.
-//! Thread Safety: Snapshot write acquires each shard's shared lock while serializing that shard; snapshot load must not race with live engine access.
+//! Thread Safety: Snapshot write acquires the shared visibility gate plus one shard shared lock for each serialization window, which blocks writers globally during those windows but allows active reads to continue. Snapshot load must not race with live engine access.
 
 const std = @import("std");
 const codec = @import("../internal/codec.zig");
@@ -152,7 +152,7 @@ pub const SnapshotLoadResult = struct {
 ///
 /// Allocator: Uses `allocator` for deterministic sorting scratch, temporary serialized values, and the temporary path.
 ///
-/// Thread Safety: Acquires each shard's shared lock while serializing that shard. Callers must provide quiescent global state if they need a fully coherent cross-shard image.
+/// Thread Safety: Acquires the shared visibility gate plus each shard's shared lock while serializing that shard. This blocks writers globally during each shard window, but active reads may continue and may delay completion.
 pub fn write(
     state: *runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
@@ -317,6 +317,8 @@ pub fn load(
 /// Time Complexity: O(n + b), where `n` is retained key and TTL entry count and `b` is total serialized bytes.
 ///
 /// Allocator: Uses `allocator` for sorting scratch, temporary serialized values, and the temporary path.
+///
+/// Thread Safety: Acquires the shared visibility gate plus one shard shared lock at a time. The resulting snapshot fully reflects all mutations with `lsn <= checkpoint_lsn`, while newer mutations may also appear and remain recoverable from retained WAL records.
 fn write_snapshot_file(
     state: *runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
@@ -345,43 +347,7 @@ fn write_snapshot_file(
     var total_records: usize = 0;
 
     for (&state.shards, 0..) |*shard, shard_idx| {
-        shard.lock.lockShared();
-        defer shard.lock.unlockShared();
-
-        const value_entries = try collect_sorted_value_entries(allocator, shard);
-        defer allocator.free(value_entries);
-
-        try writer.writeU32Le(@intCast(shard_idx));
-        try writer.writeU32Le(@intCast(value_entries.len));
-
-        for (value_entries) |entry| {
-            std.debug.assert(entry.key.len <= codec.MAX_KEY_LEN);
-
-            try writer.writeU16Le(@intCast(entry.key.len));
-            try writer.writeAll(entry.key);
-
-            value_buf.clearRetainingCapacity();
-            try codec.serialize_value(allocator, entry.value, &value_buf, 0);
-            std.debug.assert(value_buf.items.len <= codec.MAX_VAL_LEN);
-
-            try writer.writeU32Le(@intCast(value_buf.items.len));
-            try writer.writeAll(value_buf.items);
-        }
-
-        if (version >= 2) {
-            const ttl_entries = try collect_sorted_ttl_entries(allocator, shard);
-            defer allocator.free(ttl_entries);
-
-            try writer.writeU32Le(@intCast(ttl_entries.len));
-            for (ttl_entries) |entry| {
-                std.debug.assert(entry.key.len <= codec.MAX_KEY_LEN);
-                try writer.writeU16Le(@intCast(entry.key.len));
-                try writer.writeAll(entry.key);
-                try writer.writeU64Le(@bitCast(entry.expire_at));
-            }
-        }
-
-        total_records += value_entries.len;
+        total_records += try write_one_shard_snapshot(state, allocator, &writer, &value_buf, shard, shard_idx, version);
     }
 
     var crc_buf: [4]u8 = undefined;
@@ -394,6 +360,63 @@ fn write_snapshot_file(
         .checkpoint_lsn = checkpoint_lsn,
         .records_written = total_records,
     };
+}
+
+/// Writes one shard's currently visible state into the snapshot stream.
+///
+/// Time Complexity: O(n log n + b), where `n` is the shard entry count and `b` is total serialized value bytes for that shard.
+///
+/// Allocator: Uses `allocator` for sorted borrowed-entry slices and temporary serialized value bytes.
+///
+/// Thread Safety: Acquires the shared visibility gate plus this shard's shared lock for the duration of the shard-serialization window, which blocks writers globally during that window.
+fn write_one_shard_snapshot(
+    state: *runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    writer: *CrcFileWriter,
+    value_buf: *std.ArrayList(u8),
+    shard: *const runtime_shard.Shard,
+    shard_idx: usize,
+    version: u32,
+) !usize {
+    state.visibility_gate.lock_shared();
+    defer state.visibility_gate.unlock_shared();
+    shard.lock.lockShared();
+    defer shard.lock.unlockShared();
+
+    const value_entries = try collect_sorted_value_entries(allocator, shard);
+    defer allocator.free(value_entries);
+
+    try writer.writeU32Le(@intCast(shard_idx));
+    try writer.writeU32Le(@intCast(value_entries.len));
+
+    for (value_entries) |entry| {
+        std.debug.assert(entry.key.len <= codec.MAX_KEY_LEN);
+
+        try writer.writeU16Le(@intCast(entry.key.len));
+        try writer.writeAll(entry.key);
+
+        value_buf.clearRetainingCapacity();
+        try codec.serialize_value(allocator, entry.value, value_buf, 0);
+        std.debug.assert(value_buf.items.len <= codec.MAX_VAL_LEN);
+
+        try writer.writeU32Le(@intCast(value_buf.items.len));
+        try writer.writeAll(value_buf.items);
+    }
+
+    if (version >= 2) {
+        const ttl_entries = try collect_sorted_ttl_entries(allocator, shard);
+        defer allocator.free(ttl_entries);
+
+        try writer.writeU32Le(@intCast(ttl_entries.len));
+        for (ttl_entries) |entry| {
+            std.debug.assert(entry.key.len <= codec.MAX_KEY_LEN);
+            try writer.writeU16Le(@intCast(entry.key.len));
+            try writer.writeAll(entry.key);
+            try writer.writeU64Le(@bitCast(entry.expire_at));
+        }
+    }
+
+    return value_entries.len;
 }
 
 /// Collects one shard's values into a lexicographically sorted borrowed view.

@@ -176,6 +176,15 @@ fn runtime_state_from_view(view: *const types.ReadView) error_mod.EngineError!*c
     return @ptrCast(@alignCast(opaque_state));
 }
 
+/// Scans all currently visible keys with the requested prefix.
+///
+/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned scan-entry keys and values through `allocator`.
+///
+/// Ownership: Returns a caller-owned `ScanResult`. The caller must later call `deinit` with the same allocator.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate, then takes one shard-shared lock at a time while collecting visible ART entries.
 pub fn scan_prefix(
     state: *const runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
@@ -201,6 +210,15 @@ pub fn scan_prefix(
     };
 }
 
+/// Scans all currently visible keys inside one inclusive-start, exclusive-end range.
+///
+/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned scan-entry keys and values through `allocator`.
+///
+/// Ownership: Returns a caller-owned `ScanResult`. The caller must later call `deinit` with the same allocator.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate, then takes one shard-shared lock at a time while collecting visible ART entries.
 pub fn scan_range(
     state: *const runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
@@ -226,6 +244,15 @@ pub fn scan_range(
     };
 }
 
+/// Scans one prefix page inside a consistent read view.
+///
+/// Time Complexity: O(s + m log m + p + v), where `s` is shard count, `m` is matched entry count, `p` is pagination resume work over the collected sorted entries, and `v` is total cloned value size in the returned page.
+///
+/// Allocator: Allocates owned scan-entry keys, values, and any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page owns its entries and may own one continuation cursor.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes one shard-shared lock at a time while collecting ART-backed entries.
 pub fn scan_prefix_from_in_view(
     view: *const types.ReadView,
     allocator: std.mem.Allocator,
@@ -241,6 +268,15 @@ pub fn scan_prefix_from_in_view(
     return collect_page_from_entries(allocator, &entries, cursor, limit);
 }
 
+/// Scans one range page inside a consistent read view.
+///
+/// Time Complexity: O(s + m log m + p + v), where `s` is shard count, `m` is matched entry count, `p` is pagination resume work over the collected sorted entries, and `v` is total cloned value size in the returned page.
+///
+/// Allocator: Allocates owned scan-entry keys, values, and any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page owns its entries and may own one continuation cursor.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes one shard-shared lock at a time while collecting ART-backed entries.
 pub fn scan_range_from_in_view(
     view: *const types.ReadView,
     allocator: std.mem.Allocator,

@@ -1,8 +1,6 @@
-//! Adaptive Radix Tree (ART) Core Implementation.
-//! This module provides the `Tree` struct, mapping byte-slice keys to `*Value` pointers.
-//! Time Complexity: Lookups are O(k) where k is the length of the string key. Inserts and Deletes are O(k).
-//! Allocator Rules: `Tree.init()` receives an explicit `allocator` which is used for all internal nodes and leaves.
-//! Zero Implicit Allocation: No hidden allocations occur in `lookup`, `scan`, or `for_each` paths.
+//! ART-backed plain-key index storage for `zeno-core` runtime shards.
+//! Cost: Lookup, insert planning, and delete paths are O(k), where `k` is key length; scans add traversal work over matched entries.
+//! Allocator: Uses the tree-owned allocator for internal nodes and leaves, while lookup and traversal stay allocation-free.
 
 const std = @import("std");
 const Value = @import("../../types/value.zig").Value;
@@ -17,31 +15,39 @@ const Node48 = node.Node48;
 const Node256 = node.Node256;
 const Leaf = node.Leaf;
 const MAX_PREFIX_LEN = node.MAX_PREFIX_LEN;
+/// Planned insert kind reexported for runtime batch integration.
 pub const InsertPlanKind = prepared_insert.InsertPlanKind;
+/// Reservation requirements reexported for runtime batch integration.
 pub const InsertReservationSpec = prepared_insert.InsertReservationSpec;
+/// Planned path-step metadata reexported for runtime batch integration.
 pub const InsertPathStep = prepared_insert.InsertPathStep;
+/// Prepared insert plan reexported for runtime batch integration.
 pub const PreparedInsert = prepared_insert.PreparedInsert;
+/// Reserved live insert payload reexported for runtime batch integration.
 pub const ReservedInsert = prepared_insert.ReservedInsert;
+/// Planner-only shadow tree reexported for runtime batch integration.
 pub const ShadowTree = prepared_insert.ShadowTree;
 
-/// Key range for prefix scans.
-/// Used to represent an open-ended interval `[start, end)`.
-/// `null` values represent unbounded borders (infinity).
+/// Inclusive-start, exclusive-end bounds used by ART range scans.
+///
+/// Ownership:
+/// - `start` and `end` are borrowed.
+/// - Bound slices must remain valid for the duration of the consuming scan call.
 pub const KeyRange = struct {
     start: ?[]const u8 = null,
     end: ?[]const u8 = null,
 };
 
-/// The root of an Adaptive Radix Tree.
-/// This acts as the entrypoint for all key-based operations, managing
-/// the underlying union `Node` representations.
+/// Root ART handle for one shard-local plain-key index.
 pub const Tree = struct {
     root: Node = .{ .empty = {} },
     allocator: std.mem.Allocator,
 
-    /// Initializes a new empty tree.
-    /// Time Complexity: O(1)
-    /// Allocator: The allocator is used for all internal nodes and leaves.
+    /// Initializes one empty ART with the provided node allocator.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Stores `allocator` for all future internal-node and leaf allocation.
     pub fn init(allocator: std.mem.Allocator) Tree {
         return .{
             .allocator = allocator,
@@ -95,9 +101,13 @@ pub const Tree = struct {
         }
     }
 
-    /// Basic lookup function.
-    /// Time Complexity: O(k) where k is the length of the key. Fully allocation-free.
+    /// Resolves the stored value pointer for one exact key when present.
+    ///
+    /// Time Complexity: O(k), where `k` is `key.len`.
+    ///
     /// Allocator: Does not allocate.
+    ///
+    /// Ownership: Returns a borrowed stored value pointer owned by the caller-managed tree lifetime.
     pub fn lookup(self: *const Tree, key: []const u8) ?*Value {
         var current_node_ptr: *const Node = &self.root;
         var depth: usize = 0;

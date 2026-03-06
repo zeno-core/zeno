@@ -1,11 +1,10 @@
-//! Adaptive Radix Tree Node implementations.
-//! Provides the structured layout for `Node4`, `Node16`, `Node48`, `Node256` and their transitions.
-//! Time Complexity: Node transitions (`grow`, `shrink`) are O(1) bounded by local capacity copying (max 256 slots).
-//! Allocator Rules: All methods requiring allocations take an explicit `allocator` parameter.
-//! Zero Implicit Allocation: No hidden allocations or internally retained generalized allocators.
+//! ART internal node layouts and bounded grow/shrink transitions.
+//! Cost: Node-local queries are O(1); grow and shrink copy at most one bounded node payload.
+//! Allocator: Uses explicit allocators only for node transitions that materialize a replacement node.
 
 const std = @import("std");
 const Value = @import("../../types/value.zig").Value;
+
 /// Node types in the Adaptive Radix Tree.
 pub const NodeType = enum(u8) {
     node4,
@@ -14,13 +13,10 @@ pub const NodeType = enum(u8) {
     node256,
 };
 
-/// The prefix size for path compression in ART.
-/// With `MAX_PREFIX_LEN = 11`, the compact metadata block
-/// (`num_children`, `prefix_len`, `node_type`, `prefix`) occupies 16 bytes.
-/// The full `NodeHeader` is 24 bytes because it also stores `leaf_value`.
+/// Inline prefix-byte capacity stored in every ART internal-node header.
 pub const MAX_PREFIX_LEN = 11;
 
-/// Base header for all ART nodes. Current size: 24 bytes.
+/// Shared metadata stored at the front of every ART internal-node layout.
 pub const NodeHeader = extern struct {
     num_children: u16 = 0,
     prefix_len: u16 = 0,
@@ -28,6 +24,11 @@ pub const NodeHeader = extern struct {
     prefix: [MAX_PREFIX_LEN]u8 = undefined,
     leaf_value: ?*Leaf = null,
 
+    /// Initializes one empty internal-node header for the requested node class.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
     pub fn init(n_type: NodeType) NodeHeader {
         return .{
             .node_type = n_type,
@@ -49,10 +50,20 @@ pub const Node = union(enum) {
     internal: *NodeHeader,
     leaf: *Leaf,
 
+    /// Returns whether this tagged node currently points at a leaf payload.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
     pub fn is_leaf(self: *const Node) bool {
         return self.* == .leaf;
     }
 
+    /// Returns whether this tagged node currently has no payload.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
     pub fn is_empty(self: *const Node) bool {
         return self.* == .empty;
     }
@@ -667,6 +678,7 @@ pub const Node16 = struct {
 /// allowing for efficient searches and ordered iteration.
 /// Memory Footprint: 168 bytes (24 byte header + 256 bytes child_index + 192 bytes children + padding).
 pub const Node48 = struct {
+    /// Sentinel stored in `child_index` for bytes that have no child edge.
     pub const EMPTY_INDEX: u8 = 255;
     header: NodeHeader,
     child_index: [256]u8 = [_]u8{EMPTY_INDEX} ** 256,

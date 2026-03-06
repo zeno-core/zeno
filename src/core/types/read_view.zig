@@ -77,7 +77,7 @@ fn release_read_view_token(token_id: u64) ?ReadViewToken {
     return removed.value;
 }
 
-/// Logical consistent-read window handle.
+/// Consistent-read window handle for the physical `zeno-core` engine contract.
 pub const ReadView = struct {
     token_id: u64,
 

@@ -22,7 +22,7 @@ const write = @import("write.zig");
 /// Shared error set for engine contract operations.
 pub const EngineError = error_mod.EngineError;
 
-/// Central engine handle coordinated by the future engine layer.
+/// Central engine handle for the finalized `zeno-core` contract surface.
 pub const Database = struct {
     allocator: std.mem.Allocator,
     state: runtime_state.DatabaseState,
@@ -191,6 +191,59 @@ pub fn create(allocator: std.mem.Allocator) EngineError!*Database {
 /// Allocator: Allocates the engine handle from `allocator` and uses explicit allocator paths for snapshot load and WAL replay scratch when persistence is configured.
 pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) EngineError!*Database {
     return lifecycle.open(allocator, options);
+}
+
+/// Scans the next prefix page inside a consistent read view.
+///
+/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
+pub fn scan_prefix_from_in_view(
+    view: *const types.ReadView,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    cursor: ?*const types.ScanCursor,
+    limit: usize,
+) EngineError!types.ScanPageResult {
+    const state = runtime_state_from_view_for_latency(view);
+    return metrics.call_with_optional_latency(state, scan_ops.scan_prefix_from_in_view, .{ view, allocator, prefix, cursor, limit });
+}
+
+/// Scans the next range page inside a consistent read view.
+///
+/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
+pub fn scan_range_from_in_view(
+    view: *const types.ReadView,
+    allocator: std.mem.Allocator,
+    range: types.KeyRange,
+    cursor: ?*const types.ScanCursor,
+    limit: usize,
+) EngineError!types.ScanPageResult {
+    const state = runtime_state_from_view_for_latency(view);
+    return metrics.call_with_optional_latency(state, scan_ops.scan_range_from_in_view, .{ view, allocator, range, cursor, limit });
+}
+
+/// Applies one checked batch under the official advanced contract.
+///
+/// Time Complexity: O(g + n + b + v), where `g` is `batch.guards.len`, `n` is surviving write count, `b` is total serialized value bytes measured during planning, and `v` is total cloned value size for prepared writes.
+///
+/// Allocator: Uses the engine base allocator for committed values and temporary planner scratch while validating guards and preparing the batch.
+///
+/// Ownership: Clones all surviving write values into engine-owned storage before making the batch visible.
+///
+/// Thread Safety: Safe for concurrent use with point operations and read views; acquires the global visibility gate exclusively for the full guard-check and apply window.
+pub fn apply_checked_batch(db: *Database, batch: types.CheckedBatch) EngineError!void {
+    return metrics.call_with_latency(&db.state, batch_ops.apply_checked_batch, .{ &db.state, db.allocator, batch });
 }
 
 fn set_ttl_for_test(db: *Database, key: []const u8, expire_at_seconds: i64) !void {
@@ -1836,57 +1889,4 @@ test "owned scan cursor copies release continuation bytes only once" {
     cursor.deinit();
 
     try testing.expect(copied.as_cursor() == null);
-}
-
-/// Scans the next prefix page inside a consistent read view.
-///
-/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
-///
-/// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
-///
-/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
-///
-/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
-pub fn scan_prefix_from_in_view(
-    view: *const types.ReadView,
-    allocator: std.mem.Allocator,
-    prefix: []const u8,
-    cursor: ?*const types.ScanCursor,
-    limit: usize,
-) EngineError!types.ScanPageResult {
-    const state = runtime_state_from_view_for_latency(view);
-    return metrics.call_with_optional_latency(state, scan_ops.scan_prefix_from_in_view, .{ view, allocator, prefix, cursor, limit });
-}
-
-/// Scans the next range page inside a consistent read view.
-///
-/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
-///
-/// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
-///
-/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
-///
-/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
-pub fn scan_range_from_in_view(
-    view: *const types.ReadView,
-    allocator: std.mem.Allocator,
-    range: types.KeyRange,
-    cursor: ?*const types.ScanCursor,
-    limit: usize,
-) EngineError!types.ScanPageResult {
-    const state = runtime_state_from_view_for_latency(view);
-    return metrics.call_with_optional_latency(state, scan_ops.scan_range_from_in_view, .{ view, allocator, range, cursor, limit });
-}
-
-/// Applies one checked batch under the official advanced contract.
-///
-/// Time Complexity: O(g + n + b + v), where `g` is `batch.guards.len`, `n` is surviving write count, `b` is total serialized value bytes measured during planning, and `v` is total cloned value size for prepared writes.
-///
-/// Allocator: Uses the engine base allocator for committed values and temporary planner scratch while validating guards and preparing the batch.
-///
-/// Ownership: Clones all surviving write values into engine-owned storage before making the batch visible.
-///
-/// Thread Safety: Safe for concurrent use with point operations and read views; acquires the global visibility gate exclusively for the full guard-check and apply window.
-pub fn apply_checked_batch(db: *Database, batch: types.CheckedBatch) EngineError!void {
-    return metrics.call_with_latency(&db.state, batch_ops.apply_checked_batch, .{ &db.state, db.allocator, batch });
 }

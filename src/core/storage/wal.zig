@@ -128,6 +128,9 @@ pub const Wal = struct {
         applier: anytype,
         allocator: std.mem.Allocator,
     ) !Wal {
+        if (std.fs.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        }
         const file = try std.fs.cwd().createFile(path, .{
             .read = true,
             .truncate = false,
@@ -179,8 +182,8 @@ pub const Wal = struct {
     ///
     /// Thread Safety: Serializes with other append and close operations through the internal WAL mutex.
     pub fn append_put(self: *Wal, key: []const u8, value: *const Value) !void {
-        var value_buf = std.ArrayList(u8).init(self.allocator);
-        defer value_buf.deinit();
+        var value_buf = std.ArrayList(u8).empty;
+        defer value_buf.deinit(self.allocator);
 
         try codec.serialize_value(self.allocator, value, &value_buf, 0);
         _ = try self.append_record(tag_put, key, value_buf.items);
@@ -230,7 +233,7 @@ pub const Wal = struct {
         try records.ensureTotalCapacityPrecise(self.allocator, writes.len + 2);
 
         var begin_payload: [batch_begin_payload_len]u8 = undefined;
-        @memset(begin_payload, 0);
+        @memset(&begin_payload, 0);
         try records.append(self.allocator, try append_encoded_record_placeholder(
             self.allocator,
             &envelope,
@@ -255,7 +258,7 @@ pub const Wal = struct {
         }
 
         var commit_payload: [batch_commit_payload_len]u8 = undefined;
-        @memset(commit_payload, 0);
+        @memset(&commit_payload, 0);
         try records.append(self.allocator, try append_encoded_record_placeholder(
             self.allocator,
             &envelope,
@@ -286,14 +289,14 @@ pub const Wal = struct {
                 tag_batch_begin => {
                     const value_offset = record.value_offset;
                     const begin_slice = envelope.items[value_offset .. value_offset + batch_begin_payload_len];
-                    std.mem.writeInt(u32, begin_slice, member_record_count, .little);
+                    std.mem.writeInt(u32, @ptrCast(begin_slice), member_record_count, .little);
                 },
                 tag_batch_commit => {
                     const value_offset = record.value_offset;
                     const lsn_slice = envelope.items[value_offset .. value_offset + 8];
                     const count_slice = envelope.items[value_offset + 8 .. value_offset + batch_commit_payload_len];
-                    std.mem.writeInt(u64, lsn_slice, begin_lsn, .little);
-                    std.mem.writeInt(u32, count_slice, member_record_count, .little);
+                    std.mem.writeInt(u64, @ptrCast(lsn_slice), begin_lsn, .little);
+                    std.mem.writeInt(u32, @ptrCast(count_slice), member_record_count, .little);
                 },
                 tag_put => std.debug.assert(index > 0 and index + 1 < records.items.len),
                 else => unreachable,
@@ -451,6 +454,8 @@ pub const Wal = struct {
     ///
     /// Thread Safety: Serializes through the WAL mutex and must not race with `close`.
     fn append_record(self: *Wal, tag: u8, key: []const u8, value_bytes: []const u8) !u64 {
+        try validate_record_bounds(key, value_bytes);
+
         if (self.fsync_mode == .batched_async and self.state.flush_error.load(.acquire) != 0) {
             return error.WalFlushFailed;
         }
@@ -477,7 +482,7 @@ pub const Wal = struct {
         try buf.appendSlice(self.allocator, value_bytes);
 
         const crc = std.hash.crc.Crc32.hash(buf.items[4..]);
-        std.mem.writeInt(u32, buf.items[0..4], crc, .little);
+        std.mem.writeInt(u32, @ptrCast(buf.items[0..4]), crc, .little);
 
         try write_all_tracked(self.state.file, buf.items);
         _ = self.state.bytes_written_total.fetchAdd(buf.items.len, .monotonic);
@@ -588,6 +593,8 @@ fn append_encoded_record_placeholder(
     key: []const u8,
     value_bytes: []const u8,
 ) !EncodedAppendRecord {
+    try validate_record_bounds_for_tag(tag, key, value_bytes);
+
     const start_offset = buf.items.len;
     try buf.appendNTimes(allocator, 0, 4);
 
@@ -616,9 +623,9 @@ fn append_encoded_record_placeholder(
 ///
 /// Allocator: Does not allocate.
 fn patch_encoded_record(buf: []u8, record: EncodedAppendRecord, lsn: u64) void {
-    std.mem.writeInt(u64, buf[record.lsn_offset .. record.lsn_offset + 8], lsn, .little);
+    std.mem.writeInt(u64, @ptrCast(buf[record.lsn_offset .. record.lsn_offset + 8]), lsn, .little);
     const crc = std.hash.crc.Crc32.hash(buf[record.start_offset + 4 .. record.end_offset]);
-    std.mem.writeInt(u32, buf[record.start_offset .. record.start_offset + 4], crc, .little);
+    std.mem.writeInt(u32, @ptrCast(buf[record.start_offset .. record.start_offset + 4]), crc, .little);
 }
 
 /// Appends one little-endian `u16` to the target buffer.
@@ -652,6 +659,20 @@ fn write_u64_le(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: u6
     var tmp: [8]u8 = undefined;
     std.mem.writeInt(u64, &tmp, value, .little);
     try buf.appendSlice(allocator, &tmp);
+}
+
+fn validate_record_bounds(key: []const u8, value_bytes: []const u8) !void {
+    if (key.len == 0 or key.len > MAX_KEY_LEN) return error.KeyTooLarge;
+    if (value_bytes.len > MAX_VAL_LEN) return error.ValueTooLarge;
+}
+
+fn validate_record_bounds_for_tag(tag: u8, key: []const u8, value_bytes: []const u8) !void {
+    if (tag == tag_batch_begin or tag == tag_batch_commit) {
+        if (key.len != 0) return error.KeyTooLarge;
+        if (value_bytes.len > MAX_VAL_LEN) return error.ValueTooLarge;
+        return;
+    }
+    try validate_record_bounds(key, value_bytes);
 }
 
 var g_fail_next_write = std.atomic.Value(bool).init(false);
@@ -739,8 +760,8 @@ fn collect_record_tags_test(allocator: std.mem.Allocator, bytes: []const u8) ![]
         if (bytes.len - cursor < 19) return error.EndOfStream;
 
         const tag = bytes[cursor + 12];
-        const key_len = std.mem.readInt(u16, bytes[cursor + 13 .. cursor + 15], .little);
-        const value_len = std.mem.readInt(u32, bytes[cursor + 15 + key_len .. cursor + 19 + key_len], .little);
+        const key_len = std.mem.readInt(u16, @ptrCast(bytes[cursor + 13 .. cursor + 15]), .little);
+        const value_len = std.mem.readInt(u32, @ptrCast(bytes[cursor + 15 + key_len .. cursor + 19 + key_len]), .little);
         const record_len = 19 + @as(usize, key_len) + @as(usize, value_len);
         if (cursor + record_len > bytes.len) return error.EndOfStream;
 
@@ -822,7 +843,7 @@ const ReplayCollector = struct {
     fn init(allocator: std.mem.Allocator) ReplayCollector {
         return .{
             .allocator = allocator,
-            .events = std.ArrayList(ReplayEvent).init(allocator),
+            .events = .empty,
         };
     }
 
@@ -835,7 +856,7 @@ const ReplayCollector = struct {
         for (self.events.items) |event| {
             self.allocator.free(event.key);
         }
-        self.events.deinit();
+        self.events.deinit(self.allocator);
         self.* = undefined;
     }
 
@@ -864,7 +885,7 @@ const ReplayCollector = struct {
 fn replay_collector_put(ctx: *anyopaque, key: []const u8, value: *const Value) !void {
     _ = value;
     const collector: *ReplayCollector = @ptrCast(@alignCast(ctx));
-    try collector.events.append(.{
+    try collector.events.append(collector.allocator, .{
         .kind = .put,
         .key = try collector.allocator.dupe(u8, key),
     });
@@ -877,7 +898,7 @@ fn replay_collector_put(ctx: *anyopaque, key: []const u8, value: *const Value) !
 /// Allocator: Duplicates `key` with the collector allocator.
 fn replay_collector_delete(ctx: *anyopaque, key: []const u8) !void {
     const collector: *ReplayCollector = @ptrCast(@alignCast(ctx));
-    try collector.events.append(.{
+    try collector.events.append(collector.allocator, .{
         .kind = .delete,
         .key = try collector.allocator.dupe(u8, key),
     });
@@ -890,7 +911,7 @@ fn replay_collector_delete(ctx: *anyopaque, key: []const u8) !void {
 /// Allocator: Duplicates `key` with the collector allocator.
 fn replay_collector_expire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void {
     const collector: *ReplayCollector = @ptrCast(@alignCast(ctx));
-    try collector.events.append(.{
+    try collector.events.append(collector.allocator, .{
         .kind = .expire,
         .key = try collector.allocator.dupe(u8, key),
         .expire_at = expire_at_sec,
@@ -912,8 +933,8 @@ fn write_crafted_record_test(
     key: []const u8,
     value_bytes: []const u8,
 ) !void {
-    var buf = std.ArrayList(u8).init(allocator);
-    defer buf.deinit();
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
 
     try buf.appendNTimes(allocator, 0, 4);
     try write_u64_le(allocator, &buf, lsn);
@@ -924,8 +945,12 @@ fn write_crafted_record_test(
     try buf.appendSlice(allocator, value_bytes);
 
     const crc = std.hash.crc.Crc32.hash(buf.items[4..]);
-    std.mem.writeInt(u32, buf.items[0..4], crc, .little);
+    std.mem.writeInt(u32, @ptrCast(buf.items[0..4]), crc, .little);
     try file.writeAll(buf.items);
+}
+
+fn alloc_tmp_path_test(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basename: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, basename });
 }
 
 test "open succeeds for a new empty wal file" {
@@ -934,7 +959,7 @@ test "open succeeds for a new empty wal file" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-empty.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step6-empty.wal");
     defer testing.allocator.free(path);
 
     var wal = try open(path, .{ .fsync_mode = .none }, noop_applier(), testing.allocator);
@@ -947,7 +972,7 @@ test "replay restores standalone put delete and expire records" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-replay-standalone.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-replay-standalone.wal");
     defer testing.allocator.free(path);
 
     {
@@ -985,7 +1010,7 @@ test "append point records writes put delete and expire tags" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step6-point-records.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step6-point-records.wal");
     defer testing.allocator.free(path);
 
     var wal = try open(path, .{ .fsync_mode = .none }, noop_applier(), testing.allocator);
@@ -1012,7 +1037,7 @@ test "replay restores committed put batch atomically and in order" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-batch-replay.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-batch-replay.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1047,7 +1072,7 @@ test "replay truncates incomplete batch tails safely" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-incomplete-tail.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-incomplete-tail.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1076,7 +1101,7 @@ test "replay truncates incomplete batch tails safely" {
     defer collector.deinit();
 
     const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
-    try testing.expectEqual(@as(u64, 2), result.last_lsn);
+    try testing.expectEqual(@as(u64, 1), result.last_lsn);
     try testing.expectEqual(@as(usize, 0), result.records_applied);
     try testing.expectEqual(@as(usize, 0), collector.events.items.len);
     try testing.expectEqual(@as(u64, 0), try replay_file.getEndPos());
@@ -1088,7 +1113,7 @@ test "replay truncates corrupt crc tails safely" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-corrupt-tail.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-corrupt-tail.wal");
     defer testing.allocator.free(path);
 
     var second_start: u64 = 0;
@@ -1107,7 +1132,7 @@ test "replay truncates corrupt crc tails safely" {
         defer file.close();
         try file.seekTo(second_start);
         var byte: [1]u8 = undefined;
-        try file.readNoEof(&byte);
+        if ((try file.readAll(&byte)) != byte.len) return error.EndOfStream;
         try file.seekTo(second_start);
         byte[0] ^= 0xff;
         try file.writeAll(&byte);
@@ -1133,22 +1158,25 @@ test "replay truncates invalid batch structures from the matching begin" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-invalid-batch.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-invalid-batch.wal");
     defer testing.allocator.free(path);
 
+    if (std.fs.path.dirname(path)) |dir_path| {
+        if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+    }
     const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
     defer file.close();
 
-    var put_buf = std.ArrayList(u8).init(testing.allocator);
-    defer put_buf.deinit();
+    var put_buf = std.ArrayList(u8).empty;
+    defer put_buf.deinit(testing.allocator);
     try codec.serialize_value(testing.allocator, &Value{ .integer = 1 }, &put_buf, 0);
 
     var begin_payload: [batch_begin_payload_len]u8 = undefined;
     std.mem.writeInt(u32, &begin_payload, 1, .little);
 
     var commit_payload: [batch_commit_payload_len]u8 = undefined;
-    std.mem.writeInt(u64, commit_payload[0..8], 999, .little);
-    std.mem.writeInt(u32, commit_payload[8..12], 1, .little);
+    std.mem.writeInt(u64, @ptrCast(commit_payload[0..8]), 999, .little);
+    std.mem.writeInt(u32, @ptrCast(commit_payload[8..12]), 1, .little);
 
     try write_crafted_record_test(testing.allocator, file, 1, tag_put, "seed", put_buf.items);
     const batch_begin_offset = try file.getEndPos();
@@ -1163,7 +1191,7 @@ test "replay truncates invalid batch structures from the matching begin" {
     defer collector.deinit();
 
     const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
-    try testing.expectEqual(@as(u64, 1), result.last_lsn);
+    try testing.expectEqual(@as(u64, 2), result.last_lsn);
     try testing.expectEqual(@as(usize, 1), result.records_applied);
     try testing.expectEqual(@as(usize, 1), collector.events.items.len);
     try testing.expectEqualStrings("seed", collector.events.items[0].key);
@@ -1176,7 +1204,7 @@ test "replay honors min_lsn for standalone records and whole batches" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-min-lsn.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-min-lsn.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1201,7 +1229,7 @@ test "replay honors min_lsn for standalone records and whole batches" {
         defer collector.deinit();
 
         const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 1);
-        try testing.expectEqual(@as(u64, 4), result.last_lsn);
+        try testing.expectEqual(@as(u64, 5), result.last_lsn);
         try testing.expectEqual(@as(usize, 2), result.records_applied);
         try testing.expectEqual(@as(usize, 2), collector.events.items.len);
         try testing.expectEqualStrings("beta", collector.events.items[0].key);
@@ -1216,7 +1244,7 @@ test "replay honors min_lsn for standalone records and whole batches" {
         defer collector.deinit();
 
         const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 2);
-        try testing.expectEqual(@as(u64, 4), result.last_lsn);
+        try testing.expectEqual(@as(u64, 5), result.last_lsn);
         try testing.expectEqual(@as(usize, 0), result.records_applied);
         try testing.expectEqual(@as(usize, 0), collector.events.items.len);
     }
@@ -1228,7 +1256,7 @@ test "open on a non-empty wal replays and advances next_lsn" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-open-replay.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-open-replay.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1256,7 +1284,7 @@ test "fsync failure propagates from always mode append" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-fsync-failure.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-fsync-failure.wal");
     defer testing.allocator.free(path);
 
     var wal = try open(path, .{ .fsync_mode = .always }, noop_applier(), testing.allocator);
@@ -1273,7 +1301,7 @@ test "truncate_up_to_lsn drops standalone records at or below the cutoff" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-compact-standalone.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-compact-standalone.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1306,7 +1334,7 @@ test "truncate_up_to_lsn keeps committed batches by commit lsn" {
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-compact-batch.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-compact-batch.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1347,7 +1375,7 @@ test "truncate_up_to_lsn drops incomplete trailing batches instead of retaining 
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const path = try std.fmt.allocPrint(testing.allocator, "{s}/step7-compact-invalid-tail.wal", .{tmp.sub_path});
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step7-compact-invalid-tail.wal");
     defer testing.allocator.free(path);
 
     {
@@ -1385,4 +1413,180 @@ test "truncate_up_to_lsn drops incomplete trailing batches instead of retaining 
     try testing.expectEqual(@as(u64, 0), result.last_lsn);
     try testing.expectEqual(@as(usize, 0), result.records_applied);
     try testing.expectEqual(@as(usize, 0), collector.events.items.len);
+}
+
+test "append_put rejects oversized keys and values before writing records" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step12-oversized.wal");
+    defer testing.allocator.free(path);
+
+    var wal = try open(path, .{ .fsync_mode = .none }, noop_applier(), testing.allocator);
+    defer wal.close();
+
+    const oversized_key = try testing.allocator.alloc(u8, codec.MAX_KEY_LEN + 1);
+    defer testing.allocator.free(oversized_key);
+    @memset(oversized_key, 'k');
+
+    const oversized_value_bytes = try testing.allocator.alloc(u8, @as(usize, @intCast(codec.MAX_VAL_LEN)) + 1);
+    defer testing.allocator.free(oversized_value_bytes);
+    @memset(oversized_value_bytes, 'v');
+    const oversized_value = Value{ .string = oversized_value_bytes };
+
+    try testing.expectError(error.KeyTooLarge, wal.append_put(oversized_key, &Value{ .integer = 1 }));
+    try testing.expectError(error.ValueTooLarge, wal.append_put("value:too:large", &oversized_value));
+}
+
+test "replay decodes allocated string and object values for put records" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step12-allocated-values.wal");
+    defer testing.allocator.free(path);
+
+    {
+        var wal = try open(path, .{ .fsync_mode = .none }, noop_applier(), testing.allocator);
+        defer wal.close();
+
+        var object = std.StringHashMapUnmanaged(Value){};
+        defer {
+            var iterator = object.iterator();
+            while (iterator.next()) |entry| {
+                testing.allocator.free(entry.key_ptr.*);
+                entry.value_ptr.deinit(testing.allocator);
+            }
+            object.deinit(testing.allocator);
+        }
+        try object.put(testing.allocator, try testing.allocator.dupe(u8, "nested"), .{ .string = try testing.allocator.dupe(u8, "ok") });
+
+        const string_value = Value{ .string = "hello" };
+        const object_value = Value{ .object = object };
+        try wal.append_put("alpha", &string_value);
+        try wal.append_put("beta", &object_value);
+    }
+
+    const Collector = struct {
+        allocator: std.mem.Allocator,
+        values: std.ArrayList(Value),
+
+        fn init(allocator: std.mem.Allocator) @This() {
+            return .{
+                .allocator = allocator,
+                .values = .empty,
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            for (self.values.items) |*value| value.deinit(self.allocator);
+            self.values.deinit(self.allocator);
+        }
+
+        fn put(ctx: *anyopaque, key: []const u8, value: *const Value) !void {
+            _ = key;
+            const self: *@This() = @ptrCast(@alignCast(ctx));
+            try self.values.append(self.allocator, try value.clone(self.allocator));
+        }
+
+        fn delete(ctx: *anyopaque, key: []const u8) !void {
+            _ = ctx;
+            _ = key;
+        }
+
+        fn expire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void {
+            _ = ctx;
+            _ = key;
+            _ = expire_at_sec;
+        }
+    };
+
+    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    defer replay_file.close();
+
+    var collector = Collector.init(testing.allocator);
+    defer collector.deinit();
+
+    const result = try storage_replay.replay(.{
+        .ctx = &collector,
+        .put = Collector.put,
+        .delete = Collector.delete,
+        .expire = Collector.expire,
+    }, testing.allocator, replay_file, 0);
+    try testing.expectEqual(@as(u64, 2), result.last_lsn);
+    try testing.expectEqual(@as(usize, 2), collector.values.items.len);
+    try testing.expectEqualStrings("hello", collector.values.items[0].string);
+    try testing.expectEqualStrings("ok", collector.values.items[1].object.get("nested").?.string);
+}
+
+test "replay truncates standalone records with partial key payloads safely" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step12-partial-key.wal");
+    defer testing.allocator.free(path);
+
+    {
+        if (std.fs.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        }
+        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+        defer file.close();
+        try write_crafted_record_test(testing.allocator, file, 1, tag_delete, "alpha", "");
+        try file.setEndPos(4 + 8 + 1 + 2 + 3);
+    }
+
+    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    defer replay_file.close();
+
+    var collector = ReplayCollector.init(testing.allocator);
+    defer collector.deinit();
+
+    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    try testing.expectEqual(@as(u64, 0), result.last_lsn);
+    try testing.expectEqual(@as(usize, 0), result.records_applied);
+    try testing.expectEqual(@as(usize, 0), collector.events.items.len);
+    try testing.expectEqual(@as(u64, 0), try replay_file.getEndPos());
+}
+
+test "replay truncates standalone records with partial value payloads safely" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try alloc_tmp_path_test(testing.allocator, tmp, "step12-partial-value.wal");
+    defer testing.allocator.free(path);
+
+    var value_buf = std.ArrayList(u8).empty;
+    defer value_buf.deinit(testing.allocator);
+    try codec.serialize_value(testing.allocator, &Value{ .string = "hello" }, &value_buf, 0);
+
+    {
+        if (std.fs.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        }
+        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
+        defer file.close();
+        try write_crafted_record_test(testing.allocator, file, 1, tag_put, "alpha", value_buf.items);
+        const size = try file.getEndPos();
+        try file.setEndPos(size - 1);
+    }
+
+    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
+    defer replay_file.close();
+
+    var collector = ReplayCollector.init(testing.allocator);
+    defer collector.deinit();
+
+    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    try testing.expectEqual(@as(u64, 0), result.last_lsn);
+    try testing.expectEqual(@as(usize, 0), result.records_applied);
+    try testing.expectEqual(@as(usize, 0), collector.events.items.len);
+    try testing.expectEqual(@as(u64, 0), try replay_file.getEndPos());
 }

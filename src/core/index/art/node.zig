@@ -735,7 +735,19 @@ pub const Node256 = struct {
     }
 };
 
-test "ART Node Struct Definitions" {
+fn create_test_leaf(allocator: std.mem.Allocator, key: []const u8, value_int: i64) !*Leaf {
+    const stored_key = try allocator.dupe(u8, key);
+    const value = try allocator.create(Value);
+    value.* = .{ .integer = value_int };
+    const leaf = try allocator.create(Leaf);
+    leaf.* = .{
+        .key = stored_key,
+        .value = value,
+    };
+    return leaf;
+}
+
+test "art node structs keep expected header and payload sizes" {
     const testing = std.testing;
 
     const n4 = Node4.init();
@@ -745,6 +757,155 @@ test "ART Node Struct Definitions" {
 
     const n16 = Node16.init();
     try testing.expectEqual(NodeType.node16, n16.header.node_type);
+    try testing.expectEqual(NodeType.node48, Node48.init().header.node_type);
+    try testing.expectEqual(NodeType.node256, Node256.init().header.node_type);
+}
 
-    // Verify NodeHeader size is 24 bytes.
+test "node4 add_child keeps child bytes sorted" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const internal = try arena.allocator().create(Node4);
+    internal.* = Node4.init();
+    var root = Node{ .internal = &internal.header };
+
+    try root.add_child(arena.allocator(), 'm', .{ .leaf = try create_test_leaf(arena.allocator(), "m", 1) });
+    try root.add_child(arena.allocator(), 'a', .{ .leaf = try create_test_leaf(arena.allocator(), "a", 2) });
+    try root.add_child(arena.allocator(), 'z', .{ .leaf = try create_test_leaf(arena.allocator(), "z", 3) });
+    try root.add_child(arena.allocator(), 'b', .{ .leaf = try create_test_leaf(arena.allocator(), "b", 4) });
+
+    try testing.expectEqual(NodeType.node4, root.internal.node_type);
+    const n4 = @as(*Node4, @alignCast(@fieldParentPtr("header", root.internal)));
+    try testing.expectEqualSlices(u8, &.{ 'a', 'b', 'm', 'z' }, n4.keys[0..4]);
+}
+
+test "add_child grows node4 into node16 and preserves children" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const internal = try arena.allocator().create(Node4);
+    internal.* = Node4.init();
+    var root = Node{ .internal = &internal.header };
+
+    for ([_]u8{ 'a', 'b', 'c', 'd', 'e' }, 0..) |byte, index| {
+        const key = [_]u8{byte};
+        try root.add_child(arena.allocator(), byte, .{ .leaf = try create_test_leaf(arena.allocator(), &key, @intCast(index)) });
+    }
+
+    try testing.expectEqual(NodeType.node16, root.internal.node_type);
+    const n16 = @as(*Node16, @alignCast(@fieldParentPtr("header", root.internal)));
+    try testing.expectEqual(@as(u16, 5), n16.header.num_children);
+    for ([_]u8{ 'a', 'b', 'c', 'd', 'e' }) |byte| {
+        try testing.expect(n16.find_child(byte) != null);
+    }
+}
+
+test "add_child grows node16 into node48 and node48 into node256" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const internal = try arena.allocator().create(Node4);
+    internal.* = Node4.init();
+    var root = Node{ .internal = &internal.header };
+
+    for (0..49) |index| {
+        const byte: u8 = @intCast(index);
+        const key = [_]u8{byte};
+        try root.add_child(arena.allocator(), byte, .{ .leaf = try create_test_leaf(arena.allocator(), &key, @intCast(index)) });
+    }
+
+    try testing.expectEqual(NodeType.node256, root.internal.node_type);
+    const n256 = @as(*Node256, @alignCast(@fieldParentPtr("header", root.internal)));
+    try testing.expectEqual(@as(u16, 49), n256.header.num_children);
+    for (0..49) |index| {
+        try testing.expect(n256.find_child(@intCast(index)) != null);
+    }
+}
+
+test "remove_child shrinks node256 into node48 and node48 into node16 and node16 into node4" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const internal = try arena.allocator().create(Node4);
+    internal.* = Node4.init();
+    var root = Node{ .internal = &internal.header };
+
+    for (0..49) |index| {
+        const byte: u8 = @intCast(index);
+        const key = [_]u8{byte};
+        try root.add_child(arena.allocator(), byte, .{ .leaf = try create_test_leaf(arena.allocator(), &key, @intCast(index)) });
+    }
+
+    try testing.expectEqual(NodeType.node256, root.internal.node_type);
+
+    try root.remove_child(arena.allocator(), 48);
+    try testing.expectEqual(NodeType.node48, root.internal.node_type);
+
+    for (16..48) |index| {
+        try root.remove_child(arena.allocator(), @intCast(index));
+    }
+    try testing.expectEqual(NodeType.node16, root.internal.node_type);
+
+    for (4..17) |index| {
+        try root.remove_child(arena.allocator(), @intCast(index));
+    }
+    try testing.expectEqual(NodeType.node4, root.internal.node_type);
+}
+
+test "shrink on a one-child node4 promotes a leaf child" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const internal = try arena.allocator().create(Node4);
+    internal.* = Node4.init();
+    var root = Node{ .internal = &internal.header };
+    const leaf = try create_test_leaf(arena.allocator(), "alpha", 1);
+    try root.add_child(arena.allocator(), 'a', .{ .leaf = leaf });
+
+    try root.shrink(arena.allocator());
+
+    try testing.expect(root == .leaf);
+    try testing.expectEqualStrings("alpha", root.leaf.key);
+}
+
+test "shrink on a one-child node4 merges the child prefix into the remaining internal node" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    const parent = try arena.allocator().create(Node4);
+    parent.* = Node4.init();
+    parent.header.prefix_len = 2;
+    parent.header.prefix[0] = 'a';
+    parent.header.prefix[1] = 'b';
+
+    const child = try arena.allocator().create(Node4);
+    child.* = Node4.init();
+    child.header.prefix_len = 2;
+    child.header.prefix[0] = 'd';
+    child.header.prefix[1] = 'e';
+    var child_node = Node{ .internal = &child.header };
+    try child_node.add_child(arena.allocator(), 'f', .{ .leaf = try create_test_leaf(arena.allocator(), "abxdef", 1) });
+
+    var root = Node{ .internal = &parent.header };
+    try root.add_child(arena.allocator(), 'x', .{ .internal = &child.header });
+    try root.shrink(arena.allocator());
+
+    try testing.expect(root == .internal);
+    try testing.expectEqual(@as(u16, 5), root.internal.prefix_len);
+    try testing.expectEqualSlices(u8, "abxde", root.internal.prefix[0..5]);
+    const merged = @as(*Node4, @alignCast(@fieldParentPtr("header", root.internal)));
+    try testing.expectEqual(@as(u16, 1), merged.header.num_children);
+    try testing.expectEqual(@as(u8, 'f'), merged.keys[0]);
 }

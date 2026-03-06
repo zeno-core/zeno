@@ -51,6 +51,8 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
 ///
 /// Thread Safety: Acquires the exclusive side of the global visibility gate, then the selected shard's exclusive lock, and appends the DELETE record inside that same visibility window before publishing the removal.
 pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.EngineError!bool {
+    if (key.len == 0 or key.len > MAX_KEY_LEN) return error.KeyTooLarge;
+
     state.visibility_gate.lock_exclusive();
     defer state.visibility_gate.unlock_exclusive();
 

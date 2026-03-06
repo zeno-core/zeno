@@ -92,6 +92,7 @@ fn create_with_snapshot_path(
         .allocator = allocator,
         .state = DatabaseState.init(allocator, snapshot_path),
     };
+    db.state.rebind_shard_allocators();
     return db;
 }
 
@@ -147,7 +148,7 @@ pub fn checkpoint(db: *Database) EngineError!void {
     for (&db.state.shards) |*shard| shard.lock.unlock();
     db.state.visibility_gate.unlock_exclusive();
 
-    storage_snapshot.write(&db.state, db.allocator, snapshot_path, checkpoint_lsn) catch |err| {
+    _ = storage_snapshot.write(&db.state, db.allocator, snapshot_path, checkpoint_lsn) catch |err| {
         return error_mod.map_persistence_error(err);
     };
 
@@ -253,16 +254,16 @@ fn purge_expired_after_recovery(state: *DatabaseState) !void {
         shard.lock.lock();
         defer shard.lock.unlock();
 
-        var expired_keys = std.ArrayList([]u8).init(state.base_allocator);
+        var expired_keys = std.ArrayList([]u8).empty;
         defer {
             for (expired_keys.items) |key| state.base_allocator.free(key);
-            expired_keys.deinit();
+            expired_keys.deinit(state.base_allocator);
         }
 
         var iterator = shard.ttl_index.iterator();
         while (iterator.next()) |entry| {
             if (!internal_ttl_index.is_expired(entry.value_ptr.*, now)) continue;
-            try expired_keys.append(try state.base_allocator.dupe(u8, entry.key_ptr.*));
+            try expired_keys.append(state.base_allocator, try state.base_allocator.dupe(u8, entry.key_ptr.*));
         }
 
         for (expired_keys.items) |key| {
@@ -335,6 +336,10 @@ fn replay_expire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void {
     try internal_ttl_index.set_ttl_entry(shard, key, expire_at_sec);
 }
 
+fn alloc_tmp_path_test(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basename: []const u8) ![]u8 {
+    return std.fmt.allocPrint(allocator, ".zig-cache/tmp/{s}/{s}", .{ tmp.sub_path, basename });
+}
+
 test "create initializes runtime state without storage handles" {
     const testing = std.testing;
 
@@ -351,9 +356,9 @@ test "load_snapshot_for_open records corruption fallback when replayable wal exi
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/fallback.snapshot", .{tmp.sub_path});
+    const snapshot_path = try alloc_tmp_path_test(testing.allocator, tmp, "fallback.snapshot");
     defer testing.allocator.free(snapshot_path);
-    const wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/fallback.wal", .{tmp.sub_path});
+    const wal_path = try alloc_tmp_path_test(testing.allocator, tmp, "fallback.wal");
     defer testing.allocator.free(wal_path);
 
     {
@@ -388,11 +393,11 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     var tmp = testing.tmpDir(.{});
     defer tmp.cleanup();
 
-    const snapshot_path = try std.fmt.allocPrint(testing.allocator, "{s}/no-fallback.snapshot", .{tmp.sub_path});
+    const snapshot_path = try alloc_tmp_path_test(testing.allocator, tmp, "no-fallback.snapshot");
     defer testing.allocator.free(snapshot_path);
-    const missing_wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/missing.wal", .{tmp.sub_path});
+    const missing_wal_path = try alloc_tmp_path_test(testing.allocator, tmp, "missing.wal");
     defer testing.allocator.free(missing_wal_path);
-    const empty_wal_path = try std.fmt.allocPrint(testing.allocator, "{s}/empty.wal", .{tmp.sub_path});
+    const empty_wal_path = try alloc_tmp_path_test(testing.allocator, tmp, "empty.wal");
     defer testing.allocator.free(empty_wal_path);
 
     {

@@ -1507,6 +1507,124 @@ pub const ScanEntry = struct {
     value: *const Value,
 };
 
+fn create_test_value(allocator: std.mem.Allocator, value_int: i64) !*Value {
+    const value = try allocator.create(Value);
+    value.* = .{ .integer = value_int };
+    return value;
+}
+
+fn expect_lookup_int(tree: *Tree, key: []const u8, expected: i64) !void {
+    const testing = std.testing;
+    const value = tree.lookup(key) orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(expected, value.integer);
+}
+
+test "insert lookup overwrite and delete handle shared prefixes and exact matches" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tree = Tree.init(arena.allocator());
+
+    try tree.insert(try arena.allocator().dupe(u8, "alpha"), try create_test_value(arena.allocator(), 1));
+    try tree.insert(try arena.allocator().dupe(u8, "alphabet"), try create_test_value(arena.allocator(), 2));
+    try tree.insert(try arena.allocator().dupe(u8, "alphanumeric"), try create_test_value(arena.allocator(), 3));
+
+    try expect_lookup_int(&tree, "alpha", 1);
+    try expect_lookup_int(&tree, "alphabet", 2);
+    try expect_lookup_int(&tree, "alphanumeric", 3);
+
+    try tree.insert(try arena.allocator().dupe(u8, "alpha"), try create_test_value(arena.allocator(), 9));
+    try expect_lookup_int(&tree, "alpha", 9);
+
+    try testing.expect(try tree.delete("alphabet"));
+    try testing.expect(tree.lookup("alphabet") == null);
+    try expect_lookup_int(&tree, "alpha", 9);
+    try expect_lookup_int(&tree, "alphanumeric", 3);
+}
+
+test "insert handles keys when one key is a prefix of another" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tree = Tree.init(arena.allocator());
+    try tree.insert(try arena.allocator().dupe(u8, "a"), try create_test_value(arena.allocator(), 1));
+    try tree.insert(try arena.allocator().dupe(u8, "ab"), try create_test_value(arena.allocator(), 2));
+    try tree.insert(try arena.allocator().dupe(u8, "abc"), try create_test_value(arena.allocator(), 3));
+
+    try expect_lookup_int(&tree, "a", 1);
+    try expect_lookup_int(&tree, "ab", 2);
+    try expect_lookup_int(&tree, "abc", 3);
+}
+
+test "insert preserves long compressed prefixes and binary keys" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tree = Tree.init(arena.allocator());
+    try tree.insert(try arena.allocator().dupe(u8, "abcdefghijklmnop:1"), try create_test_value(arena.allocator(), 10));
+    try tree.insert(try arena.allocator().dupe(u8, "abcdefghijklmnop:2"), try create_test_value(arena.allocator(), 20));
+    try tree.insert(try arena.allocator().dupe(u8, "\x00bin"), try create_test_value(arena.allocator(), 30));
+    try tree.insert(try arena.allocator().dupe(u8, "\x00bip"), try create_test_value(arena.allocator(), 40));
+
+    try expect_lookup_int(&tree, "abcdefghijklmnop:1", 10);
+    try expect_lookup_int(&tree, "abcdefghijklmnop:2", 20);
+    try expect_lookup_int(&tree, "\x00bin", 30);
+    try expect_lookup_int(&tree, "\x00bip", 40);
+}
+
+test "scan_from honors start_after_key and max_items" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tree = Tree.init(arena.allocator());
+    const keys = [_][]const u8{ "a", "aa", "ab", "ac", "b", "c" };
+    for (keys, 0..) |key, index| {
+        try tree.insert(try arena.allocator().dupe(u8, key), try create_test_value(arena.allocator(), @intCast(index + 1)));
+    }
+
+    var collected = std.ArrayList(ScanEntry).empty;
+    defer collected.deinit(testing.allocator);
+
+    const complete = try tree.scan_from("a", "aa", testing.allocator, &collected, 2);
+    try testing.expect(!complete);
+    try testing.expectEqual(@as(usize, 2), collected.items.len);
+    try testing.expectEqualStrings("ab", collected.items[0].key);
+    try testing.expectEqualStrings("ac", collected.items[1].key);
+}
+
+test "scan_range_from returns binary keys in lexicographic order and stops at limit" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tree = Tree.init(arena.allocator());
+    const keys = [_][]const u8{ "\x00a", "\x00b", "\x01a", "\x01b" };
+    for (keys, 0..) |key, index| {
+        try tree.insert(try arena.allocator().dupe(u8, key), try create_test_value(arena.allocator(), @intCast(index + 1)));
+    }
+
+    var collected = std.ArrayList(ScanEntry).empty;
+    defer collected.deinit(testing.allocator);
+
+    const complete = try tree.scan_range_from(.{
+        .start = "\x00a",
+        .end = "\x01b",
+    }, "\x00a", testing.allocator, &collected, 2);
+    try testing.expect(!complete);
+    try testing.expectEqual(@as(usize, 2), collected.items.len);
+    try testing.expectEqualStrings("\x00b", collected.items[0].key);
+    try testing.expectEqualStrings("\x01a", collected.items[1].key);
+}
+
 test "scan_range_from and scan_range_visit_from stay equivalent for same range cursor and limit" {
     const testing = std.testing;
 

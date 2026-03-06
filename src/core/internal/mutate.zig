@@ -78,7 +78,10 @@ pub fn upsert_value_unlocked(
     const cloned_value = try arena_allocator.create(types.Value);
     cloned_value.* = try value.clone(arena_allocator);
     const cloned_key = try arena_allocator.dupe(u8, key);
-    try shard.tree.insert(cloned_key, cloned_value);
+    shard.tree.insert(cloned_key, cloned_value) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.TreeFull, error.InvalidNodeGrowth, error.InvalidNodeType => unreachable,
+    };
 }
 
 /// Removes one stored key/value pair when present.
@@ -90,7 +93,10 @@ pub fn remove_stored_value_unlocked(
     shard: *runtime_shard.Shard,
     key: []const u8,
 ) !bool {
-    return shard.tree.delete(key);
+    return shard.tree.delete(key) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        error.InvalidNodeType, error.InvalidNodeShrink => unreachable,
+    };
 }
 
 /// Returns whether two values are physically equal by full content.

@@ -1192,6 +1192,41 @@ test "plan_insert and apply_prepared_insert grow and add one child when the node
     try testing.expectEqual(@as(i64, 5), stored.integer);
 }
 
+test "shadow planning preserves hidden-prefix sequential inserts across repeated apply" {
+    const testing = std.testing;
+    const art_tree = @import("tree.zig");
+
+    var live_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer live_arena.deinit();
+    const live_allocator = live_arena.allocator();
+
+    var tree = art_tree.Tree.init(live_allocator);
+    const first_value = try live_allocator.create(Value);
+    first_value.* = .{ .integer = 10 };
+    try tree.insert(
+        try live_allocator.dupe(u8, "abcdefghijklmnop:1"),
+        first_value,
+    );
+
+    var shadow_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer shadow_arena.deinit();
+    var shadow = try tree.build_shadow_tree(shadow_arena.allocator());
+    const prepared_two = try tree.plan_prepared_insert(&shadow, shadow_arena.allocator(), "abcdefghijklmnop:2");
+    const prepared_three = try tree.plan_prepared_insert(&shadow, shadow_arena.allocator(), "abcdefghijklmnop:3");
+
+    var reserved_arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer reserved_arena.deinit();
+    const reserved_two = try reserve_insert_for_test(reserved_arena.allocator(), "abcdefghijklmnop:2", .{ .integer = 20 }, prepared_two);
+    const reserved_three = try reserve_insert_for_test(reserved_arena.allocator(), "abcdefghijklmnop:3", .{ .integer = 30 }, prepared_three);
+
+    try tree.apply_prepared_insert(&prepared_two, &reserved_two);
+    try tree.apply_prepared_insert(&prepared_three, &reserved_three);
+
+    try testing.expectEqual(@as(i64, 10), tree.lookup("abcdefghijklmnop:1").?.integer);
+    try testing.expectEqual(@as(i64, 20), tree.lookup("abcdefghijklmnop:2").?.integer);
+    try testing.expectEqual(@as(i64, 30), tree.lookup("abcdefghijklmnop:3").?.integer);
+}
+
 test "apply_prepared_insert detects invariant drift between planning and apply" {
     const testing = std.testing;
 

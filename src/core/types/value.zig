@@ -105,3 +105,120 @@ test "value clone duplicates owned nested storage" {
         else => try testing.expect(false),
     }
 }
+
+test "value clone preserves scalar payloads without allocating nested storage" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var integer = Value{ .integer = 42 };
+    var cloned_integer = try integer.clone(allocator);
+    defer cloned_integer.deinit(allocator);
+    try testing.expectEqual(@as(i64, 42), cloned_integer.integer);
+
+    var boolean = Value{ .boolean = true };
+    var cloned_boolean = try boolean.clone(allocator);
+    defer cloned_boolean.deinit(allocator);
+    try testing.expect(cloned_boolean.boolean);
+
+    var null_value = Value{ .null_val = {} };
+    var cloned_null = try null_value.clone(allocator);
+    defer cloned_null.deinit(allocator);
+    try testing.expect(cloned_null == .null_val);
+}
+
+test "value clone deep copies string storage" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    const owned = try allocator.dupe(u8, "hello");
+    var original = Value{ .string = owned };
+    defer original.deinit(allocator);
+
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit(allocator);
+
+    try testing.expectEqualStrings("hello", cloned.string);
+    try testing.expect(original.string.ptr != cloned.string.ptr);
+}
+
+test "value clone keeps object entries independent from the original" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var object = std.StringHashMapUnmanaged(Value){};
+    defer {
+        var iterator = object.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        object.deinit(allocator);
+    }
+
+    try object.put(allocator, try allocator.dupe(u8, "message"), .{ .string = try allocator.dupe(u8, "hello") });
+
+    var original = Value{ .object = object };
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit(allocator);
+
+    const original_message = original.object.getPtr("message").?;
+    allocator.free(original_message.string);
+    original_message.* = .{ .string = try allocator.dupe(u8, "jello") };
+
+    const cloned_message = cloned.object.get("message").?;
+    try testing.expectEqualStrings("hello", cloned_message.string);
+}
+
+test "value clone keeps array elements independent from the original" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var items = try std.ArrayList(Value).initCapacity(allocator, 2);
+    errdefer {
+        for (items.items) |*item| item.deinit(allocator);
+        items.deinit(allocator);
+    }
+    items.appendAssumeCapacity(.{ .string = try allocator.dupe(u8, "alpha") });
+    items.appendAssumeCapacity(.{ .integer = 7 });
+
+    var original = Value{ .array = items };
+    defer original.deinit(allocator);
+
+    var cloned = try original.clone(allocator);
+    defer cloned.deinit(allocator);
+
+    allocator.free(original.array.items[0].string);
+    original.array.items[0] = .{ .string = try allocator.dupe(u8, "omega") };
+
+    try testing.expectEqualStrings("alpha", cloned.array.items[0].string);
+    try testing.expectEqual(@as(i64, 7), cloned.array.items[1].integer);
+}
+
+test "value deinit releases deeply nested cloned storage safely" {
+    const testing = std.testing;
+    const allocator = testing.allocator;
+
+    var nested_array = try std.ArrayList(Value).initCapacity(allocator, 1);
+    errdefer {
+        for (nested_array.items) |*item| item.deinit(allocator);
+        nested_array.deinit(allocator);
+    }
+    nested_array.appendAssumeCapacity(.{ .string = try allocator.dupe(u8, "leaf") });
+
+    var object = std.StringHashMapUnmanaged(Value){};
+    errdefer {
+        var iterator = object.iterator();
+        while (iterator.next()) |entry| {
+            allocator.free(entry.key_ptr.*);
+            entry.value_ptr.deinit(allocator);
+        }
+        object.deinit(allocator);
+    }
+    try object.put(allocator, try allocator.dupe(u8, "nested"), .{ .array = nested_array });
+
+    var original = Value{ .object = object };
+    defer original.deinit(allocator);
+
+    var cloned = try original.clone(allocator);
+    cloned.deinit(allocator);
+}

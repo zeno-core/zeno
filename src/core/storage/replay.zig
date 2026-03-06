@@ -169,16 +169,16 @@ pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: std.fs.File,
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
 
-    var key_buf = std.ArrayList(u8).init(allocator);
-    defer key_buf.deinit();
-    var val_buf = std.ArrayList(u8).init(allocator);
-    defer val_buf.deinit();
+    var key_buf = std.ArrayList(u8).empty;
+    defer key_buf.deinit(allocator);
+    var val_buf = std.ArrayList(u8).empty;
+    defer val_buf.deinit(allocator);
 
     var pending_batch: ?ReplayBatchState = null;
     defer if (pending_batch) |*batch| batch.deinit();
 
     while (true) {
-        const scanned = try scan_next_record(file, &key_buf, &val_buf);
+        const scanned = try scan_next_record(file, allocator, &key_buf, &val_buf);
         switch (scanned.class) {
             .eof => break,
             .partial_eof => {
@@ -296,18 +296,18 @@ pub fn compact_up_to_lsn(
 ) !void {
     try src_file.seekTo(0);
 
-    var record = std.ArrayList(u8).init(allocator);
-    defer record.deinit();
-    var key_buf = std.ArrayList(u8).init(allocator);
-    defer key_buf.deinit();
-    var val_buf = std.ArrayList(u8).init(allocator);
-    defer val_buf.deinit();
+    var record = std.ArrayList(u8).empty;
+    defer record.deinit(allocator);
+    var key_buf = std.ArrayList(u8).empty;
+    defer key_buf.deinit(allocator);
+    var val_buf = std.ArrayList(u8).empty;
+    defer val_buf.deinit(allocator);
     var pending_batch: ?CompactBatchState = null;
-    var pending_bytes = std.ArrayList(u8).init(allocator);
-    defer pending_bytes.deinit();
+    var pending_bytes = std.ArrayList(u8).empty;
+    defer pending_bytes.deinit(allocator);
 
     while (true) {
-        const scanned = try scan_next_record(src_file, &key_buf, &val_buf);
+        const scanned = try scan_next_record(src_file, allocator, &key_buf, &val_buf);
         switch (scanned.class) {
             .eof => break,
             .partial_eof, .corrupt => break,
@@ -320,7 +320,7 @@ pub fn compact_up_to_lsn(
         if (!batch_is_pending and record_item.tag == tag_batch_commit) break;
         if (batch_is_pending and !is_mutation_tag(record_item.tag) and record_item.tag != tag_batch_commit) break;
 
-        try load_record_bytes(src_file, &record, record_item.start_offset, record_item.end_offset);
+        try load_record_bytes(src_file, allocator, &record, record_item.start_offset, record_item.end_offset);
         defer maybe_drop_replay_scratch(allocator, &key_buf, &val_buf, record_item.key.len, record_item.value.len);
 
         switch (record_item.payload) {
@@ -333,7 +333,7 @@ pub fn compact_up_to_lsn(
                     .seen_mutations = 0,
                 };
                 pending_bytes.clearRetainingCapacity();
-                try pending_bytes.appendSlice(record.items);
+                try pending_bytes.appendSlice(allocator, record.items);
             },
             .batch_commit => |commit| {
                 if (!batch_is_pending) break;
@@ -345,7 +345,7 @@ pub fn compact_up_to_lsn(
                     break;
                 }
 
-                try pending_bytes.appendSlice(record.items);
+                try pending_bytes.appendSlice(allocator, record.items);
                 if (record_item.lsn > max_lsn_inclusive) {
                     try dst_file.writeAll(pending_bytes.items);
                 }
@@ -356,7 +356,7 @@ pub fn compact_up_to_lsn(
                 if (batch_is_pending) {
                     pending_batch.?.seen_mutations += 1;
                     if (pending_batch.?.seen_mutations > pending_batch.?.member_record_count) break;
-                    try pending_bytes.appendSlice(record.items);
+                    try pending_bytes.appendSlice(allocator, record.items);
                 } else if (record_item.lsn > max_lsn_inclusive) {
                     try dst_file.writeAll(record.items);
                 }
@@ -388,12 +388,12 @@ fn maybe_drop_replay_scratch(
     val_len: usize,
 ) void {
     if (key_len > replay_retain_key_limit) {
-        key_buf.deinit();
-        key_buf.* = std.ArrayList(u8).init(allocator);
+        key_buf.deinit(allocator);
+        key_buf.* = .empty;
     }
     if (val_len > replay_retain_val_limit) {
-        val_buf.deinit();
-        val_buf.* = std.ArrayList(u8).init(allocator);
+        val_buf.deinit(allocator);
+        val_buf.* = .empty;
     }
 }
 
@@ -404,6 +404,7 @@ fn maybe_drop_replay_scratch(
 /// Allocator: Resizes `buf` through its owned allocator; caller retains ownership of the copied bytes.
 fn load_record_bytes(
     file: std.fs.File,
+    allocator: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     start_offset: u64,
     end_offset: u64,
@@ -412,7 +413,7 @@ fn load_record_bytes(
     defer file.seekTo(restore_offset) catch {};
 
     const record_len: usize = @intCast(end_offset - start_offset);
-    try buf.resize(record_len);
+    try buf.resize(allocator, record_len);
     try file.seekTo(start_offset);
     if ((try file.readAll(buf.items)) != record_len) return error.EndOfStream;
 }
@@ -501,6 +502,7 @@ fn apply_buffered_batch(
 /// Ownership: Returned `key` and `value` slices borrow `key_buf` and `val_buf` storage until the next scan.
 fn scan_next_record(
     file: std.fs.File,
+    allocator: std.mem.Allocator,
     key_buf: *std.ArrayList(u8),
     val_buf: *std.ArrayList(u8),
 ) !RecordScan {
@@ -589,7 +591,7 @@ fn scan_next_record(
         } };
     }
 
-    try key_buf.resize(key_len);
+    try key_buf.resize(allocator, key_len);
     switch (try read_exact_classified_file(file, key_buf.items)) {
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
@@ -629,7 +631,7 @@ fn scan_next_record(
         } };
     }
 
-    try val_buf.resize(val_len);
+    try val_buf.resize(allocator, val_len);
     switch (try read_exact_classified_file(file, val_buf.items)) {
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{

@@ -46,6 +46,10 @@ pub fn expire_at(
     key: []const u8,
     unix_seconds: ?i64,
 ) error_mod.EngineError!bool {
+    internal_mutate.validate_key(key) catch |err| switch (err) {
+        error.EmptyKey, error.KeyTooLarge => return error.KeyTooLarge,
+    };
+
     state.visibility_gate.lock_exclusive();
     defer state.visibility_gate.unlock_exclusive();
 
@@ -140,6 +144,10 @@ fn try_cleanup_if_possible(
 ///
 /// Thread Safety: Reads under the shared visibility gate and only performs lazy cleanup afterward if the exclusive gate can be acquired immediately.
 pub fn ttl(state: *runtime_state.DatabaseState, key: []const u8) error_mod.EngineError!i64 {
+    internal_mutate.validate_key(key) catch |err| switch (err) {
+        error.EmptyKey, error.KeyTooLarge => return error.KeyTooLarge,
+    };
+
     var cleanup: TtlCleanup = .none;
     const result = blk: {
         const visibility_gate = &state.visibility_gate;

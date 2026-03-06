@@ -97,8 +97,20 @@ pub const DatabaseState = struct {
         };
         for (&state.shards) |*shard| {
             shard.* = runtime_shard.Shard.init(base_allocator);
+            shard.rebind_tree_allocator();
         }
         return state;
+    }
+
+    /// Rebinds every shard tree allocator to the current in-struct shard storage.
+    ///
+    /// Time Complexity: O(s), where `s` is `NUM_SHARDS`.
+    ///
+    /// Allocator: Does not allocate.
+    ///
+    /// Thread Safety: Must run before the state is shared across threads or whenever a by-value move may have invalidated shard-local allocator interfaces.
+    pub fn rebind_shard_allocators(self: *DatabaseState) void {
+        for (&self.shards) |*shard| shard.rebind_tree_allocator();
     }
 
     /// Releases runtime state owned by one engine handle.

@@ -5,6 +5,7 @@
 const std = @import("std");
 const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
+const internal_mutate = @import("../internal/mutate.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
@@ -25,11 +26,11 @@ fn clone_plain_value_no_visibility(
     now: i64,
 ) error_mod.EngineError!?types.Value {
     const shard_idx = runtime_shard.get_shard_index(key);
-    const shard = &state.shards[shard_idx];
+    const shard = @constCast(&state.shards[shard_idx]);
 
     shard.lock.lockShared();
     defer shard.lock.unlockShared();
-    _ = state.counters.ops_get_total.fetchAdd(1, .monotonic);
+    _ = @constCast(&state.counters.ops_get_total).fetchAdd(1, .monotonic);
 
     const stored = shard.tree.lookup(key) orelse return null;
     if (!expiration.key_is_visible_unlocked(shard, key, now)) return null;
@@ -69,6 +70,10 @@ pub fn read_view(state: *const runtime_state.DatabaseState) error_mod.EngineErro
 ///
 /// Thread Safety: Acquires the shared side of the global visibility gate before taking the selected shard's shared lock.
 pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocator, key: []const u8) error_mod.EngineError!?types.Value {
+    internal_mutate.validate_key(key) catch |err| switch (err) {
+        error.EmptyKey, error.KeyTooLarge => return error.KeyTooLarge,
+    };
+
     const visibility_gate = @constCast(&state.visibility_gate);
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();

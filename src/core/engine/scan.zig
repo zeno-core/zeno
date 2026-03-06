@@ -35,7 +35,11 @@ fn free_collected_entries(allocator: std.mem.Allocator, entries: []const Collect
     for (entries) |entry| free_entry(allocator, entry.entry);
 }
 
-fn clone_entry(allocator: std.mem.Allocator, key: []const u8, value: *const types.Value) !types.ScanEntry {
+fn clone_entry(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: *const types.Value,
+) error_mod.EngineError!types.ScanEntry {
     const owned_key = try allocator.dupe(u8, key);
     errdefer allocator.free(owned_key);
 
@@ -73,7 +77,7 @@ const CollectCtx = struct {
     shard: *const runtime_shard.Shard,
 };
 
-fn collect_visit(ctx_ptr: *anyopaque, key: []const u8, value: *const types.Value) !void {
+fn collect_visit(ctx_ptr: *anyopaque, key: []const u8, value: *const types.Value) error_mod.EngineError!void {
     const ctx: *CollectCtx = @ptrCast(@alignCast(ctx_ptr));
     if (!key_matches_query(key, ctx.query)) return;
     if (!expiration.key_is_visible_unlocked(ctx.shard, key, ctx.now)) return;
@@ -88,17 +92,17 @@ fn collect_entries_no_visibility(
     allocator: std.mem.Allocator,
     query: ScanQuery,
     now: i64,
-) !std.ArrayList(CollectedEntry) {
+) error_mod.EngineError!std.ArrayList(CollectedEntry) {
     var entries = std.ArrayList(CollectedEntry).empty;
     errdefer {
         free_collected_entries(allocator, entries.items);
         entries.deinit(allocator);
     }
 
-    for (&state.shards, 0..) |*shard, shard_idx| {
+    for (&state.shards, 0..) |*const_shard, shard_idx| {
+        const shard = @constCast(const_shard);
         shard.lock.lockShared();
-        defer shard.lock.unlockShared();
-
+        errdefer shard.lock.unlockShared();
         var ctx = CollectCtx{
             .allocator = allocator,
             .entries = &entries,
@@ -107,7 +111,11 @@ fn collect_entries_no_visibility(
             .now = now,
             .shard = shard,
         };
-        _ = try shard.tree.for_each(&ctx, collect_visit);
+        _ = shard.tree.for_each(&ctx, collect_visit) catch |err| switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+            else => unreachable,
+        };
+        shard.lock.unlockShared();
     }
 
     std.mem.sort(CollectedEntry, entries.items, {}, entry_less_than);
@@ -194,7 +202,7 @@ pub fn scan_prefix(
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
     const now = runtime_shard.unix_now();
-    _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
+    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
 
     var collected = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix }, now);
     return .{
@@ -228,7 +236,7 @@ pub fn scan_range(
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
     const now = runtime_shard.unix_now();
-    _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
+    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
 
     var collected = try collect_entries_no_visibility(state, allocator, .{ .range = range }, now);
     return .{
@@ -262,7 +270,7 @@ pub fn scan_prefix_from_in_view(
 ) error_mod.EngineError!types.ScanPageResult {
     const state = try runtime_state_from_view(view);
     const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
-    _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
+    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
 
     var entries = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix }, opened_at_unix_seconds);
     return collect_page_from_entries(allocator, &entries, cursor, limit);
@@ -286,7 +294,7 @@ pub fn scan_range_from_in_view(
 ) error_mod.EngineError!types.ScanPageResult {
     const state = try runtime_state_from_view(view);
     const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
-    _ = state.counters.ops_scan_total.fetchAdd(1, .monotonic);
+    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
 
     var entries = try collect_entries_no_visibility(state, allocator, .{ .range = range }, opened_at_unix_seconds);
     return collect_page_from_entries(allocator, &entries, cursor, limit);

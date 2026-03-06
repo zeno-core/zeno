@@ -66,6 +66,17 @@ pub const Shard = struct {
     ttl_index: std.StringHashMapUnmanaged(i64) = .{},
     tree: art.Tree,
 
+    /// Rebinds the tree allocator interface to the shard's current arena owner.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    ///
+    /// Thread Safety: Not thread-safe; caller must already have exclusive access to the shard.
+    pub fn rebind_tree_allocator(self: *Shard) void {
+        self.tree.allocator = self.arena.allocator();
+    }
+
     /// Initializes one shard-local runtime state container.
     ///
     /// Time Complexity: O(1).
@@ -201,6 +212,7 @@ test "reset_unlocked leaves the shard empty and reusable" {
 
     var shard = Shard.init(testing.allocator);
     defer shard.deinit();
+    shard.rebind_tree_allocator();
 
     const allocator = shard.arena.allocator();
     const value = try allocator.create(Value);

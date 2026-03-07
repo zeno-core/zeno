@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const art = @import("../index/art/tree.zig");
+const art_node = @import("../index/art/node.zig");
 
 /// Number of shards in the runtime execution state.
 pub const NUM_SHARDS: usize = 64;
@@ -125,7 +126,26 @@ pub const Shard = struct {
         self.committed_arenas_tail = null;
     }
 
+    fn release_heap_owned_values_unlocked(self: *Shard) void {
+        const Context = struct {
+            shard: *Shard,
+
+            fn visit(ctx_ptr: *anyopaque, key: []const u8, _: *const @import("../types/value.zig").Value) !void {
+                const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+                const leaf = ctx.shard.tree.find_leaf_for_exact_key(key) orelse return;
+                if (leaf.value_owner != art_node.ValueOwner.heap_allocation) return;
+                leaf.value.deinit(ctx.shard.base_allocator);
+                ctx.shard.base_allocator.destroy(leaf.value);
+                leaf.value_owner = .tree_allocator;
+            }
+        };
+
+        var ctx = Context{ .shard = self };
+        _ = self.tree.for_each(&ctx, Context.visit) catch unreachable;
+    }
+
     fn release_storage_unlocked(self: *Shard) void {
+        self.release_heap_owned_values_unlocked();
         var ttl_iterator = self.ttl_index.iterator();
         while (ttl_iterator.next()) |entry| {
             self.base_allocator.free(entry.key_ptr.*);
@@ -155,6 +175,7 @@ pub const Shard = struct {
     ///
     /// Thread Safety: Not thread-safe; caller must already hold exclusive shard ownership or otherwise prove no concurrent access.
     pub fn reset_unlocked(self: *Shard) void {
+        self.release_heap_owned_values_unlocked();
         var ttl_iterator = self.ttl_index.iterator();
         while (ttl_iterator.next()) |entry| {
             self.base_allocator.free(entry.key_ptr.*);

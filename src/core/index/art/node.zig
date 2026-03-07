@@ -37,11 +37,19 @@ pub const NodeHeader = extern struct {
     }
 };
 
+/// Ownership class for one leaf's current value pointer.
+pub const ValueOwner = enum(u8) {
+    tree_allocator,
+    committed_arena,
+    heap_allocation,
+};
+
 /// A Leaf node stores the full key and the value pointer.
 /// Storing the key is essential for splitting leaves during path collisions.
 pub const Leaf = struct {
     key: []const u8,
     value: *Value,
+    value_owner: ValueOwner = .tree_allocator,
 };
 
 /// An ART Node can either be an internal node (storing children) or a leaf node (storing a value).

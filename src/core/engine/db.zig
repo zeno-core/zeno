@@ -7,6 +7,7 @@ const batch_ops = @import("batch.zig");
 const error_mod = @import("error.zig");
 const expiration = @import("expiration.zig");
 const internal_codec = @import("../internal/codec.zig");
+const internal_mutate = @import("../internal/mutate.zig");
 const internal_ttl_index = @import("../internal/ttl_index.zig");
 const lifecycle = @import("lifecycle.zig");
 const metrics = @import("metrics.zig");
@@ -271,6 +272,25 @@ fn has_stored_key_for_test(db: *Database, key: []const u8) bool {
     shard.lock.lockShared();
     defer shard.lock.unlockShared();
     return shard.tree.lookup(key) != null;
+}
+
+fn value_is_heap_owned_for_test(db: *Database, key: []const u8) bool {
+    const shard_idx = runtime_shard.get_shard_index(key);
+    const shard = &db.state.shards[shard_idx];
+
+    shard.lock.lockShared();
+    defer shard.lock.unlockShared();
+    return internal_mutate.value_is_heap_owned_unlocked(shard, key);
+}
+
+fn total_committed_arenas_for_test(db: *Database) usize {
+    var total: usize = 0;
+    for (&db.state.shards) |*shard| {
+        shard.lock.lockShared();
+        total += internal_mutate.count_committed_arenas_unlocked(shard);
+        shard.lock.unlockShared();
+    }
+    return total;
 }
 
 fn expire_at_boundary(db: *Database, key: []const u8, unix_seconds: ?i64) EngineError!bool {
@@ -1930,6 +1950,46 @@ test "shard reset reclaims committed batch arenas" {
     try testing.expect(shard.committed_arenas_tail == null);
     try testing.expect(shard.tree.lookup("arena:one") == null);
     try testing.expect(shard.tree.lookup("arena:two") == null);
+}
+
+test "overwrite-only batches avoid retaining new committed arenas and remain reclaimable" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    var values: [64]types.Value = undefined;
+    var writes: [64]types.PutWrite = undefined;
+    var key_storage: [64][16]u8 = undefined;
+
+    for (0..writes.len) |index| {
+        values[index] = .{ .integer = @intCast(index) };
+        const key = try std.fmt.bufPrint(&key_storage[index], "batch:{d:0>4}", .{index});
+        writes[index] = .{
+            .key = key,
+            .value = &values[index],
+        };
+    }
+
+    try db.apply_batch(&writes);
+    try testing.expectEqual(@as(usize, 41), total_committed_arenas_for_test(db));
+
+    for (0..writes.len) |index| {
+        values[index] = .{ .integer = @intCast(index + 1_000) };
+    }
+
+    try db.apply_batch(&writes);
+    try testing.expectEqual(@as(usize, 41), total_committed_arenas_for_test(db));
+    try testing.expect(value_is_heap_owned_for_test(db, "batch:0000"));
+
+    const point_value = types.Value{ .integer = 9_999 };
+    try db.put("batch:0000", &point_value);
+    try testing.expect(!value_is_heap_owned_for_test(db, "batch:0000"));
+
+    const replacement = types.Value{ .integer = 8_888 };
+    _ = try db.delete("batch:0000");
+    try db.put("batch:0000", &replacement);
+    try testing.expect(!value_is_heap_owned_for_test(db, "batch:0000"));
 }
 
 test "scan_prefix includes the exact key and its subkeys" {

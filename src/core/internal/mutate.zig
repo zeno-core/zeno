@@ -4,6 +4,7 @@
 
 const std = @import("std");
 const codec = @import("codec.zig");
+const art_node = @import("../index/art/node.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const types = @import("../types.zig");
 
@@ -74,6 +75,21 @@ pub fn upsert_value_unlocked(
     key: []const u8,
     value: *const types.Value,
 ) !void {
+    if (shard.tree.find_leaf_for_exact_key(key)) |leaf| {
+        const arena_allocator = shard.arena.allocator();
+        const cloned_value = try arena_allocator.create(types.Value);
+        cloned_value.* = try value.clone(arena_allocator);
+
+        const previous_value = leaf.value;
+        const previous_owner = leaf.value_owner;
+        leaf.value = cloned_value;
+        leaf.value_owner = .tree_allocator;
+        if (previous_owner == .heap_allocation) {
+            free_heap_value(shard.base_allocator, previous_value);
+        }
+        return;
+    }
+
     const arena_allocator = shard.arena.allocator();
     const cloned_value = try arena_allocator.create(types.Value);
     cloned_value.* = try value.clone(arena_allocator);
@@ -93,10 +109,53 @@ pub fn remove_stored_value_unlocked(
     shard: *runtime_shard.Shard,
     key: []const u8,
 ) !bool {
-    return shard.tree.delete(key) catch |err| switch (err) {
+    const existing_leaf = shard.tree.find_leaf_for_exact_key(key) orelse return false;
+    const removed_value = existing_leaf.value;
+    const removed_owner = existing_leaf.value_owner;
+
+    const removed = shard.tree.delete(key) catch |err| switch (err) {
         error.OutOfMemory => return error.OutOfMemory,
         error.InvalidNodeType, error.InvalidNodeShrink => unreachable,
     };
+    if (removed and removed_owner == .heap_allocation) {
+        free_heap_value(shard.base_allocator, removed_value);
+    }
+    return removed;
+}
+
+/// Releases one individually heap-owned stored value tree.
+///
+/// Time Complexity: O(v), where `v` is the nested value size.
+///
+/// Allocator: Does not allocate; recursively frees `value` through `allocator`.
+pub fn free_heap_value(allocator: std.mem.Allocator, value: *types.Value) void {
+    value.deinit(allocator);
+    allocator.destroy(value);
+}
+
+/// Returns whether one stored leaf currently owns its value through an individually reclaimable heap allocation.
+///
+/// Time Complexity: O(k), where `k` is `key.len`.
+///
+/// Allocator: Does not allocate.
+pub fn value_is_heap_owned_unlocked(shard: *const runtime_shard.Shard, key: []const u8) bool {
+    const leaf = @constCast(&shard.tree).find_leaf_for_exact_key(key) orelse return false;
+    return leaf.value_owner == art_node.ValueOwner.heap_allocation;
+}
+
+/// Counts the currently retained committed delta arenas on one shard.
+///
+/// Time Complexity: O(a), where `a` is the committed arena chain length.
+///
+/// Allocator: Does not allocate.
+pub fn count_committed_arenas_unlocked(shard: *const runtime_shard.Shard) usize {
+    var count: usize = 0;
+    var current = shard.committed_arenas_head;
+    while (current) |arena| {
+        count += 1;
+        current = arena.next;
+    }
+    return count;
 }
 
 /// Returns whether two values are physically equal by full content.

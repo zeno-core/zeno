@@ -1,0 +1,12 @@
+.{
+    .name = .zeno_core,
+    .version = "0.15.2",
+    .dependencies = .{
+        .zbench = .{
+            .url = "https://github.com/hendriknielaender/zBench/archive/refs/tags/v0.12.0.tar.gz",
+            .hash = "zbench-0.11.1-YTdc7zkmAQBWI99esNFueJc9GuzK-KaU6Nfr1ZXhNGmc",
+        },
+    },
+    .paths = .{""},
+    .fingerprint = 0xc92e7b444c567888,
+}

@@ -42,6 +42,14 @@ const ReservedShard = struct {
     writes: []ReservedBatchWrite,
 
     fn deinit(self: *ReservedShard, allocator: std.mem.Allocator) void {
+        if (self.committed == null) {
+            for (self.writes) |reserved_write| {
+                switch (reserved_write.target) {
+                    .overwrite_leaf => |overwrite| internal_mutate.free_heap_value(allocator, overwrite.value),
+                    .prepared => {},
+                }
+            }
+        }
         if (self.committed) |committed| {
             committed.arena.deinit();
             allocator.destroy(committed);
@@ -130,6 +138,7 @@ fn reserve_write(
 
     var reserved: art.ReservedInsert = .{
         .value = cloned_value,
+        .value_owner = .committed_arena,
     };
 
     if (prepared.reservation.needs_stored_key) {
@@ -140,6 +149,7 @@ fn reserve_write(
         leaf.* = .{
             .key = reserved.stored_key.?,
             .value = cloned_value,
+            .value_owner = .committed_arena,
         };
         reserved.leaf = leaf;
     }
@@ -153,11 +163,18 @@ fn reserve_write(
     return reserved;
 }
 
+fn clone_value_to_heap(allocator: std.mem.Allocator, value: *const types.Value) !*types.Value {
+    const cloned_value = try allocator.create(types.Value);
+    errdefer allocator.destroy(cloned_value);
+    cloned_value.* = try value.clone(allocator);
+    return cloned_value;
+}
+
 fn try_reserve_overwrite_group(
+    base_allocator: std.mem.Allocator,
     shard: *runtime_shard.Shard,
     group: internal_batch_plan.ShardWriteGroup,
     scratch_allocator: std.mem.Allocator,
-    reservation_allocator: std.mem.Allocator,
     writes: []ReservedBatchWrite,
 ) !bool {
     std.debug.assert(writes.len == group.writes.len);
@@ -166,8 +183,7 @@ fn try_reserve_overwrite_group(
         leaves[index] = shard.tree.find_leaf_for_exact_key(write.key) orelse return false;
     }
     for (group.writes, 0..) |write, index| {
-        const cloned_value = try reservation_allocator.create(types.Value);
-        cloned_value.* = try write.value.clone(reservation_allocator);
+        const cloned_value = try clone_value_to_heap(base_allocator, write.value);
         writes[index] = .{
             .write = write,
             .target = .{
@@ -181,15 +197,40 @@ fn try_reserve_overwrite_group(
     return true;
 }
 
-fn apply_reserved_write_or_panic(tree: *art.Tree, reserved_write: *const ReservedBatchWrite) void {
+fn apply_reserved_write_or_panic(shard: *runtime_shard.Shard, reserved_write: *const ReservedBatchWrite) void {
     switch (reserved_write.target) {
         .overwrite_leaf => |overwrite| {
+            const previous_value = overwrite.leaf.value;
+            const previous_owner = overwrite.leaf.value_owner;
             overwrite.leaf.value = overwrite.value;
+            overwrite.leaf.value_owner = .heap_allocation;
+            if (previous_owner == .heap_allocation) {
+                internal_mutate.free_heap_value(shard.base_allocator, previous_value);
+            }
         },
         .prepared => |prepared_write| {
-            tree.apply_prepared_insert(&prepared_write.prepared, &prepared_write.reserved) catch |err| {
+            const old_heap_value: ?*types.Value = switch (prepared_write.prepared.kind) {
+                .overwrite_leaf, .overwrite_leaf_value => blk: {
+                    const live_leaf = shard.tree.find_leaf_for_exact_key(reserved_write.write.key) orelse break :blk null;
+                    break :blk if (live_leaf.value_owner == .heap_allocation) live_leaf.value else null;
+                },
+                else => null,
+            };
+            shard.tree.apply_prepared_insert(&prepared_write.prepared, &prepared_write.reserved) catch |err| {
                 std.debug.panic("apply_batch prepared apply invariant failed: {s}", .{@errorName(err)});
             };
+            switch (prepared_write.prepared.kind) {
+                .overwrite_leaf, .overwrite_leaf_value => {
+                    const live_leaf = shard.tree.find_leaf_for_exact_key(reserved_write.write.key) orelse {
+                        std.debug.panic("apply_batch prepared overwrite lost target leaf", .{});
+                    };
+                    live_leaf.value_owner = prepared_write.reserved.value_owner;
+                    if (old_heap_value) |value| {
+                        internal_mutate.free_heap_value(shard.base_allocator, value);
+                    }
+                },
+                else => {},
+            }
         },
     }
 }
@@ -276,6 +317,18 @@ fn apply_plan(
     }
 
     for (plan.groups, 0..) |group, index| {
+        reservations[index] = .{
+            .committed = null,
+            .writes = try scratch_allocator.alloc(ReservedBatchWrite, group.writes.len),
+        };
+        initialized += 1;
+
+        const shard = &state.shards[group.shard_idx];
+
+        if (try try_reserve_overwrite_group(state.base_allocator, shard, group, scratch_allocator, reservations[index].writes)) {
+            continue;
+        }
+
         const committed = try state.base_allocator.create(runtime_shard.CommittedArena);
         errdefer state.base_allocator.destroy(committed);
         committed.* = .{
@@ -283,19 +336,8 @@ fn apply_plan(
             .next = null,
         };
         errdefer committed.arena.deinit();
-
-        reservations[index] = .{
-            .committed = committed,
-            .writes = try scratch_allocator.alloc(ReservedBatchWrite, group.writes.len),
-        };
-        initialized += 1;
-
-        const shard = &state.shards[group.shard_idx];
+        reservations[index].committed = committed;
         const reservation_allocator = committed.arena.allocator();
-
-        if (try try_reserve_overwrite_group(shard, group, scratch_allocator, reservation_allocator, reservations[index].writes)) {
-            continue;
-        }
 
         var shadow = try shard.tree.build_shadow_tree(scratch_allocator);
         var last_input_index: ?usize = null;
@@ -323,11 +365,13 @@ fn apply_plan(
     for (plan.groups, 0..) |group, index| {
         const shard = &state.shards[group.shard_idx];
         for (reservations[index].writes) |*reserved_write| {
-            apply_reserved_write_or_panic(&shard.tree, reserved_write);
+            apply_reserved_write_or_panic(shard, reserved_write);
             internal_ttl_index.clear_ttl_entry(shard, reserved_write.write.key);
         }
-        shard.append_committed_arena(reservations[index].committed.?);
-        reservations[index].committed = null;
+        if (reservations[index].committed) |committed| {
+            shard.append_committed_arena(committed);
+            reservations[index].committed = null;
+        }
         applied_count += group.writes.len;
     }
 

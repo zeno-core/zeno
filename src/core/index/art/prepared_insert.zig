@@ -17,6 +17,7 @@ const Node256 = node.Node256;
 const Leaf = node.Leaf;
 const MAX_PREFIX_LEN = node.MAX_PREFIX_LEN;
 const ReservedInternalNode = node.ReservedInternalNode;
+const ValueOwner = node.ValueOwner;
 
 /// Structural insert outcomes recognized by the ART planner.
 ///
@@ -94,6 +95,7 @@ pub const PreparedInsert = struct {
 /// value ownership into the live tree shape selected by `prepared.kind`.
 pub const ReservedInsert = struct {
     value: *Value,
+    value_owner: ValueOwner = .tree_allocator,
     stored_key: ?[]const u8 = null,
     leaf: ?*Leaf = null,
     split_node: ?ReservedInternalNode = null,
@@ -490,12 +492,14 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
             };
             if (!std.mem.eql(u8, leaf.key, prepared.expected_target_leaf_key.?)) return error.BatchPlanInvariantViolation;
             leaf.value = reserved.value;
+            leaf.value_owner = reserved.value_owner;
         },
         .overwrite_leaf_value => {
             const header = try validate_target_internal(target.node_ref, prepared, target.depth);
             const leaf = header.leaf_value orelse return error.BatchPlanInvariantViolation;
             if (!std.mem.eql(u8, leaf.key, prepared.expected_target_leaf_key.?)) return error.BatchPlanInvariantViolation;
             leaf.value = reserved.value;
+            leaf.value_owner = reserved.value_owner;
         },
         .attach_leaf_value => {
             const header = try validate_target_internal(target.node_ref, prepared, target.depth);
@@ -981,6 +985,7 @@ fn reserve_insert_for_test(
 
     var reserved: ReservedInsert = .{
         .value = cloned_value,
+        .value_owner = .tree_allocator,
     };
 
     if (prepared.reservation.needs_stored_key) {
@@ -991,6 +996,7 @@ fn reserve_insert_for_test(
         leaf.* = .{
             .key = reserved.stored_key.?,
             .value = cloned_value,
+            .value_owner = .tree_allocator,
         };
         reserved.leaf = leaf;
     }
@@ -1020,6 +1026,7 @@ fn create_leaf_for_test(allocator: std.mem.Allocator, key: []const u8, value: Va
     leaf.* = .{
         .key = stored_key,
         .value = stored_value,
+        .value_owner = .tree_allocator,
     };
     return leaf;
 }

@@ -292,7 +292,7 @@ fn apply_plan(
 
     var acquired: usize = 0;
     var applied_count: u64 = 0;
-    errdefer _ = state.counters.ops_put_total.fetchAdd(applied_count, .monotonic);
+    errdefer state.record_operation(.put, applied_count);
     defer {
         while (acquired > 0) {
             acquired -= 1;
@@ -375,7 +375,7 @@ fn apply_plan(
         applied_count += group.writes.len;
     }
 
-    _ = state.counters.ops_put_total.fetchAdd(applied_count, .monotonic);
+    state.record_operation(.put, applied_count);
 }
 
 /// Applies one plain atomic batch.

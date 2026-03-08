@@ -295,7 +295,7 @@ fn total_committed_arenas_for_test(db: *Database) usize {
 
 fn expire_at_boundary(db: *Database, key: []const u8, unix_seconds: ?i64) EngineError!bool {
     const updated = try expiration.expire_at(&db.state, key, unix_seconds);
-    _ = db.state.counters.ops_expire_total.fetchAdd(1, .monotonic);
+    db.state.record_operation(.expire, 1);
     return updated;
 }
 
@@ -684,7 +684,9 @@ test "open purges expired keys recovered from snapshot and wal replay" {
 test "checkpoint without a configured snapshot path returns no snapshot path" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try open(testing.allocator, .{
+        .metrics = .{ .mode = .full },
+    });
     defer db.close() catch unreachable;
 
     try testing.expectError(error.NoSnapshotPath, db.checkpoint());
@@ -780,7 +782,9 @@ test "checkpoint preserves post-snapshot wal delta on reopen" {
 test "engine boundary latency sampling records one sample per call including errors" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try open(testing.allocator, .{
+        .metrics = .{ .mode = .full },
+    });
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };

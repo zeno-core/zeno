@@ -38,7 +38,7 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
     try durability.append_put_if_enabled(state, key, value);
     try internal_mutate.upsert_value_unlocked(shard, key, value);
     internal_ttl_index.clear_ttl_entry(shard, key);
-    _ = state.counters.ops_put_total.fetchAdd(1, .monotonic);
+    state.record_operation(.put, 1);
 }
 
 /// Deletes one plain key/value pair when present.
@@ -79,6 +79,6 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.En
     _ = try internal_mutate.remove_stored_value_unlocked(shard, key);
     internal_ttl_index.clear_ttl_entry(shard, key);
 
-    _ = state.counters.ops_delete_total.fetchAdd(1, .monotonic);
+    state.record_operation(.delete, 1);
     return true;
 }

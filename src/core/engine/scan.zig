@@ -202,7 +202,7 @@ pub fn scan_prefix(
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
     const now = runtime_shard.unix_now();
-    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
+    state.record_operation(.scan, 1);
 
     var collected = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix }, now);
     return .{
@@ -236,7 +236,7 @@ pub fn scan_range(
     visibility_gate.lock_shared();
     defer visibility_gate.unlock_shared();
     const now = runtime_shard.unix_now();
-    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
+    state.record_operation(.scan, 1);
 
     var collected = try collect_entries_no_visibility(state, allocator, .{ .range = range }, now);
     return .{
@@ -270,7 +270,7 @@ pub fn scan_prefix_from_in_view(
 ) error_mod.EngineError!types.ScanPageResult {
     const state = try runtime_state_from_view(view);
     const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
-    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
+    state.record_operation(.scan, 1);
 
     var entries = try collect_entries_no_visibility(state, allocator, .{ .prefix = prefix }, opened_at_unix_seconds);
     return collect_page_from_entries(allocator, &entries, cursor, limit);
@@ -294,7 +294,7 @@ pub fn scan_range_from_in_view(
 ) error_mod.EngineError!types.ScanPageResult {
     const state = try runtime_state_from_view(view);
     const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
-    _ = @constCast(&state.counters.ops_scan_total).fetchAdd(1, .monotonic);
+    state.record_operation(.scan, 1);
 
     var entries = try collect_entries_no_visibility(state, allocator, .{ .range = range }, opened_at_unix_seconds);
     return collect_page_from_entries(allocator, &entries, cursor, limit);

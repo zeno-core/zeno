@@ -35,7 +35,7 @@ var checkpoint_barrier_test_probe: ?*CheckpointBarrierTestProbe = null;
 ///
 /// Allocator: Allocates the engine handle from `allocator`.
 pub fn create(allocator: Allocator) EngineError!*Database {
-    return create_with_snapshot_path(allocator, null);
+    return create_with_snapshot_path(allocator, null, types.default_metrics_config());
 }
 
 /// Opens an engine handle and routes persistence work through storage-owned modules.
@@ -51,7 +51,7 @@ pub fn create(allocator: Allocator) EngineError!*Database {
 ///
 /// Thread Safety: Not thread-safe during open; recovery mutates runtime state before the database handle is published to callers.
 pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Database {
-    var db = try create_with_snapshot_path(allocator, options.snapshot_path);
+    var db = try create_with_snapshot_path(allocator, options.snapshot_path, options.metrics);
     errdefer db.close() catch unreachable;
 
     const snapshot_lsn = try load_snapshot_for_open(db, allocator, options.snapshot_path, options.wal_path);
@@ -84,13 +84,14 @@ pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Databas
 fn create_with_snapshot_path(
     allocator: Allocator,
     snapshot_path: ?[]const u8,
+    metrics_config: types.MetricsConfig,
 ) EngineError!*Database {
     const db = allocator.create(Database) catch return error.OutOfMemory;
     errdefer allocator.destroy(db);
 
     db.* = .{
         .allocator = allocator,
-        .state = DatabaseState.init(allocator, snapshot_path),
+        .state = DatabaseState.init_with_metrics(allocator, snapshot_path, metrics_config),
     };
     db.state.rebind_shard_allocators();
     return db;
@@ -380,7 +381,7 @@ test "load_snapshot_for_open records corruption fallback when replayable wal exi
     defer file.close();
     try file.writeAll("bad!");
 
-    const db = try create_with_snapshot_path(testing.allocator, snapshot_path);
+    const db = try create_with_snapshot_path(testing.allocator, snapshot_path, types.default_metrics_config());
     defer close(db) catch unreachable;
 
     try testing.expectEqual(@as(u64, 0), try load_snapshot_for_open(db, testing.allocator, snapshot_path, wal_path));
@@ -421,7 +422,7 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     }
 
     {
-        const db = try create_with_snapshot_path(testing.allocator, snapshot_path);
+        const db = try create_with_snapshot_path(testing.allocator, snapshot_path, types.default_metrics_config());
         defer close(db) catch unreachable;
 
         try testing.expectError(error.SnapshotCorrupted, load_snapshot_for_open(db, testing.allocator, snapshot_path, missing_wal_path));
@@ -429,7 +430,7 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     }
 
     {
-        const db = try create_with_snapshot_path(testing.allocator, snapshot_path);
+        const db = try create_with_snapshot_path(testing.allocator, snapshot_path, types.default_metrics_config());
         defer close(db) catch unreachable;
 
         try testing.expectError(error.SnapshotCorrupted, load_snapshot_for_open(db, testing.allocator, snapshot_path, empty_wal_path));

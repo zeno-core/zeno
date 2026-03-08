@@ -17,8 +17,11 @@ pub fn call_with_latency(
     comptime operation: anytype,
     args: anytype,
 ) @TypeOf(@call(.auto, operation, args)) {
+    if (!state.should_record_latency()) {
+        return @call(.auto, operation, args);
+    }
     var timer = std.time.Timer.start() catch unreachable;
-    defer state.record_sampled_latency(timer.read());
+    defer state.record_latency_sample(timer.read());
     return @call(.auto, operation, args);
 }
 
@@ -34,9 +37,50 @@ pub fn call_with_optional_latency(
     comptime operation: anytype,
     args: anytype,
 ) @TypeOf(@call(.auto, operation, args)) {
+    if (state) |resolved_state| {
+        if (!resolved_state.should_record_latency()) {
+            return @call(.auto, operation, args);
+        }
+    } else {
+        return @call(.auto, operation, args);
+    }
     var timer = std.time.Timer.start() catch unreachable;
     defer if (state) |resolved_state| {
-        resolved_state.record_sampled_latency(timer.read());
+        resolved_state.record_latency_sample(timer.read());
     };
     return @call(.auto, operation, args);
+}
+
+fn increment_counter(counter: *u32) void {
+    counter.* += 1;
+}
+
+test "call_with_latency skips latency counters when disabled" {
+    const testing = std.testing;
+
+    var state = runtime_state.DatabaseState.init_with_metrics(testing.allocator, null, .{
+        .mode = .disabled,
+    });
+    defer state.deinit();
+
+    var counter: u32 = 0;
+    call_with_latency(&state, increment_counter, .{&counter});
+
+    try testing.expectEqual(@as(u32, 1), counter);
+    try testing.expectEqual(@as(u64, 0), state.stats_snapshot().latency_samples_total);
+}
+
+test "call_with_optional_latency records when full mode is enabled" {
+    const testing = std.testing;
+
+    var state = runtime_state.DatabaseState.init_with_metrics(testing.allocator, null, .{
+        .mode = .full,
+    });
+    defer state.deinit();
+
+    var counter: u32 = 0;
+    call_with_optional_latency(&state, increment_counter, .{&counter});
+
+    try testing.expectEqual(@as(u32, 1), counter);
+    try testing.expectEqual(@as(u64, 1), state.stats_snapshot().latency_samples_total);
 }

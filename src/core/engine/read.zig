@@ -30,7 +30,7 @@ fn clone_plain_value_no_visibility(
 
     shard.lock.lockShared();
     defer shard.lock.unlockShared();
-    _ = @constCast(&state.counters.ops_get_total).fetchAdd(1, .monotonic);
+    state.record_operation(.get, 1);
 
     const stored = shard.tree.lookup(key) orelse return null;
     if (!expiration.key_is_visible_unlocked(shard, key, now)) return null;

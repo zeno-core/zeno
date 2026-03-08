@@ -196,13 +196,13 @@ pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) Engine
 
 /// Scans the next prefix page inside a consistent read view.
 ///
-/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
 ///
 /// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
 ///
 /// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
 ///
-/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while fetching or refilling shard-local ART heads.
 pub fn scan_prefix_from_in_view(
     view: *const types.ReadView,
     allocator: std.mem.Allocator,
@@ -216,13 +216,13 @@ pub fn scan_prefix_from_in_view(
 
 /// Scans the next range page inside a consistent read view.
 ///
-/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
 ///
 /// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
 ///
 /// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
 ///
-/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while fetching or refilling shard-local ART heads.
 pub fn scan_range_from_in_view(
     view: *const types.ReadView,
     allocator: std.mem.Allocator,
@@ -1758,22 +1758,15 @@ test "scan_prefix_from_in_view merges cross-shard heads in global key order" {
     try testing.expect(second_page.borrow_next_cursor() == null);
 }
 
-test "scan_prefix_from_in_view cursor records the real shard index of the last emitted key" {
+test "scan_prefix_from_in_view cursor records the last emitted key" {
     const testing = std.testing;
-
-    const primary_key = blk: {
-        if (runtime_shard.get_shard_index("alpha") != 0) break :blk "alpha";
-        if (runtime_shard.get_shard_index("beta") != 0) break :blk "beta";
-        if (runtime_shard.get_shard_index("gamma") != 0) break :blk "gamma";
-        unreachable;
-    };
 
     const db = try create(testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
     const two = types.Value{ .integer = 2 };
-    try db.put(primary_key, &one);
+    try db.put("alpha", &one);
     try db.put("zz-after", &two);
 
     var view = try db.read_view();
@@ -1783,7 +1776,7 @@ test "scan_prefix_from_in_view cursor records the real shard index of the last e
     defer page.deinit();
 
     const cursor = page.borrow_next_cursor().?;
-    try testing.expectEqual(runtime_shard.get_shard_index(page.entries.items[0].key), cursor.shard_idx);
+    try testing.expectEqualStrings(page.entries.items[0].key, cursor.resume_key);
 }
 
 test "scan_prefix_from_in_view omits keys expired before the view opens" {
@@ -1900,19 +1893,22 @@ test "scan page can promote one borrowed continuation cursor into owned storage"
     try testing.expectEqualStrings("alpha:1", second_page.entries.items[0].key);
 }
 
-test "owned scan cursor copies release continuation bytes only once" {
+test "owned scan cursor clone makes an independent continuation owner" {
     const testing = std.testing;
 
-    var cursor = try types.OwnedScanCursor.init(testing.allocator, 0, "alpha");
-    var copied = cursor;
-    defer copied.deinit();
+    var cursor = try types.OwnedScanCursor.init(testing.allocator, "alpha");
     defer cursor.deinit();
 
+    var cloned = (try cursor.clone(testing.allocator)).?;
+    defer cloned.deinit();
+
     try testing.expect(cursor.as_cursor() != null);
+    try testing.expect(cloned.as_cursor() != null);
 
     cursor.deinit();
 
-    try testing.expect(copied.as_cursor() == null);
+    try testing.expect(cloned.as_cursor() != null);
+    try testing.expectEqualStrings("alpha", cloned.as_cursor().?.resume_key);
 }
 
 test "point operation boundaries reject empty keys" {

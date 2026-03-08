@@ -26,13 +26,13 @@ pub const Error = engine_db.EngineError;
 
 /// Scans the next prefix page inside a consistent read view.
 ///
-/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
 ///
 /// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
 ///
 /// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
 ///
-/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while fetching or refilling shard-local ART heads.
 pub fn scan_prefix_from_in_view(
     view: *const ReadView,
     allocator: std.mem.Allocator,
@@ -45,13 +45,13 @@ pub fn scan_prefix_from_in_view(
 
 /// Scans the next range page inside a consistent read view.
 ///
-/// Time Complexity: O(s + m log m + v), where `s` is shard count, `m` is matched entry count, and `v` is total cloned value size.
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
 ///
 /// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
 ///
 /// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page exposes any continuation cursor through `borrow_next_cursor` and may transfer it into `OwnedScanCursor` through `take_next_cursor`.
 ///
-/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while collecting entries.
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while fetching or refilling shard-local ART heads.
 pub fn scan_range_from_in_view(
     view: *const ReadView,
     allocator: std.mem.Allocator,

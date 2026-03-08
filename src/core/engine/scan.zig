@@ -17,7 +17,6 @@ const ScanQuery = union(enum) {
 };
 
 const CollectedEntry = struct {
-    shard_idx: u8,
     entry: types.ScanEntry,
 };
 
@@ -82,7 +81,6 @@ const CollectCtx = struct {
     allocator: std.mem.Allocator,
     entries: *std.ArrayList(CollectedEntry),
     query: ScanQuery,
-    shard_idx: u8,
     now: i64,
     shard: *const runtime_shard.Shard,
 };
@@ -92,7 +90,6 @@ fn collect_visit(ctx_ptr: *anyopaque, key: []const u8, value: *const types.Value
     if (!key_matches_query(key, ctx.query)) return;
     if (!expiration.key_is_visible_unlocked(ctx.shard, key, ctx.now)) return;
     try ctx.entries.append(ctx.allocator, .{
-        .shard_idx = ctx.shard_idx,
         .entry = try clone_entry(ctx.allocator, key, value),
     });
 }
@@ -109,7 +106,7 @@ fn collect_entries_no_visibility(
         entries.deinit(allocator);
     }
 
-    for (&state.shards, 0..) |*const_shard, shard_idx| {
+    for (&state.shards) |*const_shard| {
         const shard = @constCast(const_shard);
         shard.lock.lockShared();
         errdefer shard.lock.unlockShared();
@@ -117,7 +114,6 @@ fn collect_entries_no_visibility(
             .allocator = allocator,
             .entries = &entries,
             .query = query,
-            .shard_idx = @intCast(shard_idx),
             .now = now,
             .shard = shard,
         };
@@ -141,7 +137,7 @@ fn collect_page_from_entries(
     var page = types.ScanPageResult{
         .entries = std.ArrayList(types.ScanEntry).empty,
         .allocator = allocator,
-        ._cursor_slot = .invalid,
+        ._next_cursor = null,
     };
     errdefer page.deinit();
     errdefer {
@@ -171,11 +167,7 @@ fn collect_page_from_entries(
 
     if (end_index < all_entries.items.len) {
         const last_emitted = all_entries.items[end_index - 1];
-        page._cursor_slot = @enumFromInt(@intFromEnum(try types.OwnedScanCursor.init(
-            allocator,
-            last_emitted.shard_idx,
-            last_emitted.entry.key,
-        )));
+        page._next_cursor = try types.OwnedScanCursor.init(allocator, last_emitted.entry.key);
     }
 
     for (all_entries.items, 0..) |collected, index| {
@@ -303,7 +295,7 @@ fn merge_page_from_shards(
     var page = types.ScanPageResult{
         .entries = std.ArrayList(types.ScanEntry).empty,
         .allocator = allocator,
-        ._cursor_slot = .invalid,
+        ._next_cursor = null,
     };
     errdefer page.deinit();
 
@@ -335,13 +327,11 @@ fn merge_page_from_shards(
         if (maybe_head) |head| try add_head_or_free(allocator, &heap, head);
     }
 
-    var last_emitted_shard_idx: u8 = 0;
     var last_emitted_key: ?[]const u8 = null;
 
     while (page.entries.items.len < limit) {
         const head = heap.removeOrNull() orelse break;
         page.entries.appendAssumeCapacity(head.entry);
-        last_emitted_shard_idx = head.shard_idx;
         last_emitted_key = head.entry.key;
 
         const maybe_refill = try fetch_next_visible_head(
@@ -358,11 +348,7 @@ fn merge_page_from_shards(
 
     if (last_emitted_key) |resume_key| {
         if (heap.count() != 0) {
-            page._cursor_slot = @enumFromInt(@intFromEnum(try types.OwnedScanCursor.init(
-                allocator,
-                last_emitted_shard_idx,
-                resume_key,
-            )));
+            page._next_cursor = try types.OwnedScanCursor.init(allocator, resume_key);
         }
     }
 

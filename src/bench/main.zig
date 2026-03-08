@@ -34,6 +34,7 @@ var steady_checked_batch_insert_seed = std.atomic.Value(usize).init(0);
 const BenchCliConfig = struct {
     run_all_metrics_modes: bool = false,
     scan_allocation_profile: bool = false,
+    scan_candidate_profile: bool = false,
     metrics_config: types.MetricsConfig = types.default_metrics_config(),
 };
 
@@ -51,6 +52,17 @@ const ScanAllocationProfile = struct {
     deallocations: usize,
     allocated_bytes: usize,
     freed_bytes: usize,
+};
+
+const ScanCandidateProfile = struct {
+    emitted_entries: usize,
+    page_calls: usize,
+    cursor_handoffs: usize,
+    allocations: usize,
+    deallocations: usize,
+    allocated_bytes: usize,
+    freed_bytes: usize,
+    elapsed_ns: u64,
 };
 
 fn open_bench_db(allocator: std.mem.Allocator) !*engine.Database {
@@ -262,6 +274,8 @@ pub fn main() !void {
 
     if (cli_config.scan_allocation_profile) {
         try run_scan_allocation_profile(&stdout.interface, cli_config.metrics_config);
+    } else if (cli_config.scan_candidate_profile) {
+        try run_scan_candidate_profile(&stdout.interface, cli_config.metrics_config);
     } else if (cli_config.run_all_metrics_modes) {
         const configs = [_]types.MetricsConfig{
             .{ .mode = .disabled },
@@ -318,6 +332,10 @@ fn parse_cli_config(allocator: std.mem.Allocator) !BenchCliConfig {
             cli.scan_allocation_profile = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--scan-candidate-profile")) {
+            cli.scan_candidate_profile = true;
+            continue;
+        }
         return error.InvalidArgument;
     }
 
@@ -338,7 +356,7 @@ fn parse_metrics_mode(raw: []const u8) ?types.MetricsMode {
 
 fn print_usage() void {
     std.debug.print(
-        \\usage: zeno-core-bench [--metrics-mode=disabled|counters_only|sampled_latency|full|all] [--latency-sample-shift=N] [--scan-allocation-profile]
+        \\usage: zeno-core-bench [--metrics-mode=disabled|counters_only|sampled_latency|full|all] [--latency-sample-shift=N] [--scan-allocation-profile] [--scan-candidate-profile]
         \\
     , .{});
 }
@@ -361,6 +379,24 @@ fn run_scan_allocation_profile(writer: anytype, metrics_config: types.MetricsCon
     try print_scan_allocation_profile(writer, "scan64 in-view 4096 steady", scan4096_in_view);
 }
 
+fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConfig) !void {
+    bench_metrics_config = metrics_config;
+    try print_metrics_config(writer, metrics_config);
+    try writer.print("scan candidate profile (prefix=\"scan:\", page_limit={d})\n", .{scan_page_item_count});
+
+    const scan256_full = try profile_public_full_scan(scan_item_count);
+    try print_scan_candidate_profile(writer, "scan256 steady", scan256_full);
+
+    const scan256_candidate = try profile_merged_full_scan_candidate(scan_item_count);
+    try print_scan_candidate_profile(writer, "scan256 merged page-loop candidate", scan256_candidate);
+
+    const scan4096_full = try profile_public_full_scan(scan_large_item_count);
+    try print_scan_candidate_profile(writer, "scan4096 steady", scan4096_full);
+
+    const scan4096_candidate = try profile_merged_full_scan_candidate(scan_large_item_count);
+    try print_scan_candidate_profile(writer, "scan4096 merged page-loop candidate", scan4096_candidate);
+}
+
 fn print_scan_allocation_profile(
     writer: anytype,
     label: []const u8,
@@ -376,6 +412,27 @@ fn print_scan_allocation_profile(
             profile.deallocations,
             profile.allocated_bytes,
             profile.freed_bytes,
+        },
+    );
+}
+
+fn print_scan_candidate_profile(
+    writer: anytype,
+    label: []const u8,
+    profile: ScanCandidateProfile,
+) !void {
+    try writer.print(
+        "{s}: entries={d} pages={d} cursor_handoffs={d} allocations={d} deallocations={d} allocated_bytes={d} freed_bytes={d} elapsed_ns={d}\n",
+        .{
+            label,
+            profile.emitted_entries,
+            profile.page_calls,
+            profile.cursor_handoffs,
+            profile.allocations,
+            profile.deallocations,
+            profile.allocated_bytes,
+            profile.freed_bytes,
+            profile.elapsed_ns,
         },
     );
 }
@@ -426,6 +483,136 @@ fn profile_scan_allocations(
         .deallocations = counting_state.deallocations,
         .allocated_bytes = counting_state.allocated_bytes,
         .freed_bytes = counting_state.freed_bytes,
+    };
+}
+
+fn profile_public_full_scan(comptime fixture_items: usize) !ScanCandidateProfile {
+    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(db_gpa.deinit() == .ok);
+
+    const db = try open_bench_db(db_gpa.allocator());
+    defer db.close() catch unreachable;
+    load_scan_fixture(fixture_items, db);
+
+    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(result_gpa.deinit() == .ok);
+
+    var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
+    const counting_allocator = counting_state.allocator();
+
+    var timer = try std.time.Timer.start();
+    var result = try db.scan_prefix(counting_allocator, "scan:");
+    const elapsed_ns = timer.read();
+
+    const emitted_entries = result.entries.items.len;
+    std.debug.assert(emitted_entries == fixture_items);
+    result.deinit();
+    std.debug.assert(counting_state.allocated_bytes == counting_state.freed_bytes);
+
+    return .{
+        .emitted_entries = emitted_entries,
+        .page_calls = 1,
+        .cursor_handoffs = 0,
+        .allocations = counting_state.allocations,
+        .deallocations = counting_state.deallocations,
+        .allocated_bytes = counting_state.allocated_bytes,
+        .freed_bytes = counting_state.freed_bytes,
+        .elapsed_ns = elapsed_ns,
+    };
+}
+
+fn profile_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandidateProfile {
+    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(db_gpa.deinit() == .ok);
+
+    const db = try open_bench_db(db_gpa.allocator());
+    defer db.close() catch unreachable;
+    load_scan_fixture(fixture_items, db);
+
+    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(result_gpa.deinit() == .ok);
+
+    var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
+    const counting_allocator = counting_state.allocator();
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    var collected = std.ArrayList(types.ScanEntry).empty;
+    var cursor_owner: ?types.OwnedScanCursor = null;
+    var page_calls: usize = 0;
+    var cursor_handoffs: usize = 0;
+
+    var timer = try std.time.Timer.start();
+    defer if (cursor_owner) |*cursor| cursor.deinit();
+
+    while (true) {
+        var borrowed_cursor: ?types.ScanCursor = null;
+        if (cursor_owner) |owned_cursor| {
+            borrowed_cursor = owned_cursor.as_cursor();
+        }
+
+        var page = try official.scan_prefix_from_in_view(
+            &view,
+            counting_allocator,
+            "scan:",
+            if (borrowed_cursor) |*cursor| cursor else null,
+            scan_page_item_count,
+        );
+        page_calls += 1;
+
+        errdefer page.deinit();
+        errdefer {
+            for (collected.items) |entry| {
+                counting_allocator.free(entry.key);
+                const owned_value: *types.Value = @constCast(entry.value);
+                owned_value.deinit(counting_allocator);
+                counting_allocator.destroy(owned_value);
+            }
+            collected.deinit(counting_allocator);
+        }
+
+        try collected.ensureTotalCapacity(counting_allocator, collected.items.len + page.entries.items.len);
+
+        var page_entries = page.entries;
+        page.entries = std.ArrayList(types.ScanEntry).empty;
+        for (page_entries.items) |entry| {
+            collected.appendAssumeCapacity(entry);
+        }
+        page_entries.deinit(counting_allocator);
+
+        if (cursor_owner) |*cursor| {
+            cursor.deinit();
+        }
+        cursor_owner = page.take_next_cursor();
+        if (cursor_owner != null) cursor_handoffs += 1;
+
+        page.deinit();
+
+        if (cursor_owner == null) break;
+    }
+
+    const elapsed_ns = timer.read();
+    const emitted_entries = collected.items.len;
+    std.debug.assert(emitted_entries == fixture_items);
+
+    var result = types.ScanResult{
+        .entries = collected,
+        .allocator = counting_allocator,
+    };
+    result.deinit();
+
+    std.debug.assert(counting_state.allocated_bytes == counting_state.freed_bytes);
+
+    return .{
+        .emitted_entries = emitted_entries,
+        .page_calls = page_calls,
+        .cursor_handoffs = cursor_handoffs,
+        .allocations = counting_state.allocations,
+        .deallocations = counting_state.deallocations,
+        .allocated_bytes = counting_state.allocated_bytes,
+        .freed_bytes = counting_state.freed_bytes,
+        .elapsed_ns = elapsed_ns,
     };
 }
 

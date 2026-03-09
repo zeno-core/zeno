@@ -404,6 +404,9 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
     const scan256_buffered_candidate = try profile_buffered_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan256 merged shard-buffer-8 candidate", scan256_buffered_candidate);
 
+    const scan256_persistent_paged_candidate = try profile_persistent_paged_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size);
+    try print_scan_candidate_profile(writer, "scan256 merged persistent-page-8 candidate", scan256_persistent_paged_candidate);
+
     const scan256_buffered_candidate_large = try profile_buffered_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size_large);
     try print_scan_candidate_profile(writer, "scan256 merged shard-buffer-16 candidate", scan256_buffered_candidate_large);
 
@@ -415,6 +418,9 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
 
     const scan4096_buffered_candidate = try profile_buffered_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan4096 merged shard-buffer-8 candidate", scan4096_buffered_candidate);
+
+    const scan4096_persistent_paged_candidate = try profile_persistent_paged_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size);
+    try print_scan_candidate_profile(writer, "scan4096 merged persistent-page-8 candidate", scan4096_persistent_paged_candidate);
 
     const scan4096_buffered_candidate_large = try profile_buffered_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size_large);
     try print_scan_candidate_profile(writer, "scan4096 merged shard-buffer-16 candidate", scan4096_buffered_candidate_large);
@@ -712,6 +718,60 @@ fn profile_buffered_merged_full_scan_candidate(
         .emitted_entries = emitted_entries,
         .page_calls = 1,
         .cursor_handoffs = 0,
+        .initial_fetch_calls = profiled_result.stats.initial_fetch_calls,
+        .refill_fetch_calls = profiled_result.stats.refill_fetch_calls,
+        .art_fetches = profiled_result.stats.art_fetches,
+        .visibility_skips = profiled_result.stats.visibility_skips,
+        .empty_fetches = profiled_result.stats.empty_fetches,
+        .buffered_entries_loaded = profiled_result.stats.buffered_entries_loaded,
+        .allocations = counting_state.allocations,
+        .deallocations = counting_state.deallocations,
+        .allocated_bytes = counting_state.allocated_bytes,
+        .freed_bytes = counting_state.freed_bytes,
+        .elapsed_ns = elapsed_ns,
+    };
+}
+
+fn profile_persistent_paged_merged_full_scan_candidate(
+    comptime fixture_items: usize,
+    shard_buffer_size: usize,
+) !ScanCandidateProfile {
+    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(db_gpa.deinit() == .ok);
+
+    const db = try open_bench_db(db_gpa.allocator());
+    defer db.close() catch unreachable;
+    load_scan_fixture(fixture_items, db);
+
+    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(result_gpa.deinit() == .ok);
+
+    var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
+    const counting_allocator = counting_state.allocator();
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    var timer = try std.time.Timer.start();
+    var profiled_result = try official.scan_prefix_materialized_from_in_view_paged_profiled(
+        &view,
+        counting_allocator,
+        "scan:",
+        scan_page_item_count,
+        shard_buffer_size,
+    );
+    const elapsed_ns = timer.read();
+
+    const emitted_entries = profiled_result.result.entries.items.len;
+    std.debug.assert(emitted_entries == fixture_items);
+    profiled_result.result.deinit();
+
+    std.debug.assert(counting_state.allocated_bytes == counting_state.freed_bytes);
+
+    return .{
+        .emitted_entries = emitted_entries,
+        .page_calls = profiled_result.page_calls,
+        .cursor_handoffs = profiled_result.cursor_handoffs,
         .initial_fetch_calls = profiled_result.stats.initial_fetch_calls,
         .refill_fetch_calls = profiled_result.stats.refill_fetch_calls,
         .art_fetches = profiled_result.stats.art_fetches,

@@ -44,6 +44,13 @@ pub const ProfiledScanResult = struct {
     stats: MergePageProfileStats,
 };
 
+pub const ProfiledPagedScanResult = struct {
+    result: types.ScanResult,
+    stats: MergePageProfileStats,
+    page_calls: usize,
+    cursor_handoffs: usize,
+};
+
 const FetchPhase = enum {
     initial,
     refill,
@@ -77,6 +84,154 @@ const BorrowedShardChunk = struct {
 const BorrowedShardHead = struct {
     shard_idx: u8,
     entry: art.ScanEntry,
+};
+
+const PrefixShardChunkMergeState = struct {
+    heap: std.PriorityQueue(BorrowedShardHead, void, borrowed_shard_head_order),
+    prefix_scratch: std.ArrayList(art.ScanEntry),
+    chunks: [runtime_shard.NUM_SHARDS]BorrowedShardChunk,
+    prefix: []const u8,
+    shard_chunk_size: usize,
+    now: i64,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        state: *const runtime_state.DatabaseState,
+        prefix: []const u8,
+        shard_chunk_size: usize,
+        now: i64,
+        stats: *MergePageProfileStats,
+    ) error_mod.EngineError!@This() {
+        var self = @This(){
+            .heap = std.PriorityQueue(BorrowedShardHead, void, borrowed_shard_head_order).init(allocator, {}),
+            .prefix_scratch = std.ArrayList(art.ScanEntry).empty,
+            .chunks = [_]BorrowedShardChunk{.{}} ** runtime_shard.NUM_SHARDS,
+            .prefix = prefix,
+            .shard_chunk_size = shard_chunk_size,
+            .now = now,
+        };
+        errdefer self.deinit(allocator);
+
+        if (shard_chunk_size == 0) return self;
+
+        for (&state.shards, 0..) |*shard, shard_idx| {
+            try fetch_visible_prefix_chunk_profiled(
+                allocator,
+                &self.prefix_scratch,
+                &self.chunks[shard_idx],
+                shard,
+                prefix,
+                null,
+                shard_chunk_size,
+                now,
+                stats,
+                .initial,
+            );
+
+            if (self.chunks[shard_idx].peek()) |entry| {
+                try self.heap.add(.{
+                    .shard_idx = @intCast(shard_idx),
+                    .entry = entry,
+                });
+            }
+        }
+
+        return self;
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        self.heap.deinit();
+        self.prefix_scratch.deinit(allocator);
+        for (&self.chunks) |*chunk| chunk.deinit(allocator);
+        self.* = undefined;
+    }
+
+    fn refill_chunk_for_shard(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        state: *const runtime_state.DatabaseState,
+        shard_idx: usize,
+        start_after_key: []const u8,
+        stats: *MergePageProfileStats,
+    ) error_mod.EngineError!void {
+        try fetch_visible_prefix_chunk_profiled(
+            allocator,
+            &self.prefix_scratch,
+            &self.chunks[shard_idx],
+            &state.shards[shard_idx],
+            self.prefix,
+            start_after_key,
+            self.shard_chunk_size,
+            self.now,
+            stats,
+            .refill,
+        );
+
+        if (self.chunks[shard_idx].peek()) |next_entry| {
+            try self.heap.add(.{
+                .shard_idx = @intCast(shard_idx),
+                .entry = next_entry,
+            });
+        }
+    }
+
+    fn next_owned_entry(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        state: *const runtime_state.DatabaseState,
+        stats: *MergePageProfileStats,
+    ) error_mod.EngineError!?types.ScanEntry {
+        const head = self.heap.removeOrNull() orelse return null;
+        const owned_entry = try clone_entry(allocator, head.entry.key, head.entry.value);
+
+        var chunk = &self.chunks[head.shard_idx];
+        chunk.advance();
+
+        if (chunk.peek()) |next_entry| {
+            try self.heap.add(.{
+                .shard_idx = head.shard_idx,
+                .entry = next_entry,
+            });
+        } else {
+            try self.refill_chunk_for_shard(allocator, state, head.shard_idx, head.entry.key, stats);
+        }
+
+        return owned_entry;
+    }
+
+    fn next_page(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+        state: *const runtime_state.DatabaseState,
+        limit: usize,
+        stats: *MergePageProfileStats,
+    ) error_mod.EngineError!types.ScanPageResult {
+        var page = types.ScanPageResult{
+            .entries = std.ArrayList(types.ScanEntry).empty,
+            .allocator = allocator,
+            ._next_cursor = null,
+        };
+        errdefer page.deinit();
+
+        if (limit == 0) return page;
+
+        try page.entries.ensureTotalCapacity(allocator, limit);
+        var last_emitted_key: ?[]const u8 = null;
+
+        while (page.entries.items.len < limit) {
+            const owned_entry = try self.next_owned_entry(allocator, state, stats) orelse break;
+            page.entries.appendAssumeCapacity(owned_entry);
+            last_emitted_key = owned_entry.key;
+        }
+
+        if (last_emitted_key) |resume_key| {
+            if (self.heap.count() != 0) {
+                page._next_cursor = try types.OwnedScanCursor.init(allocator, resume_key);
+            }
+        }
+
+        return page;
+    }
 };
 
 fn entry_less_than(_: void, left: CollectedEntry, right: CollectedEntry) bool {
@@ -623,75 +778,91 @@ fn materialize_prefix_from_shard_chunks_profiled(
         };
     }
 
-    var heap = std.PriorityQueue(BorrowedShardHead, void, borrowed_shard_head_order).init(allocator, {});
-    defer heap.deinit();
+    var merge_state = try PrefixShardChunkMergeState.init(
+        allocator,
+        state,
+        prefix,
+        shard_chunk_size,
+        now,
+        &stats,
+    );
+    defer merge_state.deinit(allocator);
 
-    var prefix_scratch = std.ArrayList(art.ScanEntry).empty;
-    defer prefix_scratch.deinit(allocator);
-
-    var chunks = [_]BorrowedShardChunk{.{}} ** runtime_shard.NUM_SHARDS;
-    defer for (&chunks) |*chunk| chunk.deinit(allocator);
-
-    for (&state.shards, 0..) |*shard, shard_idx| {
-        try fetch_visible_prefix_chunk_profiled(
-            allocator,
-            &prefix_scratch,
-            &chunks[shard_idx],
-            shard,
-            prefix,
-            null,
-            shard_chunk_size,
-            now,
-            &stats,
-            .initial,
-        );
-
-        if (chunks[shard_idx].peek()) |entry| {
-            try heap.add(.{
-                .shard_idx = @intCast(shard_idx),
-                .entry = entry,
-            });
-        }
-    }
-
-    while (heap.removeOrNull()) |head| {
-        try result.entries.append(allocator, try clone_entry(allocator, head.entry.key, head.entry.value));
-
-        var chunk = &chunks[head.shard_idx];
-        chunk.advance();
-
-        if (chunk.peek()) |next_entry| {
-            try heap.add(.{
-                .shard_idx = head.shard_idx,
-                .entry = next_entry,
-            });
-            continue;
-        }
-
-        try fetch_visible_prefix_chunk_profiled(
-            allocator,
-            &prefix_scratch,
-            chunk,
-            &state.shards[head.shard_idx],
-            prefix,
-            head.entry.key,
-            shard_chunk_size,
-            now,
-            &stats,
-            .refill,
-        );
-
-        if (chunk.peek()) |next_entry| {
-            try heap.add(.{
-                .shard_idx = head.shard_idx,
-                .entry = next_entry,
-            });
-        }
+    while (try merge_state.next_owned_entry(allocator, state, &stats)) |entry| {
+        try result.entries.append(allocator, entry);
     }
 
     return .{
         .result = result,
         .stats = stats,
+    };
+}
+
+fn materialize_prefix_from_persistent_pages_profiled(
+    state: *const runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    page_limit: usize,
+    shard_chunk_size: usize,
+    now: i64,
+) error_mod.EngineError!ProfiledPagedScanResult {
+    var stats = MergePageProfileStats{};
+    var result = types.ScanResult{
+        .entries = std.ArrayList(types.ScanEntry).empty,
+        .allocator = allocator,
+    };
+    errdefer result.deinit();
+
+    if (page_limit == 0 or shard_chunk_size == 0) {
+        return .{
+            .result = result,
+            .stats = stats,
+            .page_calls = 0,
+            .cursor_handoffs = 0,
+        };
+    }
+
+    var merge_state = try PrefixShardChunkMergeState.init(
+        allocator,
+        state,
+        prefix,
+        shard_chunk_size,
+        now,
+        &stats,
+    );
+    defer merge_state.deinit(allocator);
+
+    var page_calls: usize = 0;
+    var cursor_handoffs: usize = 0;
+
+    while (true) {
+        var page = try merge_state.next_page(allocator, state, page_limit, &stats);
+        if (page.entries.items.len == 0) {
+            page.deinit();
+            break;
+        }
+        errdefer page.deinit();
+
+        page_calls += 1;
+        if (page.borrow_next_cursor() != null) cursor_handoffs += 1;
+
+        try result.entries.ensureTotalCapacity(allocator, result.entries.items.len + page.entries.items.len);
+
+        var page_entries = page.entries;
+        page.entries = std.ArrayList(types.ScanEntry).empty;
+        for (page_entries.items) |entry| {
+            result.entries.appendAssumeCapacity(entry);
+        }
+        page_entries.deinit(allocator);
+
+        page.deinit();
+    }
+
+    return .{
+        .result = result,
+        .stats = stats,
+        .page_calls = page_calls,
+        .cursor_handoffs = cursor_handoffs,
     };
 }
 
@@ -829,6 +1000,36 @@ pub fn scan_prefix_materialized_from_in_view_profiled(
     state.record_operation(.scan, 1);
 
     return materialize_prefix_from_shard_chunks_profiled(state, allocator, prefix, shard_chunk_size, opened_at_unix_seconds);
+}
+
+/// Materializes one full prefix scan inside a consistent read view by consuming a persistent merged shard-buffer state page-by-page.
+///
+/// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size in the returned result.
+///
+/// Allocator: Allocates owned scan-entry keys, values, result storage, per-page cursor storage, and bounded per-shard chunk scratch through `allocator`.
+///
+/// Ownership: Returns a caller-owned `ScanResult` plus profiling counters by value. The caller must later call `deinit` on the returned `ScanResult`.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes one shard-shared lock at a time while seeding or refilling shard-local ART chunks.
+pub fn scan_prefix_materialized_from_in_view_paged_profiled(
+    view: *const types.ReadView,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    page_limit: usize,
+    shard_chunk_size: usize,
+) error_mod.EngineError!ProfiledPagedScanResult {
+    const state = try runtime_state_from_view(view);
+    const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
+    state.record_operation(.scan, 1);
+
+    return materialize_prefix_from_persistent_pages_profiled(
+        state,
+        allocator,
+        prefix,
+        page_limit,
+        shard_chunk_size,
+        opened_at_unix_seconds,
+    );
 }
 
 /// Scans one range page inside a consistent read view.

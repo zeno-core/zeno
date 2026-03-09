@@ -15,6 +15,7 @@ const scan_item_count: usize = 256;
 const scan_large_item_count: usize = 4096;
 const scan_page_item_count: usize = 64;
 const scan_candidate_shard_buffer_size: usize = 8;
+const scan_candidate_shard_buffer_size_large: usize = 16;
 const batch_item_count: usize = 64;
 const batch_key_storage_bytes: usize = 32;
 
@@ -390,8 +391,8 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
     bench_metrics_config = metrics_config;
     try print_metrics_config(writer, metrics_config);
     try writer.print(
-        "scan candidate profile (prefix=\"scan:\", page_limit={d}, shard_buffer_size={d})\n",
-        .{ scan_page_item_count, scan_candidate_shard_buffer_size },
+        "scan candidate profile (prefix=\"scan:\", page_limit={d}, shard_buffer_sizes={d},{d})\n",
+        .{ scan_page_item_count, scan_candidate_shard_buffer_size, scan_candidate_shard_buffer_size_large },
     );
 
     const scan256_full = try profile_public_full_scan(scan_item_count);
@@ -400,8 +401,11 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
     const scan256_candidate = try profile_merged_full_scan_candidate(scan_item_count);
     try print_scan_candidate_profile(writer, "scan256 merged page-loop candidate", scan256_candidate);
 
-    const scan256_buffered_candidate = try profile_buffered_merged_full_scan_candidate(scan_item_count);
-    try print_scan_candidate_profile(writer, "scan256 merged shard-buffer candidate", scan256_buffered_candidate);
+    const scan256_buffered_candidate = try profile_buffered_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size);
+    try print_scan_candidate_profile(writer, "scan256 merged shard-buffer-8 candidate", scan256_buffered_candidate);
+
+    const scan256_buffered_candidate_large = try profile_buffered_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size_large);
+    try print_scan_candidate_profile(writer, "scan256 merged shard-buffer-16 candidate", scan256_buffered_candidate_large);
 
     const scan4096_full = try profile_public_full_scan(scan_large_item_count);
     try print_scan_candidate_profile(writer, "scan4096 steady", scan4096_full);
@@ -409,8 +413,11 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
     const scan4096_candidate = try profile_merged_full_scan_candidate(scan_large_item_count);
     try print_scan_candidate_profile(writer, "scan4096 merged page-loop candidate", scan4096_candidate);
 
-    const scan4096_buffered_candidate = try profile_buffered_merged_full_scan_candidate(scan_large_item_count);
-    try print_scan_candidate_profile(writer, "scan4096 merged shard-buffer candidate", scan4096_buffered_candidate);
+    const scan4096_buffered_candidate = try profile_buffered_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size);
+    try print_scan_candidate_profile(writer, "scan4096 merged shard-buffer-8 candidate", scan4096_buffered_candidate);
+
+    const scan4096_buffered_candidate_large = try profile_buffered_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size_large);
+    try print_scan_candidate_profile(writer, "scan4096 merged shard-buffer-16 candidate", scan4096_buffered_candidate_large);
 }
 
 fn print_scan_allocation_profile(
@@ -666,7 +673,10 @@ fn profile_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandid
     };
 }
 
-fn profile_buffered_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandidateProfile {
+fn profile_buffered_merged_full_scan_candidate(
+    comptime fixture_items: usize,
+    shard_buffer_size: usize,
+) !ScanCandidateProfile {
     var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer std.debug.assert(db_gpa.deinit() == .ok);
 
@@ -688,7 +698,7 @@ fn profile_buffered_merged_full_scan_candidate(comptime fixture_items: usize) !S
         &view,
         counting_allocator,
         "scan:",
-        scan_candidate_shard_buffer_size,
+        shard_buffer_size,
     );
     const elapsed_ns = timer.read();
 

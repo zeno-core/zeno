@@ -32,6 +32,12 @@ pub const MergePageProfileStats = struct {
     visibility_skips: usize = 0,
     empty_fetches: usize = 0,
     buffered_entries_loaded: usize = 0,
+    initial_fetch_elapsed_ns: u64 = 0,
+    refill_fetch_elapsed_ns: u64 = 0,
+    heap_push_elapsed_ns: u64 = 0,
+    heap_pop_elapsed_ns: u64 = 0,
+    clone_elapsed_ns: u64 = 0,
+    result_append_elapsed_ns: u64 = 0,
 };
 
 pub const ProfiledScanPageResult = struct {
@@ -129,10 +135,10 @@ const PrefixShardChunkMergeState = struct {
             );
 
             if (self.chunks[shard_idx].peek()) |entry| {
-                try self.heap.add(.{
+                try add_borrowed_head_profiled(&self.heap, .{
                     .shard_idx = @intCast(shard_idx),
                     .entry = entry,
-                });
+                }, stats);
             }
         }
 
@@ -168,10 +174,10 @@ const PrefixShardChunkMergeState = struct {
         );
 
         if (self.chunks[shard_idx].peek()) |next_entry| {
-            try self.heap.add(.{
+            try add_borrowed_head_profiled(&self.heap, .{
                 .shard_idx = @intCast(shard_idx),
                 .entry = next_entry,
-            });
+            }, stats);
         }
     }
 
@@ -181,17 +187,17 @@ const PrefixShardChunkMergeState = struct {
         state: *const runtime_state.DatabaseState,
         stats: *MergePageProfileStats,
     ) error_mod.EngineError!?types.ScanEntry {
-        const head = self.heap.removeOrNull() orelse return null;
-        const owned_entry = try clone_entry(allocator, head.entry.key, head.entry.value);
+        const head = remove_borrowed_head_profiled(&self.heap, stats) orelse return null;
+        const owned_entry = try clone_entry_profiled(allocator, head.entry.key, head.entry.value, stats);
 
         var chunk = &self.chunks[head.shard_idx];
         chunk.advance();
 
         if (chunk.peek()) |next_entry| {
-            try self.heap.add(.{
+            try add_borrowed_head_profiled(&self.heap, .{
                 .shard_idx = head.shard_idx,
                 .entry = next_entry,
-            });
+            }, stats);
         } else {
             try self.refill_chunk_for_shard(allocator, state, head.shard_idx, head.entry.key, stats);
         }
@@ -215,12 +221,16 @@ const PrefixShardChunkMergeState = struct {
 
         if (limit == 0) return page;
 
+        var ensure_timer = std.time.Timer.start() catch unreachable;
         try page.entries.ensureTotalCapacity(allocator, limit);
+        stats.result_append_elapsed_ns += ensure_timer.read();
         var last_emitted_key: ?[]const u8 = null;
 
         while (page.entries.items.len < limit) {
             const owned_entry = try self.next_owned_entry(allocator, state, stats) orelse break;
+            var append_timer = std.time.Timer.start() catch unreachable;
             page.entries.appendAssumeCapacity(owned_entry);
+            stats.result_append_elapsed_ns += append_timer.read();
             last_emitted_key = owned_entry.key;
         }
 
@@ -498,6 +508,8 @@ fn fetch_visible_prefix_chunk_profiled(
 ) error_mod.EngineError!void {
     const mutable_shard = @constCast(shard);
     var resume_after = start_after_key;
+    var timer = std.time.Timer.start() catch unreachable;
+    defer note_fetch_elapsed(stats, phase, timer.read());
 
     chunk.clear();
     if (chunk_size == 0) return;
@@ -552,6 +564,71 @@ fn note_fetch_call(stats: *MergePageProfileStats, phase: FetchPhase) void {
     }
 }
 
+fn note_fetch_elapsed(stats: *MergePageProfileStats, phase: FetchPhase, elapsed_ns: u64) void {
+    switch (phase) {
+        .initial => stats.initial_fetch_elapsed_ns += elapsed_ns,
+        .refill => stats.refill_fetch_elapsed_ns += elapsed_ns,
+    }
+}
+
+fn clone_entry_profiled(
+    allocator: std.mem.Allocator,
+    key: []const u8,
+    value: *const types.Value,
+    stats: *MergePageProfileStats,
+) error_mod.EngineError!types.ScanEntry {
+    var timer = std.time.Timer.start() catch unreachable;
+    const entry = try clone_entry(allocator, key, value);
+    stats.clone_elapsed_ns += timer.read();
+    return entry;
+}
+
+fn add_borrowed_head_profiled(
+    heap: *std.PriorityQueue(BorrowedShardHead, void, borrowed_shard_head_order),
+    head: BorrowedShardHead,
+    stats: *MergePageProfileStats,
+) error_mod.EngineError!void {
+    var timer = std.time.Timer.start() catch unreachable;
+    try heap.add(head);
+    stats.heap_push_elapsed_ns += timer.read();
+}
+
+fn remove_borrowed_head_profiled(
+    heap: *std.PriorityQueue(BorrowedShardHead, void, borrowed_shard_head_order),
+    stats: *MergePageProfileStats,
+) ?BorrowedShardHead {
+    var timer = std.time.Timer.start() catch unreachable;
+    const head = heap.removeOrNull();
+    stats.heap_pop_elapsed_ns += timer.read();
+    return head;
+}
+
+fn add_head_or_free_profiled(
+    allocator: std.mem.Allocator,
+    heap: *std.PriorityQueue(ShardHead, void, shard_head_order),
+    head: ShardHead,
+    stats: *MergePageProfileStats,
+) error_mod.EngineError!void {
+    var timer = std.time.Timer.start() catch unreachable;
+    heap.add(head) catch |err| {
+        free_entry(allocator, head.entry);
+        switch (err) {
+            error.OutOfMemory => return error.OutOfMemory,
+        }
+    };
+    stats.heap_push_elapsed_ns += timer.read();
+}
+
+fn remove_head_profiled(
+    heap: *std.PriorityQueue(ShardHead, void, shard_head_order),
+    stats: *MergePageProfileStats,
+) ?ShardHead {
+    var timer = std.time.Timer.start() catch unreachable;
+    const head = heap.removeOrNull();
+    stats.heap_pop_elapsed_ns += timer.read();
+    return head;
+}
+
 fn fetch_next_visible_head_profiled(
     allocator: std.mem.Allocator,
     prefix_scratch: *std.ArrayList(art.ScanEntry),
@@ -565,6 +642,8 @@ fn fetch_next_visible_head_profiled(
 ) error_mod.EngineError!?ShardHead {
     const mutable_shard = @constCast(shard);
     var resume_after = start_after_key;
+    var timer = std.time.Timer.start() catch unreachable;
+    defer note_fetch_elapsed(stats, phase, timer.read());
 
     note_fetch_call(stats, phase);
 
@@ -589,7 +668,7 @@ fn fetch_next_visible_head_profiled(
 
         return .{
             .shard_idx = shard_idx,
-            .entry = try clone_entry(allocator, borrowed_entry.key, borrowed_entry.value),
+            .entry = try clone_entry_profiled(allocator, borrowed_entry.key, borrowed_entry.value, stats),
         };
     }
 }
@@ -697,7 +776,9 @@ fn merge_page_from_shards_profiled(
     if (limit == 0) return .{ .page = page, .stats = stats };
     if (query == .range and range_is_empty(query.range)) return .{ .page = page, .stats = stats };
 
+    var ensure_timer = std.time.Timer.start() catch unreachable;
     try page.entries.ensureTotalCapacity(allocator, limit);
+    stats.result_append_elapsed_ns += ensure_timer.read();
 
     var heap = std.PriorityQueue(ShardHead, void, shard_head_order).init(allocator, {});
     defer {
@@ -721,14 +802,16 @@ fn merge_page_from_shards_profiled(
             &stats,
             .initial,
         );
-        if (maybe_head) |head| try add_head_or_free(allocator, &heap, head);
+        if (maybe_head) |head| try add_head_or_free_profiled(allocator, &heap, head, &stats);
     }
 
     var last_emitted_key: ?[]const u8 = null;
 
     while (page.entries.items.len < limit) {
-        const head = heap.removeOrNull() orelse break;
+        const head = remove_head_profiled(&heap, &stats) orelse break;
+        var append_timer = std.time.Timer.start() catch unreachable;
         page.entries.appendAssumeCapacity(head.entry);
+        stats.result_append_elapsed_ns += append_timer.read();
         last_emitted_key = head.entry.key;
 
         const maybe_refill = try fetch_next_visible_head_profiled(
@@ -742,7 +825,7 @@ fn merge_page_from_shards_profiled(
             &stats,
             .refill,
         );
-        if (maybe_refill) |refill| try add_head_or_free(allocator, &heap, refill);
+        if (maybe_refill) |refill| try add_head_or_free_profiled(allocator, &heap, refill, &stats);
     }
 
     if (last_emitted_key) |resume_key| {
@@ -789,7 +872,9 @@ fn materialize_prefix_from_shard_chunks_profiled(
     defer merge_state.deinit(allocator);
 
     while (try merge_state.next_owned_entry(allocator, state, &stats)) |entry| {
+        var append_timer = std.time.Timer.start() catch unreachable;
         try result.entries.append(allocator, entry);
+        stats.result_append_elapsed_ns += append_timer.read();
     }
 
     return .{
@@ -846,13 +931,17 @@ fn materialize_prefix_from_persistent_pages_profiled(
         page_calls += 1;
         if (page.borrow_next_cursor() != null) cursor_handoffs += 1;
 
+        var ensure_timer = std.time.Timer.start() catch unreachable;
         try result.entries.ensureTotalCapacity(allocator, result.entries.items.len + page.entries.items.len);
+        stats.result_append_elapsed_ns += ensure_timer.read();
 
         var page_entries = page.entries;
         page.entries = std.ArrayList(types.ScanEntry).empty;
+        var append_timer = std.time.Timer.start() catch unreachable;
         for (page_entries.items) |entry| {
             result.entries.appendAssumeCapacity(entry);
         }
+        stats.result_append_elapsed_ns += append_timer.read();
         page_entries.deinit(allocator);
 
         page.deinit();
@@ -932,6 +1021,30 @@ pub fn scan_range(
         },
         .allocator = allocator,
     };
+}
+
+/// Materializes one full prefix scan over the current visible state while reporting chunked merged-executor counters.
+///
+/// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size in the returned result.
+///
+/// Allocator: Allocates owned scan-entry keys, values, result storage, and bounded per-shard chunk scratch through `allocator`.
+///
+/// Ownership: Returns a caller-owned `ScanResult` plus profiling counters by value. The caller must later call `deinit` on the returned `ScanResult`.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate, then takes one shard-shared lock at a time while seeding or refilling shard-local ART chunks.
+pub fn scan_prefix_materialized_profiled(
+    state: *const runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    shard_chunk_size: usize,
+) error_mod.EngineError!ProfiledScanResult {
+    const visibility_gate = @constCast(&state.visibility_gate);
+    visibility_gate.lock_shared();
+    defer visibility_gate.unlock_shared();
+    const now = runtime_shard.unix_now();
+    state.record_operation(.scan, 1);
+
+    return materialize_prefix_from_shard_chunks_profiled(state, allocator, prefix, shard_chunk_size, now);
 }
 
 /// Scans one prefix page inside a consistent read view.

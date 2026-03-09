@@ -25,6 +25,24 @@ const ShardHead = struct {
     entry: types.ScanEntry,
 };
 
+pub const MergePageProfileStats = struct {
+    initial_fetch_calls: usize = 0,
+    refill_fetch_calls: usize = 0,
+    art_fetches: usize = 0,
+    visibility_skips: usize = 0,
+    empty_fetches: usize = 0,
+};
+
+pub const ProfiledScanPageResult = struct {
+    page: types.ScanPageResult,
+    stats: MergePageProfileStats,
+};
+
+const FetchPhase = enum {
+    initial,
+    refill,
+};
+
 fn entry_less_than(_: void, left: CollectedEntry, right: CollectedEntry) bool {
     return std.mem.lessThan(u8, left.entry.key, right.entry.key);
 }
@@ -271,6 +289,55 @@ fn fetch_next_visible_head(
     }
 }
 
+fn note_fetch_call(stats: *MergePageProfileStats, phase: FetchPhase) void {
+    switch (phase) {
+        .initial => stats.initial_fetch_calls += 1,
+        .refill => stats.refill_fetch_calls += 1,
+    }
+}
+
+fn fetch_next_visible_head_profiled(
+    allocator: std.mem.Allocator,
+    prefix_scratch: *std.ArrayList(art.ScanEntry),
+    shard: *const runtime_shard.Shard,
+    shard_idx: u8,
+    query: ScanQuery,
+    start_after_key: ?[]const u8,
+    now: i64,
+    stats: *MergePageProfileStats,
+    phase: FetchPhase,
+) error_mod.EngineError!?ShardHead {
+    const mutable_shard = @constCast(shard);
+    var resume_after = start_after_key;
+
+    note_fetch_call(stats, phase);
+
+    mutable_shard.lock.lockShared();
+    defer mutable_shard.lock.unlockShared();
+
+    while (true) {
+        stats.art_fetches += 1;
+        const borrowed_entry = switch (query) {
+            .prefix => |prefix| try fetch_one_prefix_entry(allocator, prefix_scratch, shard, prefix, resume_after),
+            .range => |range| try fetch_one_range_entry(shard, range, resume_after),
+        } orelse {
+            stats.empty_fetches += 1;
+            return null;
+        };
+
+        if (!expiration.key_is_visible_unlocked(shard, borrowed_entry.key, now)) {
+            stats.visibility_skips += 1;
+            resume_after = borrowed_entry.key;
+            continue;
+        }
+
+        return .{
+            .shard_idx = shard_idx,
+            .entry = try clone_entry(allocator, borrowed_entry.key, borrowed_entry.value),
+        };
+    }
+}
+
 fn add_head_or_free(
     allocator: std.mem.Allocator,
     heap: *std.PriorityQueue(ShardHead, void, shard_head_order),
@@ -353,6 +420,85 @@ fn merge_page_from_shards(
     }
 
     return page;
+}
+
+fn merge_page_from_shards_profiled(
+    state: *const runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    query: ScanQuery,
+    cursor: ?*const types.ScanCursor,
+    limit: usize,
+    now: i64,
+) error_mod.EngineError!ProfiledScanPageResult {
+    var stats = MergePageProfileStats{};
+    var page = types.ScanPageResult{
+        .entries = std.ArrayList(types.ScanEntry).empty,
+        .allocator = allocator,
+        ._next_cursor = null,
+    };
+    errdefer page.deinit();
+
+    if (limit == 0) return .{ .page = page, .stats = stats };
+    if (query == .range and range_is_empty(query.range)) return .{ .page = page, .stats = stats };
+
+    try page.entries.ensureTotalCapacity(allocator, limit);
+
+    var heap = std.PriorityQueue(ShardHead, void, shard_head_order).init(allocator, {});
+    defer {
+        while (heap.removeOrNull()) |head| free_entry(allocator, head.entry);
+        heap.deinit();
+    }
+
+    var prefix_scratch = std.ArrayList(art.ScanEntry).empty;
+    defer prefix_scratch.deinit(allocator);
+
+    const resume_after_key = if (cursor) |resume_cursor| resume_cursor.resume_key else null;
+    for (&state.shards, 0..) |*shard, shard_idx| {
+        const maybe_head = try fetch_next_visible_head_profiled(
+            allocator,
+            &prefix_scratch,
+            shard,
+            @intCast(shard_idx),
+            query,
+            resume_after_key,
+            now,
+            &stats,
+            .initial,
+        );
+        if (maybe_head) |head| try add_head_or_free(allocator, &heap, head);
+    }
+
+    var last_emitted_key: ?[]const u8 = null;
+
+    while (page.entries.items.len < limit) {
+        const head = heap.removeOrNull() orelse break;
+        page.entries.appendAssumeCapacity(head.entry);
+        last_emitted_key = head.entry.key;
+
+        const maybe_refill = try fetch_next_visible_head_profiled(
+            allocator,
+            &prefix_scratch,
+            &state.shards[head.shard_idx],
+            head.shard_idx,
+            query,
+            head.entry.key,
+            now,
+            &stats,
+            .refill,
+        );
+        if (maybe_refill) |refill| try add_head_or_free(allocator, &heap, refill);
+    }
+
+    if (last_emitted_key) |resume_key| {
+        if (heap.count() != 0) {
+            page._next_cursor = try types.OwnedScanCursor.init(allocator, resume_key);
+        }
+    }
+
+    return .{
+        .page = page,
+        .stats = stats,
+    };
 }
 
 /// Scans all currently visible keys with the requested prefix.
@@ -444,6 +590,29 @@ pub fn scan_prefix_from_in_view(
     state.record_operation(.scan, 1);
 
     return merge_page_from_shards(state, allocator, .{ .prefix = prefix }, cursor, limit, opened_at_unix_seconds);
+}
+
+/// Scans one prefix page inside a consistent read view while reporting merged-executor refill counters.
+///
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size in the returned page.
+///
+/// Allocator: Allocates owned scan-entry keys, values, and any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page owns its entries and may own one continuation cursor.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes one shard-shared lock at a time while fetching or refilling shard-local ART heads.
+pub fn scan_prefix_from_in_view_profiled(
+    view: *const types.ReadView,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    cursor: ?*const types.ScanCursor,
+    limit: usize,
+) error_mod.EngineError!ProfiledScanPageResult {
+    const state = try runtime_state_from_view(view);
+    const opened_at_unix_seconds = read_view_mod.resolve_opened_at_unix_seconds(view) orelse return error.InvalidReadView;
+    state.record_operation(.scan, 1);
+
+    return merge_page_from_shards_profiled(state, allocator, .{ .prefix = prefix }, cursor, limit, opened_at_unix_seconds);
 }
 
 /// Scans one range page inside a consistent read view.

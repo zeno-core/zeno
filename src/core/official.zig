@@ -23,6 +23,8 @@ pub const CheckedBatchGuard = types.CheckedBatchGuard;
 
 /// Public error set used by the official engine contract.
 pub const Error = engine_db.EngineError;
+pub const MergePageProfileStats = engine_db.MergePageProfileStats;
+pub const ProfiledScanPageResult = engine_db.ProfiledScanPageResult;
 
 /// Scans the next prefix page inside a consistent read view.
 ///
@@ -41,6 +43,25 @@ pub fn scan_prefix_from_in_view(
     limit: usize,
 ) Error!types.ScanPageResult {
     return engine_db.scan_prefix_from_in_view(view, allocator, prefix, cursor, limit);
+}
+
+/// Scans the next prefix page inside a consistent read view while reporting merged-executor refill counters.
+///
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page owns its entries, may own one continuation cursor, and carries caller-owned profiling counters by value.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while fetching or refilling shard-local ART heads.
+pub fn scan_prefix_from_in_view_profiled(
+    view: *const ReadView,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    cursor: ?*const types.ScanCursor,
+    limit: usize,
+) Error!ProfiledScanPageResult {
+    return engine_db.scan_prefix_from_in_view_profiled(view, allocator, prefix, cursor, limit);
 }
 
 /// Scans the next range page inside a consistent read view.

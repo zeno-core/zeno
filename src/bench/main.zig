@@ -58,6 +58,11 @@ const ScanCandidateProfile = struct {
     emitted_entries: usize,
     page_calls: usize,
     cursor_handoffs: usize,
+    initial_fetch_calls: usize,
+    refill_fetch_calls: usize,
+    art_fetches: usize,
+    visibility_skips: usize,
+    empty_fetches: usize,
     allocations: usize,
     deallocations: usize,
     allocated_bytes: usize,
@@ -422,12 +427,17 @@ fn print_scan_candidate_profile(
     profile: ScanCandidateProfile,
 ) !void {
     try writer.print(
-        "{s}: entries={d} pages={d} cursor_handoffs={d} allocations={d} deallocations={d} allocated_bytes={d} freed_bytes={d} elapsed_ns={d}\n",
+        "{s}: entries={d} pages={d} cursor_handoffs={d} initial_fetch_calls={d} refill_fetch_calls={d} art_fetches={d} visibility_skips={d} empty_fetches={d} allocations={d} deallocations={d} allocated_bytes={d} freed_bytes={d} elapsed_ns={d}\n",
         .{
             label,
             profile.emitted_entries,
             profile.page_calls,
             profile.cursor_handoffs,
+            profile.initial_fetch_calls,
+            profile.refill_fetch_calls,
+            profile.art_fetches,
+            profile.visibility_skips,
+            profile.empty_fetches,
             profile.allocations,
             profile.deallocations,
             profile.allocated_bytes,
@@ -435,6 +445,17 @@ fn print_scan_candidate_profile(
             profile.elapsed_ns,
         },
     );
+}
+
+fn accumulate_merge_profile_stats(
+    totals: *official.MergePageProfileStats,
+    page_stats: official.MergePageProfileStats,
+) void {
+    totals.initial_fetch_calls += page_stats.initial_fetch_calls;
+    totals.refill_fetch_calls += page_stats.refill_fetch_calls;
+    totals.art_fetches += page_stats.art_fetches;
+    totals.visibility_skips += page_stats.visibility_skips;
+    totals.empty_fetches += page_stats.empty_fetches;
 }
 
 fn profile_scan_allocations(
@@ -513,6 +534,11 @@ fn profile_public_full_scan(comptime fixture_items: usize) !ScanCandidateProfile
         .emitted_entries = emitted_entries,
         .page_calls = 1,
         .cursor_handoffs = 0,
+        .initial_fetch_calls = 0,
+        .refill_fetch_calls = 0,
+        .art_fetches = 0,
+        .visibility_skips = 0,
+        .empty_fetches = 0,
         .allocations = counting_state.allocations,
         .deallocations = counting_state.deallocations,
         .allocated_bytes = counting_state.allocated_bytes,
@@ -542,6 +568,7 @@ fn profile_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandid
     var cursor_owner: ?types.OwnedScanCursor = null;
     var page_calls: usize = 0;
     var cursor_handoffs: usize = 0;
+    var merge_stats = official.MergePageProfileStats{};
 
     var timer = try std.time.Timer.start();
     defer if (cursor_owner) |*cursor| cursor.deinit();
@@ -552,7 +579,7 @@ fn profile_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandid
             borrowed_cursor = owned_cursor.as_cursor();
         }
 
-        var page = try official.scan_prefix_from_in_view(
+        const profiled_page = try official.scan_prefix_from_in_view_profiled(
             &view,
             counting_allocator,
             "scan:",
@@ -560,6 +587,9 @@ fn profile_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandid
             scan_page_item_count,
         );
         page_calls += 1;
+        accumulate_merge_profile_stats(&merge_stats, profiled_page.stats);
+
+        var page = profiled_page.page;
 
         errdefer page.deinit();
         errdefer {
@@ -608,6 +638,11 @@ fn profile_merged_full_scan_candidate(comptime fixture_items: usize) !ScanCandid
         .emitted_entries = emitted_entries,
         .page_calls = page_calls,
         .cursor_handoffs = cursor_handoffs,
+        .initial_fetch_calls = merge_stats.initial_fetch_calls,
+        .refill_fetch_calls = merge_stats.refill_fetch_calls,
+        .art_fetches = merge_stats.art_fetches,
+        .visibility_skips = merge_stats.visibility_skips,
+        .empty_fetches = merge_stats.empty_fetches,
         .allocations = counting_state.allocations,
         .deallocations = counting_state.deallocations,
         .allocated_bytes = counting_state.allocated_bytes,

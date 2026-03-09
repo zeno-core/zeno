@@ -22,6 +22,8 @@ const write = @import("write.zig");
 
 /// Shared error set for engine contract operations.
 pub const EngineError = error_mod.EngineError;
+pub const MergePageProfileStats = scan_ops.MergePageProfileStats;
+pub const ProfiledScanPageResult = scan_ops.ProfiledScanPageResult;
 
 /// Central engine handle for the finalized `zeno-core` contract surface.
 pub const Database = struct {
@@ -212,6 +214,26 @@ pub fn scan_prefix_from_in_view(
 ) EngineError!types.ScanPageResult {
     const state = runtime_state_from_view_for_latency(view);
     return metrics.call_with_optional_latency(state, scan_ops.scan_prefix_from_in_view, .{ view, allocator, prefix, cursor, limit });
+}
+
+/// Scans the next prefix page inside a consistent read view while reporting merged-executor refill counters.
+///
+/// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned entry keys and values plus any continuation cursor through `allocator`.
+///
+/// Ownership: `cursor` is borrowed when present and must remain valid for the duration of the call. The returned page owns its entries, may own one continuation cursor, and carries caller-owned profiling counters by value.
+///
+/// Thread Safety: Relies on the caller-owned `ReadView` visibility hold and takes shard shared locks while fetching or refilling shard-local ART heads.
+pub fn scan_prefix_from_in_view_profiled(
+    view: *const types.ReadView,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    cursor: ?*const types.ScanCursor,
+    limit: usize,
+) EngineError!ProfiledScanPageResult {
+    const state = runtime_state_from_view_for_latency(view);
+    return metrics.call_with_optional_latency(state, scan_ops.scan_prefix_from_in_view_profiled, .{ view, allocator, prefix, cursor, limit });
 }
 
 /// Scans the next range page inside a consistent read view.

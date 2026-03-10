@@ -293,6 +293,24 @@ pub fn scan_prefix_materialized_winner_selected_profiled(
     return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_winner_selected_profiled, .{ &db.state, allocator, prefix, shard_chunk_size });
 }
 
+/// Materializes one full prefix scan over the current visible state using a fixed-capacity inline min-heap merge-state candidate.
+///
+/// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned entry keys and values plus result storage and bounded per-shard chunk scratch through `allocator`. The heap is inline with compile-time capacity and requires no allocator.
+///
+/// Ownership: Returns a caller-owned `ScanResult` plus profiling counters by value. The caller must later call `deinit` on the returned `ScanResult`.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate before taking shard shared locks to seed or refill shard-local ART chunks.
+pub fn scan_prefix_materialized_fixed_heap_profiled(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    shard_chunk_size: usize,
+) EngineError!ProfiledScanResult {
+    return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_fixed_heap_profiled, .{ &db.state, allocator, prefix, shard_chunk_size });
+}
+
 /// Materializes one full prefix scan inside a consistent read view by consuming a persistent merged shard-buffer state page-by-page.
 ///
 /// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size.
@@ -1990,6 +2008,46 @@ test "scan_prefix_materialized_winner_selected_profiled matches full scan orderi
     defer expected.deinit();
 
     var profiled = try scan_prefix_materialized_winner_selected_profiled(db, testing.allocator, "alpha", 2);
+    defer profiled.result.deinit();
+
+    try testing.expectEqual(expected.entries.items.len, profiled.result.entries.items.len);
+    try testing.expectEqual(expected.entries.items.len, profiled.stats.buffered_entries_loaded);
+
+    for (expected.entries.items, profiled.result.entries.items) |expected_entry, actual_entry| {
+        try testing.expectEqualStrings(expected_entry.key, actual_entry.key);
+        try testing.expectEqual(expected_entry.value.integer, actual_entry.value.integer);
+    }
+}
+
+test "scan_prefix_materialized_fixed_heap_profiled matches full scan ordering" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const values = [_]types.Value{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+        .{ .integer = 4 },
+        .{ .integer = 5 },
+    };
+    const keys = [_][]const u8{
+        "alpha",
+        "alpha:1",
+        "alpha:2",
+        "alpha:3",
+        "alpha:4",
+    };
+
+    for (keys, values) |key, value| {
+        try db.put(key, &value);
+    }
+
+    var expected = try db.scan_prefix(testing.allocator, "alpha");
+    defer expected.deinit();
+
+    var profiled = try scan_prefix_materialized_fixed_heap_profiled(db, testing.allocator, "alpha", 2);
     defer profiled.result.deinit();
 
     try testing.expectEqual(expected.entries.items.len, profiled.result.entries.items.len);

@@ -120,6 +120,24 @@ pub fn scan_prefix_materialized_winner_selected_profiled(
     return engine_db.scan_prefix_materialized_winner_selected_profiled(db, allocator, prefix, shard_chunk_size);
 }
 
+/// Materializes one full prefix scan over the current visible state using a fixed-capacity inline min-heap merge-state candidate.
+///
+/// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size.
+///
+/// Allocator: Allocates owned entry keys and values plus result storage and bounded per-shard chunk scratch through `allocator`. The heap is inline with compile-time capacity and requires no allocator.
+///
+/// Ownership: Returns a caller-owned `ScanResult` plus profiling counters by value. The caller must later call `deinit` on the returned `ScanResult`.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate before taking shard shared locks to seed or refill shard-local ART chunks.
+pub fn scan_prefix_materialized_fixed_heap_profiled(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    shard_chunk_size: usize,
+) Error!ProfiledScanResult {
+    return engine_db.scan_prefix_materialized_fixed_heap_profiled(db, allocator, prefix, shard_chunk_size);
+}
+
 /// Materializes one full prefix scan inside a consistent read view by consuming a persistent merged shard-buffer state page-by-page.
 ///
 /// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size.

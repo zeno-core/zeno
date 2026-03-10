@@ -420,6 +420,12 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
     const scan256_public_fixed_heap_candidate = try profile_public_fixed_heap_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan256 merged public-fixed-heap-shard-buffer-8 candidate", scan256_public_fixed_heap_candidate);
 
+    const scan256_public_bulk_collect_candidate = try profile_public_bulk_collect_merged_full_scan_candidate(scan_item_count);
+    try print_scan_candidate_profile(writer, "scan256 merged public-bulk-collect candidate", scan256_public_bulk_collect_candidate);
+
+    const scan256_public_bulk_visit_candidate = try profile_public_bulk_visit_merged_full_scan_candidate(scan_item_count);
+    try print_scan_candidate_profile(writer, "scan256 merged public-bulk-visit candidate", scan256_public_bulk_visit_candidate);
+
     const scan256_persistent_paged_candidate = try profile_persistent_paged_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan256 merged persistent-page-8 candidate", scan256_persistent_paged_candidate);
 
@@ -443,6 +449,12 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
 
     const scan4096_public_fixed_heap_candidate = try profile_public_fixed_heap_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan4096 merged public-fixed-heap-shard-buffer-8 candidate", scan4096_public_fixed_heap_candidate);
+
+    const scan4096_public_bulk_collect_candidate = try profile_public_bulk_collect_merged_full_scan_candidate(scan_large_item_count);
+    try print_scan_candidate_profile(writer, "scan4096 merged public-bulk-collect candidate", scan4096_public_bulk_collect_candidate);
+
+    const scan4096_public_bulk_visit_candidate = try profile_public_bulk_visit_merged_full_scan_candidate(scan_large_item_count);
+    try print_scan_candidate_profile(writer, "scan4096 merged public-bulk-visit candidate", scan4096_public_bulk_visit_candidate);
 
     const scan4096_persistent_paged_candidate = try profile_persistent_paged_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan4096 merged persistent-page-8 candidate", scan4096_persistent_paged_candidate);
@@ -929,6 +941,116 @@ fn profile_public_fixed_heap_merged_full_scan_candidate(
         counting_allocator,
         "scan:",
         shard_buffer_size,
+    );
+    const elapsed_ns = timer.read();
+
+    const emitted_entries = profiled_result.result.entries.items.len;
+    std.debug.assert(emitted_entries == fixture_items);
+    profiled_result.result.deinit();
+
+    std.debug.assert(counting_state.allocated_bytes == counting_state.freed_bytes);
+
+    return .{
+        .emitted_entries = emitted_entries,
+        .page_calls = 1,
+        .cursor_handoffs = 0,
+        .initial_fetch_calls = profiled_result.stats.initial_fetch_calls,
+        .refill_fetch_calls = profiled_result.stats.refill_fetch_calls,
+        .art_fetches = profiled_result.stats.art_fetches,
+        .visibility_skips = profiled_result.stats.visibility_skips,
+        .empty_fetches = profiled_result.stats.empty_fetches,
+        .buffered_entries_loaded = profiled_result.stats.buffered_entries_loaded,
+        .initial_fetch_elapsed_ns = profiled_result.stats.initial_fetch_elapsed_ns,
+        .refill_fetch_elapsed_ns = profiled_result.stats.refill_fetch_elapsed_ns,
+        .heap_push_elapsed_ns = profiled_result.stats.heap_push_elapsed_ns,
+        .heap_pop_elapsed_ns = profiled_result.stats.heap_pop_elapsed_ns,
+        .winner_select_elapsed_ns = profiled_result.stats.winner_select_elapsed_ns,
+        .clone_elapsed_ns = profiled_result.stats.clone_elapsed_ns,
+        .result_append_elapsed_ns = profiled_result.stats.result_append_elapsed_ns,
+        .allocations = counting_state.allocations,
+        .deallocations = counting_state.deallocations,
+        .allocated_bytes = counting_state.allocated_bytes,
+        .freed_bytes = counting_state.freed_bytes,
+        .elapsed_ns = elapsed_ns,
+    };
+}
+
+fn profile_public_bulk_collect_merged_full_scan_candidate(
+    comptime fixture_items: usize,
+) !ScanCandidateProfile {
+    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(db_gpa.deinit() == .ok);
+
+    const db = try open_bench_db(db_gpa.allocator());
+    defer db.close() catch unreachable;
+    load_scan_fixture(fixture_items, db);
+
+    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(result_gpa.deinit() == .ok);
+
+    var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
+    const counting_allocator = counting_state.allocator();
+
+    var timer = try std.time.Timer.start();
+    var profiled_result = try official.scan_prefix_materialized_bulk_collect_profiled(
+        db,
+        counting_allocator,
+        "scan:",
+    );
+    const elapsed_ns = timer.read();
+
+    const emitted_entries = profiled_result.result.entries.items.len;
+    std.debug.assert(emitted_entries == fixture_items);
+    profiled_result.result.deinit();
+
+    std.debug.assert(counting_state.allocated_bytes == counting_state.freed_bytes);
+
+    return .{
+        .emitted_entries = emitted_entries,
+        .page_calls = 1,
+        .cursor_handoffs = 0,
+        .initial_fetch_calls = profiled_result.stats.initial_fetch_calls,
+        .refill_fetch_calls = profiled_result.stats.refill_fetch_calls,
+        .art_fetches = profiled_result.stats.art_fetches,
+        .visibility_skips = profiled_result.stats.visibility_skips,
+        .empty_fetches = profiled_result.stats.empty_fetches,
+        .buffered_entries_loaded = profiled_result.stats.buffered_entries_loaded,
+        .initial_fetch_elapsed_ns = profiled_result.stats.initial_fetch_elapsed_ns,
+        .refill_fetch_elapsed_ns = profiled_result.stats.refill_fetch_elapsed_ns,
+        .heap_push_elapsed_ns = profiled_result.stats.heap_push_elapsed_ns,
+        .heap_pop_elapsed_ns = profiled_result.stats.heap_pop_elapsed_ns,
+        .winner_select_elapsed_ns = profiled_result.stats.winner_select_elapsed_ns,
+        .clone_elapsed_ns = profiled_result.stats.clone_elapsed_ns,
+        .result_append_elapsed_ns = profiled_result.stats.result_append_elapsed_ns,
+        .allocations = counting_state.allocations,
+        .deallocations = counting_state.deallocations,
+        .allocated_bytes = counting_state.allocated_bytes,
+        .freed_bytes = counting_state.freed_bytes,
+        .elapsed_ns = elapsed_ns,
+    };
+}
+
+fn profile_public_bulk_visit_merged_full_scan_candidate(
+    comptime fixture_items: usize,
+) !ScanCandidateProfile {
+    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(db_gpa.deinit() == .ok);
+
+    const db = try open_bench_db(db_gpa.allocator());
+    defer db.close() catch unreachable;
+    load_scan_fixture(fixture_items, db);
+
+    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(result_gpa.deinit() == .ok);
+
+    var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
+    const counting_allocator = counting_state.allocator();
+
+    var timer = try std.time.Timer.start();
+    var profiled_result = try official.scan_prefix_materialized_bulk_visit_profiled(
+        db,
+        counting_allocator,
+        "scan:",
     );
     const elapsed_ns = timer.read();
 

@@ -138,6 +138,22 @@ pub fn scan_prefix_materialized_fixed_heap_profiled(
     return engine_db.scan_prefix_materialized_fixed_heap_profiled(db, allocator, prefix, shard_chunk_size);
 }
 
+pub fn scan_prefix_materialized_bulk_collect_profiled(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) Error!ProfiledScanResult {
+    return engine_db.scan_prefix_materialized_bulk_collect_profiled(db, allocator, prefix);
+}
+
+pub fn scan_prefix_materialized_bulk_visit_profiled(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) Error!ProfiledScanResult {
+    return engine_db.scan_prefix_materialized_bulk_visit_profiled(db, allocator, prefix);
+}
+
 /// Materializes one full prefix scan inside a consistent read view by consuming a persistent merged shard-buffer state page-by-page.
 ///
 /// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size.

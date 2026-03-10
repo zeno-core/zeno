@@ -311,6 +311,22 @@ pub fn scan_prefix_materialized_fixed_heap_profiled(
     return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_fixed_heap_profiled, .{ &db.state, allocator, prefix, shard_chunk_size });
 }
 
+pub fn scan_prefix_materialized_bulk_collect_profiled(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) EngineError!ProfiledScanResult {
+    return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_bulk_collect_profiled, .{ &db.state, allocator, prefix });
+}
+
+pub fn scan_prefix_materialized_bulk_visit_profiled(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) EngineError!ProfiledScanResult {
+    return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_bulk_visit_profiled, .{ &db.state, allocator, prefix });
+}
+
 /// Materializes one full prefix scan inside a consistent read view by consuming a persistent merged shard-buffer state page-by-page.
 ///
 /// Time Complexity: O(s log s + r * (k + log s + v)), where `s` is shard count, `r` is emitted result size, `k` is ART seek work for one chunk refill, and `v` is total cloned value size.
@@ -2048,6 +2064,74 @@ test "scan_prefix_materialized_fixed_heap_profiled matches full scan ordering" {
     defer expected.deinit();
 
     var profiled = try scan_prefix_materialized_fixed_heap_profiled(db, testing.allocator, "alpha", 2);
+    defer profiled.result.deinit();
+
+    try testing.expectEqual(expected.entries.items.len, profiled.result.entries.items.len);
+    try testing.expectEqual(expected.entries.items.len, profiled.stats.buffered_entries_loaded);
+
+    for (expected.entries.items, profiled.result.entries.items) |expected_entry, actual_entry| {
+        try testing.expectEqualStrings(expected_entry.key, actual_entry.key);
+        try testing.expectEqual(expected_entry.value.integer, actual_entry.value.integer);
+    }
+}
+
+test "scan_prefix_materialized_bulk_collect_profiled matches full scan ordering" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const values = [_]types.Value{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+        .{ .integer = 4 },
+        .{ .integer = 5 },
+    };
+    const keys = [_][]const u8{ "alpha", "alphabet", "alphanumeric", "beta", "gamma" };
+
+    for (keys, values) |key, value| {
+        try db.put(key, &value);
+    }
+
+    var expected = try db.scan_prefix(testing.allocator, "alpha");
+    defer expected.deinit();
+
+    var profiled = try scan_prefix_materialized_bulk_collect_profiled(db, testing.allocator, "alpha");
+    defer profiled.result.deinit();
+
+    try testing.expectEqual(expected.entries.items.len, profiled.result.entries.items.len);
+    try testing.expectEqual(expected.entries.items.len, profiled.stats.buffered_entries_loaded);
+
+    for (expected.entries.items, profiled.result.entries.items) |expected_entry, actual_entry| {
+        try testing.expectEqualStrings(expected_entry.key, actual_entry.key);
+        try testing.expectEqual(expected_entry.value.integer, actual_entry.value.integer);
+    }
+}
+
+test "scan_prefix_materialized_bulk_visit_profiled matches full scan ordering" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const values = [_]types.Value{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+        .{ .integer = 4 },
+        .{ .integer = 5 },
+    };
+    const keys = [_][]const u8{ "alpha", "alphabet", "alphanumeric", "beta", "gamma" };
+
+    for (keys, values) |key, value| {
+        try db.put(key, &value);
+    }
+
+    var expected = try db.scan_prefix(testing.allocator, "alpha");
+    defer expected.deinit();
+
+    var profiled = try scan_prefix_materialized_bulk_visit_profiled(db, testing.allocator, "alpha");
     defer profiled.result.deinit();
 
     try testing.expectEqual(expected.entries.items.len, profiled.result.entries.items.len);

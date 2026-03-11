@@ -1513,13 +1513,17 @@ pub const Iterator = struct {
     allocator: std.mem.Allocator,
     prefix: []const u8,
     cursor: ?[]const u8,
-    stack: std.ArrayList(Frame),
+    inline_stack: [inline_stack_capacity]Frame = undefined,
+    inline_len: usize = 0,
+    spill_stack: std.ArrayListUnmanaged(Frame) = .empty,
 
     pub const Frame = struct {
         node: *const Node,
         depth: usize,
         step: u16,
     };
+
+    const inline_stack_capacity: usize = 16;
 
     /// Initializes a new Prefix Scanner Iterator.
     /// `cursor` must outlive the `Iterator` if provided.
@@ -1528,10 +1532,9 @@ pub const Iterator = struct {
             .allocator = allocator,
             .prefix = prefix,
             .cursor = cursor,
-            .stack = .empty,
         };
         if (!tree.root.is_empty()) {
-            try it.stack.append(allocator, .{
+            try it.push(.{
                 .node = &tree.root,
                 .depth = 0,
                 .step = 0,
@@ -1542,26 +1545,23 @@ pub const Iterator = struct {
 
     /// Frees internal stack allocations.
     pub fn deinit(self: *Iterator) void {
-        self.stack.deinit(self.allocator);
+        self.spill_stack.deinit(self.allocator);
         self.* = undefined;
     }
 
     /// Advances the iterator and returns the next matching element.
     /// Time Complexity: O(k) for the first call (seek), O(1) amortized for subsequent calls.
     pub fn next(self: *Iterator) !?ScanEntry {
-        while (self.stack.items.len > 0) {
-            const frame_idx = self.stack.items.len - 1;
-            var frame = &self.stack.items[frame_idx];
-
+        while (self.peek()) |frame| {
             switch (frame.node.*) {
                 .empty => {
-                    _ = self.stack.pop();
+                    self.pop();
                     continue;
                 },
                 .leaf => |leaf| {
                     const is_match = std.mem.startsWith(u8, leaf.key, self.prefix);
                     var valid = is_match;
-                    
+
                     if (valid and self.cursor != null) {
                         if (std.mem.order(u8, self.cursor.?, leaf.key) != .lt) {
                             valid = false;
@@ -1569,8 +1569,8 @@ pub const Iterator = struct {
                             self.cursor = null;
                         }
                     }
-                    
-                    _ = self.stack.pop();
+
+                    self.pop();
                     if (valid) return ScanEntry{ .key = leaf.key, .value = leaf.value };
                     continue;
                 },
@@ -1586,7 +1586,8 @@ pub const Iterator = struct {
                         for (0..max_cmp) |i| {
                             if (d >= self.prefix.len) break;
                             if (header.prefix[i] != self.prefix[d]) {
-                                match = false; break;
+                                match = false;
+                                break;
                             }
                             d += 1;
                         }
@@ -1596,21 +1597,22 @@ pub const Iterator = struct {
                             for (MAX_PREFIX_LEN..p_len) |_| {
                                 if (d >= self.prefix.len) break;
                                 if (any.key[d] != self.prefix[d]) {
-                                    match = false; break;
+                                    match = false;
+                                    break;
                                 }
                                 d += 1;
                             }
                         }
 
                         if (!match) {
-                            _ = self.stack.pop();
+                            self.pop();
                             continue;
                         }
 
                         if (self.cursor) |c| {
                             const step_cmp = Tree.compare_compressed_prefix_with_cursor(frame.node, header, frame.depth, c);
                             if (step_cmp.relation == .before_cursor) {
-                                _ = self.stack.pop();
+                                self.pop();
                                 continue;
                             }
                         }
@@ -1639,12 +1641,12 @@ pub const Iterator = struct {
                                 const i = frame.step - 1;
                                 frame.step += 1;
                                 const cb = n4.keys[i];
-                                
+
                                 if (self.cursor) |c| {
                                     const nd = frame.depth + p_len;
                                     if (nd < c.len and cb < c[nd]) continue;
                                 }
-                                
+
                                 child_to_push = &n4.children[i];
                                 break;
                             }
@@ -1655,12 +1657,12 @@ pub const Iterator = struct {
                                 const i = frame.step - 1;
                                 frame.step += 1;
                                 const cb = n16.keys[i];
-                                
+
                                 if (self.cursor) |c| {
                                     const nd = frame.depth + p_len;
                                     if (nd < c.len and cb < c[nd]) continue;
                                 }
-                                
+
                                 child_to_push = &n16.children[i];
                                 break;
                             }
@@ -1672,13 +1674,13 @@ pub const Iterator = struct {
                                 frame.step += 1;
                                 const idx = n48.child_index[i];
                                 if (idx == Node48.EMPTY_INDEX) continue;
-                                
+
                                 const cb: u8 = @intCast(i);
                                 if (self.cursor) |c| {
                                     const nd = frame.depth + p_len;
                                     if (nd < c.len and cb < c[nd]) continue;
                                 }
-                                
+
                                 child_to_push = &n48.children[idx];
                                 break;
                             }
@@ -1689,13 +1691,13 @@ pub const Iterator = struct {
                                 const i = frame.step - 1;
                                 frame.step += 1;
                                 if (n256.children[i].is_empty()) continue;
-                                
+
                                 const cb: u8 = @intCast(i);
                                 if (self.cursor) |c| {
                                     const nd = frame.depth + p_len;
                                     if (nd < c.len and cb < c[nd]) continue;
                                 }
-                                
+
                                 child_to_push = &n256.children[i];
                                 break;
                             }
@@ -1703,18 +1705,46 @@ pub const Iterator = struct {
                     }
 
                     if (child_to_push) |child| {
-                        try self.stack.append(self.allocator, .{
+                        try self.push(.{
                             .node = child,
                             .depth = frame.depth + p_len + 1,
                             .step = 0,
                         });
                     } else {
-                        _ = self.stack.pop();
+                        self.pop();
                     }
-                }
+                },
             }
         }
         return null;
+    }
+
+    fn push(self: *Iterator, frame: Frame) !void {
+        if (self.spill_stack.items.len != 0 or self.inline_len == self.inline_stack.len) {
+            try self.spill_stack.append(self.allocator, frame);
+            return;
+        }
+
+        self.inline_stack[self.inline_len] = frame;
+        self.inline_len += 1;
+    }
+
+    fn pop(self: *Iterator) void {
+        if (self.spill_stack.items.len != 0) {
+            _ = self.spill_stack.pop();
+            return;
+        }
+
+        std.debug.assert(self.inline_len != 0);
+        self.inline_len -= 1;
+    }
+
+    fn peek(self: *Iterator) ?*Frame {
+        if (self.spill_stack.items.len != 0) {
+            return &self.spill_stack.items[self.spill_stack.items.len - 1];
+        }
+        if (self.inline_len == 0) return null;
+        return &self.inline_stack[self.inline_len - 1];
     }
 };
 
@@ -1889,4 +1919,39 @@ test "scan_range_from and scan_range_visit_from stay equivalent for same range c
         try testing.expectEqualStrings(lhs.key, rhs.key);
         try testing.expect(lhs.value == rhs.value);
     }
+}
+
+test "iterator uses inline stack for shallow prefix scans" {
+    const testing = std.testing;
+
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+
+    var tree = Tree.init(arena.allocator());
+    var values = [_]Value{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+        .{ .integer = 4 },
+    };
+    const keys = [_][]const u8{ "alpha", "alphabet", "alpine", "beta" };
+    for (keys, 0..) |key, i| {
+        try tree.insert(try arena.allocator().dupe(u8, key), &values[i]);
+    }
+
+    var counting_state = std.testing.FailingAllocator.init(testing.allocator, .{});
+    var it = try Iterator.init(counting_state.allocator(), &tree, "al", null);
+    defer it.deinit();
+
+    const expected = [_][]const u8{ "alpha", "alphabet", "alpine" };
+    var next_index: usize = 0;
+    while (try it.next()) |entry| {
+        try testing.expect(next_index < expected.len);
+        try testing.expectEqualStrings(expected[next_index], entry.key);
+        next_index += 1;
+    }
+
+    try testing.expectEqual(expected.len, next_index);
+    try testing.expectEqual(@as(usize, 0), counting_state.allocations);
+    try testing.expectEqual(@as(usize, 0), counting_state.allocated_bytes);
 }

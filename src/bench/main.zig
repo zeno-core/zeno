@@ -429,6 +429,9 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
     const scan256_public_iterator_candidate = try profile_public_iterator_merged_full_scan_candidate(scan_item_count);
     try print_scan_candidate_profile(writer, "scan256 merged public-iterator candidate", scan256_public_iterator_candidate);
 
+    const scan256_public_iterator_unprofiled_candidate = try profile_public_iterator_merged_full_scan_candidate_unprofiled(scan_item_count);
+    try print_scan_candidate_profile(writer, "scan256 merged public-iterator-unprofiled candidate", scan256_public_iterator_unprofiled_candidate);
+
     const scan256_persistent_paged_candidate = try profile_persistent_paged_merged_full_scan_candidate(scan_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan256 merged persistent-page-8 candidate", scan256_persistent_paged_candidate);
 
@@ -461,6 +464,9 @@ fn run_scan_candidate_profile(writer: anytype, metrics_config: types.MetricsConf
 
     const scan4096_public_iterator_candidate = try profile_public_iterator_merged_full_scan_candidate(scan_large_item_count);
     try print_scan_candidate_profile(writer, "scan4096 merged public-iterator candidate", scan4096_public_iterator_candidate);
+
+    const scan4096_public_iterator_unprofiled_candidate = try profile_public_iterator_merged_full_scan_candidate_unprofiled(scan_large_item_count);
+    try print_scan_candidate_profile(writer, "scan4096 merged public-iterator-unprofiled candidate", scan4096_public_iterator_unprofiled_candidate);
 
     const scan4096_persistent_paged_candidate = try profile_persistent_paged_merged_full_scan_candidate(scan_large_item_count, scan_candidate_shard_buffer_size);
     try print_scan_candidate_profile(writer, "scan4096 merged persistent-page-8 candidate", scan4096_persistent_paged_candidate);
@@ -1138,6 +1144,61 @@ fn profile_public_iterator_merged_full_scan_candidate(
         .winner_select_elapsed_ns = profiled_result.stats.winner_select_elapsed_ns,
         .clone_elapsed_ns = profiled_result.stats.clone_elapsed_ns,
         .result_append_elapsed_ns = profiled_result.stats.result_append_elapsed_ns,
+        .allocations = counting_state.allocations,
+        .deallocations = counting_state.deallocations,
+        .allocated_bytes = counting_state.allocated_bytes,
+        .freed_bytes = counting_state.freed_bytes,
+        .elapsed_ns = elapsed_ns,
+    };
+}
+
+fn profile_public_iterator_merged_full_scan_candidate_unprofiled(
+    comptime fixture_items: usize,
+) !ScanCandidateProfile {
+    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(db_gpa.deinit() == .ok);
+
+    const db = try open_bench_db(db_gpa.allocator());
+    defer db.close() catch unreachable;
+    load_scan_fixture(fixture_items, db);
+
+    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(result_gpa.deinit() == .ok);
+
+    var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
+    const counting_allocator = counting_state.allocator();
+
+    var timer = try std.time.Timer.start();
+    var result = try official.scan_prefix_materialized_iterator(
+        db,
+        counting_allocator,
+        "scan:",
+    );
+    const elapsed_ns = timer.read();
+
+    const emitted_entries = result.entries.items.len;
+    std.debug.assert(emitted_entries == fixture_items);
+    result.deinit();
+
+    std.debug.assert(counting_state.allocated_bytes == counting_state.freed_bytes);
+
+    return .{
+        .emitted_entries = emitted_entries,
+        .page_calls = 1,
+        .cursor_handoffs = 0,
+        .initial_fetch_calls = 0,
+        .refill_fetch_calls = 0,
+        .art_fetches = 0,
+        .visibility_skips = 0,
+        .empty_fetches = 0,
+        .buffered_entries_loaded = 0,
+        .initial_fetch_elapsed_ns = 0,
+        .refill_fetch_elapsed_ns = 0,
+        .heap_push_elapsed_ns = 0,
+        .heap_pop_elapsed_ns = 0,
+        .winner_select_elapsed_ns = 0,
+        .clone_elapsed_ns = 0,
+        .result_append_elapsed_ns = 0,
         .allocations = counting_state.allocations,
         .deallocations = counting_state.deallocations,
         .allocated_bytes = counting_state.allocated_bytes,

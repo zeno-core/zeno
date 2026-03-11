@@ -1612,6 +1612,106 @@ fn materialize_prefix_from_shard_bulk_visit_profiled(
     };
 }
 
+fn next_visible_from_iterator(
+    it: *art.Iterator,
+    shard: *const runtime_shard.Shard,
+    now: i64,
+) error_mod.EngineError!?art.ScanEntry {
+    while (true) {
+        const entry = (try it.next()) orelse return null;
+        if (!expiration.key_is_visible_unlocked(shard, entry.key, now)) continue;
+        return entry;
+    }
+}
+
+const PrefixShardIteratorMergeState = struct {
+    heap: FixedBorrowedShardHeap,
+    iterators: [runtime_shard.NUM_SHARDS]art.Iterator,
+    now: i64,
+    state: *const runtime_state.DatabaseState,
+
+    fn init(
+        allocator: std.mem.Allocator,
+        state: *const runtime_state.DatabaseState,
+        prefix: []const u8,
+        now: i64,
+    ) error_mod.EngineError!@This() {
+        var self = @This(){
+            .heap = .{},
+            .iterators = undefined,
+            .now = now,
+            .state = state,
+        };
+        errdefer self.deinit(allocator);
+
+        for (&state.shards) |*shard| {
+            @constCast(shard).lock.lockShared();
+        }
+
+        for (&state.shards, 0..) |*shard, shard_idx| {
+            self.iterators[shard_idx] = try art.Iterator.init(allocator, &shard.tree, prefix, null);
+            if (try next_visible_from_iterator(&self.iterators[shard_idx], shard, now)) |entry| {
+                self.heap.add(.{ .shard_idx = @intCast(shard_idx), .entry = entry });
+            }
+        }
+
+        return self;
+    }
+
+    fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        for (&self.iterators) |*it| {
+            it.deinit();
+        }
+        for (&self.state.shards) |*shard| {
+            @constCast(shard).lock.unlockShared();
+        }
+        self.* = undefined;
+    }
+
+    fn next_owned_entry(
+        self: *@This(),
+        allocator: std.mem.Allocator,
+    ) error_mod.EngineError!?types.ScanEntry {
+        const head = self.heap.remove_min() orelse return null;
+        const owned_entry = try clone_entry(allocator, head.entry.key, head.entry.value);
+
+        const shard_idx = head.shard_idx;
+        if (try next_visible_from_iterator(&self.iterators[shard_idx], &self.state.shards[shard_idx], self.now)) |next_entry| {
+            self.heap.add(.{ .shard_idx = shard_idx, .entry = next_entry });
+        }
+
+        return owned_entry;
+    }
+};
+
+fn materialize_prefix_from_shard_iterator(
+    state: *const runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+    now: i64,
+) error_mod.EngineError!types.ScanResult {
+    var result = types.ScanResult{
+        .entries = std.ArrayList(types.ScanEntry).empty,
+        .allocator = allocator,
+    };
+    errdefer result.deinit();
+
+    var merge_state = try PrefixShardIteratorMergeState.init(
+        allocator,
+        state,
+        prefix,
+        now,
+    );
+    defer merge_state.deinit(allocator);
+
+    while (try merge_state.next_owned_entry(allocator)) |entry| {
+        try result.entries.append(allocator, entry);
+    }
+
+    return result;
+}
+
 const PrefixShardIteratorBulkMergeState = struct {
     heap: FixedBorrowedShardHeap,
     iterators: [runtime_shard.NUM_SHARDS]art.Iterator,
@@ -1647,8 +1747,9 @@ const PrefixShardIteratorBulkMergeState = struct {
             self.iterators[shard_idx] = try art.Iterator.init(allocator, &shard.tree, prefix, null);
 
             var fetch_timer = std.time.Timer.start() catch unreachable;
-            if (try self.next_visible_from_iterator(&self.iterators[shard_idx], shard, now, stats)) |entry| {
+            if (try next_visible_from_iterator(&self.iterators[shard_idx], shard, now)) |entry| {
                 stats.initial_fetch_elapsed_ns += fetch_timer.read();
+                stats.buffered_entries_loaded += 1;
                 var push_timer = std.time.Timer.start() catch unreachable;
                 self.heap.add(.{ .shard_idx = @intCast(shard_idx), .entry = entry });
                 stats.heap_push_elapsed_ns += push_timer.read();
@@ -1673,25 +1774,6 @@ const PrefixShardIteratorBulkMergeState = struct {
         self.* = undefined;
     }
 
-    fn next_visible_from_iterator(
-        self: *@This(),
-        it: *art.Iterator,
-        shard: *const runtime_shard.Shard,
-        now: i64,
-        stats: *MergePageProfileStats,
-    ) error_mod.EngineError!?art.ScanEntry {
-        _ = self;
-        while (true) {
-            const entry = (try it.next()) orelse return null;
-            if (!expiration.key_is_visible_unlocked(shard, entry.key, now)) {
-                stats.visibility_skips += 1;
-                continue;
-            }
-            stats.buffered_entries_loaded += 1;
-            return entry;
-        }
-    }
-
     fn next_owned_entry(
         self: *@This(),
         allocator: std.mem.Allocator,
@@ -1705,10 +1787,11 @@ const PrefixShardIteratorBulkMergeState = struct {
 
         const shard_idx = head.shard_idx;
         var fetch_timer = std.time.Timer.start() catch unreachable;
-        if (try self.next_visible_from_iterator(&self.iterators[shard_idx], &self.state.shards[shard_idx], self.now, stats)) |next_entry| {
+        if (try next_visible_from_iterator(&self.iterators[shard_idx], &self.state.shards[shard_idx], self.now)) |next_entry| {
             stats.refill_fetch_elapsed_ns += fetch_timer.read();
             stats.refill_fetch_calls += 1;
-            
+            stats.buffered_entries_loaded += 1;
+
             var push_timer = std.time.Timer.start() catch unreachable;
             self.heap.add(.{ .shard_idx = shard_idx, .entry = next_entry });
             stats.heap_push_elapsed_ns += push_timer.read();
@@ -2011,6 +2094,29 @@ pub fn scan_prefix_materialized_bulk_visit_profiled(
     state.record_operation(.scan, 1);
 
     return materialize_prefix_from_shard_bulk_visit_profiled(state, allocator, prefix, now);
+}
+
+/// Materializes one full prefix scan over the current visible state by continuously advancing a stateful O(1) Iterator per shard without internal profiling timers.
+///
+/// Time Complexity: O(s * k + n log s), where `s` is shard count, `k` is ART traversal state initialization cost per shard, `n` is total matched entries, and `log s` is the heap merge depth.
+///
+/// Allocator: Allocates iterator spill storage and caller-owned result entries through `allocator`.
+///
+/// Ownership: Returns a caller-owned `ScanResult`. The caller must later call `deinit`.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate and locks all shards in shared mode for the duration of the scan to keep iterator pointers valid.
+pub fn scan_prefix_materialized_iterator(
+    state: *const runtime_state.DatabaseState,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) error_mod.EngineError!types.ScanResult {
+    const visibility_gate = @constCast(&state.visibility_gate);
+    visibility_gate.lock_shared();
+    defer visibility_gate.unlock_shared();
+    const now = runtime_shard.unix_now();
+    state.record_operation(.scan, 1);
+
+    return materialize_prefix_from_shard_iterator(state, allocator, prefix, now);
 }
 
 /// Materializes one full prefix scan over the current visible state by continuously advancing a stateful O(1) Iterator per shard, fetching entries without intermediate shard buffers.

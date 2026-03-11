@@ -154,6 +154,23 @@ pub fn scan_prefix_materialized_bulk_visit_profiled(
     return engine_db.scan_prefix_materialized_bulk_visit_profiled(db, allocator, prefix);
 }
 
+/// Materializes one full prefix scan over the current visible state using the production-shaped iterator merge candidate without internal profiling timers.
+///
+/// Time Complexity: O(s * k + n log s), where `s` is shard count, `k` is ART traversal state initialization cost per shard, `n` is total matched entries, and `log s` is the heap merge depth.
+///
+/// Allocator: Allocates iterator spill storage and caller-owned result entries through `allocator`.
+///
+/// Ownership: Returns a caller-owned `ScanResult`. The caller must later call `deinit`.
+///
+/// Thread Safety: Acquires the shared side of the global visibility gate and locks all shards in shared mode for the duration of the scan to keep iterator pointers valid.
+pub fn scan_prefix_materialized_iterator(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) Error!types.ScanResult {
+    return engine_db.scan_prefix_materialized_iterator(db, allocator, prefix);
+}
+
 pub fn scan_prefix_materialized_iterator_profiled(
     db: *const Database,
     allocator: std.mem.Allocator,

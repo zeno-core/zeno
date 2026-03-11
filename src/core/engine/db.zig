@@ -327,6 +327,19 @@ pub fn scan_prefix_materialized_bulk_visit_profiled(
     return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_bulk_visit_profiled, .{ &db.state, allocator, prefix });
 }
 
+/// Materializes one full prefix scan over the current visible state using the production-shaped iterator merge candidate.
+///
+/// Time Complexity: O(s * k + n log s), where `s` is shard count, `k` is ART traversal state initialization cost per shard, and `n` is emitted result size.
+///
+/// Allocator: Allocates iterator spill storage and caller-owned result entries through `allocator`.
+pub fn scan_prefix_materialized_iterator(
+    db: *const Database,
+    allocator: std.mem.Allocator,
+    prefix: []const u8,
+) EngineError!types.ScanResult {
+    return metrics.call_with_latency(&db.state, scan_ops.scan_prefix_materialized_iterator, .{ &db.state, allocator, prefix });
+}
+
 pub fn scan_prefix_materialized_iterator_profiled(
     db: *const Database,
     allocator: std.mem.Allocator,
@@ -2146,6 +2159,39 @@ test "scan_prefix_materialized_bulk_visit_profiled matches full scan ordering" {
     try testing.expectEqual(expected.entries.items.len, profiled.stats.buffered_entries_loaded);
 
     for (expected.entries.items, profiled.result.entries.items) |expected_entry, actual_entry| {
+        try testing.expectEqualStrings(expected_entry.key, actual_entry.key);
+        try testing.expectEqual(expected_entry.value.integer, actual_entry.value.integer);
+    }
+}
+
+test "scan_prefix_materialized_iterator matches full scan ordering" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const values = [_]types.Value{
+        .{ .integer = 1 },
+        .{ .integer = 2 },
+        .{ .integer = 3 },
+        .{ .integer = 4 },
+        .{ .integer = 5 },
+    };
+    const keys = [_][]const u8{ "alpha", "alphabet", "alphanumeric", "beta", "gamma" };
+
+    for (keys, values) |key, value| {
+        try db.put(key, &value);
+    }
+
+    var expected = try db.scan_prefix(testing.allocator, "alpha");
+    defer expected.deinit();
+
+    var iterated = try scan_prefix_materialized_iterator(db, testing.allocator, "alpha");
+    defer iterated.deinit();
+
+    try testing.expectEqual(expected.entries.items.len, iterated.entries.items.len);
+
+    for (expected.entries.items, iterated.entries.items) |expected_entry, actual_entry| {
         try testing.expectEqualStrings(expected_entry.key, actual_entry.key);
         try testing.expectEqual(expected_entry.value.integer, actual_entry.value.integer);
     }

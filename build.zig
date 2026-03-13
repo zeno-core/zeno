@@ -4,14 +4,14 @@ pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
 
-    const core_module = b.addModule("zeno_core", .{
-        .root_source_file = b.path("src/zeno-core.zig"),
+    const zeno_module = b.addModule("zeno", .{
+        .root_source_file = b.path("src/zeno.zig"),
         .target = target,
     });
 
     const module_tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/zeno-core.zig"),
+            .root_source_file = b.path("src/zeno.zig"),
             .target = target,
             .optimize = optimize,
         }),
@@ -33,7 +33,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    bench_exe.root_module.addImport("zeno_core", core_module);
+    bench_exe.root_module.addImport("zeno", zeno_module);
     bench_exe.root_module.addImport("zbench", zbench_dep.module("zbench"));
 
     const run_bench = b.addRunArtifact(bench_exe);

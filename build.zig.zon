@@ -1,5 +1,5 @@
 .{
-    .name = .zeno_core,
+    .name = .zeno,
     .version = "0.15.2",
     .dependencies = .{
         .zbench = .{
@@ -7,6 +7,11 @@
             .hash = "zbench-0.11.1-YTdc7zkmAQBWI99esNFueJc9GuzK-KaU6Nfr1ZXhNGmc",
         },
     },
-    .paths = .{""},
-    .fingerprint = 0xc92e7b444c567888,
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "README.md",
+    },
+    .fingerprint = 0x4da9accf852496b0,
 }

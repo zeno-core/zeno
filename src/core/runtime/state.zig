@@ -6,6 +6,7 @@ const std = @import("std");
 const runtime_shard = @import("shard.zig");
 const runtime_visibility = @import("visibility.zig");
 const storage_wal = @import("../storage/wal.zig");
+const art_node = @import("../index/art/node.zig");
 const types = @import("../types.zig");
 
 /// Number of shards in the runtime execution state.
@@ -81,7 +82,6 @@ pub const OperationKind = enum {
 /// Full database runtime state, including shards, visibility coordination, and local counters.
 pub const DatabaseState = struct {
     base_allocator: std.mem.Allocator,
-    visibility_gate: runtime_visibility.VisibilityGate,
     wal: ?storage_wal.Wal = null,
     snapshot_path: ?[]const u8 = null,
     shards: [NUM_SHARDS]runtime_shard.Shard,
@@ -115,7 +115,6 @@ pub const DatabaseState = struct {
     ) DatabaseState {
         var state = DatabaseState{
             .base_allocator = base_allocator,
-            .visibility_gate = .{},
             .wal = null,
             .snapshot_path = snapshot_path,
             .shards = undefined,
@@ -269,8 +268,55 @@ pub const DatabaseState = struct {
     /// Allocator: Does not allocate.
     ///
     /// Thread Safety: Uses atomic increments only; safe to call from the single-threaded open path before publication.
+    /// Increments the counter tracking snapshot-corruption fallbacks to full WAL replay.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    ///
+    /// Thread Safety: Uses atomic increments only; safe to call from the single-threaded open path before publication.
     pub fn record_snapshot_corruption_fallback(self: *const DatabaseState) void {
         _ = @constCast(&self.counters.snapshot_corruption_fallback_total).fetchAdd(1, .monotonic);
+    }
+
+    /// Acquires the shared side of all shard-local visibility gates.
+    ///
+    /// Time Complexity: O(s), where `s` is the shard count.
+    pub fn lock_all_shards_shared(self: *const DatabaseState) void {
+        var i: usize = 0;
+        while (i < NUM_SHARDS) : (i += 1) {
+            @constCast(&self.shards[i].visibility_gate).lock_shared();
+        }
+    }
+
+    /// Releases the shared side of all shard-local visibility gates.
+    ///
+    /// Time Complexity: O(s), where `s` is the shard count.
+    pub fn unlock_all_shards_shared(self: *const DatabaseState) void {
+        var i: usize = 0;
+        while (i < NUM_SHARDS) : (i += 1) {
+            @constCast(&self.shards[i].visibility_gate).unlock_shared();
+        }
+    }
+
+    /// Acquires the exclusive side of all shard-local visibility gates.
+    ///
+    /// Time Complexity: O(s), where `s` is the shard count.
+    pub fn lock_all_shards_exclusive(self: *const DatabaseState) void {
+        var i: usize = 0;
+        while (i < NUM_SHARDS) : (i += 1) {
+            @constCast(&self.shards[i].visibility_gate).lock_exclusive();
+        }
+    }
+
+    /// Releases the exclusive side of all shard-local visibility gates.
+    ///
+    /// Time Complexity: O(s), where `s` is the shard count.
+    pub fn unlock_all_shards_exclusive(self: *const DatabaseState) void {
+        var i: usize = 0;
+        while (i < NUM_SHARDS) : (i += 1) {
+            @constCast(&self.shards[i].visibility_gate).unlock_exclusive();
+        }
     }
 };
 

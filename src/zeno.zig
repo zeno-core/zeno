@@ -22,6 +22,8 @@ const builtin = @import("builtin");
 pub const testing_internal = if (config.expose_internals or builtin.is_test) struct {
     pub const art = @import("core/index/art/tree.zig");
     pub const wal = @import("core/storage/wal.zig");
+    pub const runtime_state = @import("core/runtime/state.zig");
+    pub const runtime_shard = @import("core/runtime/shard.zig");
 } else struct {};
 
 test "package root includes internal art module tests without exporting them" {

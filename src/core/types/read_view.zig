@@ -10,7 +10,6 @@ const ReadViewCounter = std.atomic.Value(usize);
 /// Registry payload for one active read-view token.
 const ReadViewToken = struct {
     runtime_state: *const anyopaque,
-    visibility_gate: *runtime_visibility.VisibilityGate,
     active_read_views: *ReadViewCounter,
     opened_at_unix_seconds: i64,
 };
@@ -30,7 +29,6 @@ var read_view_tokens = std.AutoHashMapUnmanaged(u64, ReadViewToken){};
 /// Thread Safety: Serializes registry mutation through `read_view_tokens_mutex`.
 fn register_read_view_token(
     runtime_state: *const anyopaque,
-    visibility_gate: *runtime_visibility.VisibilityGate,
     active_read_views: *ReadViewCounter,
     opened_at_unix_seconds: i64,
 ) std.mem.Allocator.Error!u64 {
@@ -39,7 +37,6 @@ fn register_read_view_token(
     defer read_view_tokens_mutex.unlock();
     try read_view_tokens.put(std.heap.page_allocator, token_id, .{
         .runtime_state = runtime_state,
-        .visibility_gate = visibility_gate,
         .active_read_views = active_read_views,
         .opened_at_unix_seconds = opened_at_unix_seconds,
     });
@@ -90,11 +87,10 @@ pub const ReadView = struct {
     /// Ownership: The returned handle borrows `runtime_state` and owns one registry token tracked until `deinit`.
     pub fn init(
         runtime_state: *const anyopaque,
-        visibility_gate: *runtime_visibility.VisibilityGate,
         active_read_views: *ReadViewCounter,
         opened_at_unix_seconds: i64,
     ) std.mem.Allocator.Error!ReadView {
-        const token_id = try register_read_view_token(runtime_state, visibility_gate, active_read_views, opened_at_unix_seconds);
+        const token_id = try register_read_view_token(runtime_state, active_read_views, opened_at_unix_seconds);
         _ = active_read_views.fetchAdd(1, .monotonic);
         return .{
             .token_id = token_id,
@@ -127,7 +123,8 @@ pub const ReadView = struct {
             self.token_id = 0;
             return;
         };
-        token.visibility_gate.unlock_shared();
+        const state: *const @import("../runtime/state.zig").DatabaseState = @ptrCast(@alignCast(token.runtime_state));
+        state.unlock_all_shards_shared();
         _ = token.active_read_views.fetchSub(1, .monotonic);
         self.token_id = 0;
     }

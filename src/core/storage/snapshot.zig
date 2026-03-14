@@ -348,7 +348,7 @@ fn write_snapshot_file(
     var total_records: usize = 0;
 
     for (&state.shards, 0..) |*shard, shard_idx| {
-        total_records += try write_one_shard_snapshot(state, allocator, &writer, &value_buf, shard, shard_idx, version);
+        total_records += try write_one_shard_snapshot(allocator, &writer, &value_buf, shard, shard_idx, version);
     }
 
     var crc_buf: [4]u8 = undefined;
@@ -371,7 +371,6 @@ fn write_snapshot_file(
 ///
 /// Thread Safety: Acquires the shared visibility gate plus this shard's shared lock for the duration of the shard-serialization window, which blocks writers globally during that window.
 fn write_one_shard_snapshot(
-    state: *runtime_state.DatabaseState,
     allocator: std.mem.Allocator,
     writer: *CrcFileWriter,
     value_buf: *std.ArrayList(u8),
@@ -379,8 +378,8 @@ fn write_one_shard_snapshot(
     shard_idx: usize,
     version: u32,
 ) !usize {
-    state.visibility_gate.lock_shared();
-    defer state.visibility_gate.unlock_shared();
+    shard.visibility_gate.lock_shared();
+    defer shard.visibility_gate.unlock_shared();
     const live_shard = @constCast(shard);
     live_shard.lock.lockShared();
     defer live_shard.lock.unlockShared();

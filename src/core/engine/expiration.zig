@@ -50,11 +50,11 @@ pub fn expire_at(
         error.EmptyKey, error.KeyTooLarge => return error.KeyTooLarge,
     };
 
-    state.visibility_gate.lock_exclusive();
-    defer state.visibility_gate.unlock_exclusive();
-
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
+
+    shard.visibility_gate.lock_exclusive();
+    defer shard.visibility_gate.unlock_exclusive();
 
     shard.lock.lock();
     defer shard.lock.unlock();
@@ -106,11 +106,11 @@ fn try_cleanup_if_possible(
     cleanup: TtlCleanup,
 ) void {
     if (cleanup == .none) return;
-    if (!state.visibility_gate.try_lock_exclusive()) return;
-    defer state.visibility_gate.unlock_exclusive();
-
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
+
+    if (!shard.visibility_gate.try_lock_exclusive()) return;
+    defer shard.visibility_gate.unlock_exclusive();
 
     shard.lock.lock();
     defer shard.lock.unlock();
@@ -150,13 +150,13 @@ pub fn ttl(state: *runtime_state.DatabaseState, key: []const u8) error_mod.Engin
 
     var cleanup: TtlCleanup = .none;
     const result = blk: {
-        const visibility_gate = &state.visibility_gate;
-        visibility_gate.lock_shared();
-        defer visibility_gate.unlock_shared();
-
-        const now = runtime_shard.unix_now();
         const shard_idx = runtime_shard.get_shard_index(key);
         const shard = &state.shards[shard_idx];
+
+        shard.visibility_gate.lock_shared();
+        defer shard.visibility_gate.unlock_shared();
+
+        const now = runtime_shard.unix_now();
 
         shard.lock.lockShared();
         defer shard.lock.unlockShared();

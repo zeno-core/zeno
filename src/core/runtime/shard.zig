@@ -5,6 +5,7 @@
 const std = @import("std");
 const art = @import("../index/art/tree.zig");
 const art_node = @import("../index/art/node.zig");
+const runtime_visibility = @import("visibility.zig");
 
 /// Number of shards in the runtime execution state.
 pub const NUM_SHARDS: usize = 64;
@@ -59,7 +60,8 @@ pub const CommittedArena = struct {
 
 /// One shard of runtime state owned by the engine.
 pub const Shard = struct {
-    lock: std.Thread.RwLock = .{},
+    lock: std.Thread.RwLock align(64) = .{},
+    visibility_gate: runtime_visibility.VisibilityGate align(64) = .{},
     base_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     committed_arenas_head: ?*CommittedArena = null,

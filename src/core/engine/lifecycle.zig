@@ -139,15 +139,17 @@ pub fn checkpoint(db: *Database) EngineError!void {
     const snapshot_path = db.state.snapshot_path orelse return error.NoSnapshotPath;
 
     notify_checkpoint_barrier_attempt_for_test();
-    db.state.visibility_gate.lock_exclusive();
+    db.state.lock_all_shards_exclusive();
     notify_checkpoint_barrier_acquired_for_test();
+
     for (&db.state.shards) |*shard| shard.lock.lock();
     const checkpoint_lsn: u64 = if (db.state.wal) |wal|
         if (wal.next_lsn > 0) wal.next_lsn - 1 else 0
     else
         0;
     for (&db.state.shards) |*shard| shard.lock.unlock();
-    db.state.visibility_gate.unlock_exclusive();
+
+    db.state.unlock_all_shards_exclusive();
 
     _ = storage_snapshot.write(&db.state, db.allocator, snapshot_path, checkpoint_lsn) catch |err| {
         return error_mod.map_persistence_error(err);

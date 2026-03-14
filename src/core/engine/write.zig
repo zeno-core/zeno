@@ -22,15 +22,15 @@ pub const MAX_KEY_LEN: usize = 4_096;
 ///
 /// Ownership: Clones `value` into shard-owned storage before the call returns.
 ///
-/// Thread Safety: Acquires the exclusive side of the global visibility gate, then the selected shard's exclusive lock, and may append to the shared WAL before publishing the in-memory mutation.
+/// Thread Safety: Safe for concurrent use with other point operations; acquires the shared side of the global visibility gate before taking one shard-exclusive lock.
 pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const types.Value) error_mod.EngineError!void {
     if (key.len == 0 or key.len > MAX_KEY_LEN) return error.KeyTooLarge;
 
-    state.visibility_gate.lock_exclusive();
-    defer state.visibility_gate.unlock_exclusive();
-
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
+
+    shard.visibility_gate.lock_shared();
+    defer shard.visibility_gate.unlock_shared();
 
     shard.lock.lock();
     defer shard.lock.unlock();
@@ -49,15 +49,15 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
 ///
 /// Ownership: Releases shard-owned key and value storage only after the WAL append succeeds when the key exists and is still TTL-visible.
 ///
-/// Thread Safety: Acquires the exclusive side of the global visibility gate, then the selected shard's exclusive lock, and appends the DELETE record inside that same visibility window before publishing the removal.
+/// Thread Safety: Safe for concurrent use with other point operations; acquires the shared side of the global visibility gate before taking one shard-exclusive lock and appends the live DELETE record inside that same visibility window.
 pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.EngineError!bool {
     if (key.len == 0 or key.len > MAX_KEY_LEN) return error.KeyTooLarge;
 
-    state.visibility_gate.lock_exclusive();
-    defer state.visibility_gate.unlock_exclusive();
-
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = &state.shards[shard_idx];
+
+    shard.visibility_gate.lock_shared();
+    defer shard.visibility_gate.unlock_shared();
 
     shard.lock.lock();
     defer shard.lock.unlock();

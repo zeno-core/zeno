@@ -484,9 +484,9 @@ pub fn scan_prefix(
     allocator: std.mem.Allocator,
     prefix: []const u8,
 ) error_mod.EngineError!types.ScanResult {
-    const visibility_gate = @constCast(&state.visibility_gate);
-    visibility_gate.lock_shared();
-    defer visibility_gate.unlock_shared();
+    state.lock_all_shards_shared();
+    
+    defer state.unlock_all_shards_shared();
     const now = runtime_shard.unix_now();
     state.record_operation(.scan, 1);
 
@@ -507,9 +507,9 @@ pub fn scan_range(
     allocator: std.mem.Allocator,
     range: types.KeyRange,
 ) error_mod.EngineError!types.ScanResult {
-    const visibility_gate = @constCast(&state.visibility_gate);
-    visibility_gate.lock_shared();
-    defer visibility_gate.unlock_shared();
+    state.lock_all_shards_shared();
+    
+    defer state.unlock_all_shards_shared();
     const now = runtime_shard.unix_now();
     state.record_operation(.scan, 1);
 

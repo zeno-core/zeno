@@ -325,6 +325,7 @@ pub fn main() !void {
     } else {
         try run_bench_suite(allocator, &stdout.interface, cli_config.metrics_config);
         try print_throughput_summary(allocator, &stdout.interface, cli_config.metrics_config);
+        try run_scaling_benchmarks(allocator, &stdout.interface);
     }
 
     try stdout.interface.flush();
@@ -456,6 +457,106 @@ fn run_and_print_throughput(
             latency_text,
             @as(f64, @floatFromInt(ops_per_sec)) / 1_000_000.0,
         });
+    }
+}
+
+const ScalingBenchmarkType = enum { get, put };
+
+const ScalingWorkerContext = struct {
+    db: *engine.Database,
+    op: ScalingBenchmarkType,
+    thread_id: usize,
+    iterations: usize,
+};
+
+fn scaling_worker(ctx: ScalingWorkerContext) void {
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer _ = gpa.deinit();
+    const allocator = gpa.allocator();
+
+    var key_buf: [32]u8 = undefined;
+    const key = std.fmt.bufPrint(&key_buf, "worker:{d}:key", .{ctx.thread_id}) catch unreachable;
+    const value = types.Value{ .integer = 123 };
+
+    const shard_idx = internal.runtime_shard.get_shard_index(key);
+    const shard = &ctx.db.state.shards[shard_idx];
+
+    if (ctx.op == .put) {
+        for (0..ctx.iterations) |i| {
+            // Periodically reset shard to prevent arena bloat from overwrites
+            // In a real DB we'd have compaction, here we just want to measure throughput
+            if (i % 1000 == 0) {
+                shard.lock.lock();
+                shard.reset_unlocked();
+                shard.lock.unlock();
+                // Re-prime key after reset
+                ctx.db.put(key, &value) catch unreachable;
+            }
+            ctx.db.put(key, &value) catch unreachable;
+        }
+    } else {
+        for (0..ctx.iterations) |_| {
+            var stored = (ctx.db.get(allocator, key) catch unreachable).?;
+            defer stored.deinit(allocator);
+            std.mem.doNotOptimizeAway(stored.integer);
+        }
+    }
+}
+
+fn run_scaling_benchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
+    try writer.print("\nSharded Scalability Benchmark\n", .{});
+    try writer.print("--------------------------------------------------------------------------------\n", .{});
+    try writer.print("{s: <15} | {s: <10} | {s: <15} | {s: <10}\n", .{ "Workload", "Threads", "Throughput", "Scaling" });
+    try writer.print("--------------------------------------------------------------------------------\n", .{});
+
+    const thread_counts = [_]usize{ 1, 2, 4, 8, 16 };
+    const ops_per_test = 1_000_000;
+
+    for ([_]ScalingBenchmarkType{ .get, .put }) |op| {
+        var base_throughput: f64 = 0;
+        for (thread_counts) |t_count| {
+            const db = try open_bench_db(std.heap.page_allocator);
+            defer db.close() catch unreachable;
+
+            // Pre-prime keys
+            for (0..t_count) |i| {
+                var key_buf: [32]u8 = undefined;
+                const key = try std.fmt.bufPrint(&key_buf, "worker:{d}:key", .{i});
+                const value = types.Value{ .integer = @intCast(i) };
+                try db.put(key, &value);
+            }
+
+            const iters_per_thread = ops_per_test / t_count;
+            var threads = try allocator.alloc(std.Thread, t_count);
+            defer allocator.free(threads);
+
+            var timer = try std.time.Timer.start();
+            for (0..t_count) |i| {
+                threads[i] = try std.Thread.spawn(.{}, scaling_worker, .{ScalingWorkerContext{
+                    .db = db,
+                    .op = op,
+                    .thread_id = i,
+                    .iterations = iters_per_thread,
+                }});
+            }
+
+            for (threads) |thread| thread.join();
+            const elapsed = timer.read();
+
+            const throughput = @as(f64, @floatFromInt(ops_per_test)) / (@as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(std.time.ns_per_s)));
+            if (t_count == 1) base_throughput = throughput;
+
+            const scaling = throughput / base_throughput;
+            const op_name = if (op == .get) "GET (Shared)" else "PUT (Sharded)";
+
+            try writer.print("{s: <15} | {d: <10} | {d:.2}M ops/sec | {d:.2}x\n", .{
+                op_name,
+                t_count,
+                throughput / 1_000_000.0,
+                scaling,
+            });
+        }
+        try writer.print("--------------------------------------------------------------------------------\n", .{});
     }
 }
 

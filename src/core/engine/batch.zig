@@ -280,8 +280,8 @@ fn apply_plan(
     plan: *const internal_batch_plan.BatchPlan,
     guards: []const types.CheckedBatchGuard,
 ) error_mod.EngineError!void {
-    state.visibility_gate.lock_exclusive();
-    defer state.visibility_gate.unlock_exclusive();
+    state.lock_all_shards_exclusive();
+    defer state.unlock_all_shards_exclusive();
     maybe_pause_after_visibility_gate();
 
     const now = runtime_shard.unix_now();

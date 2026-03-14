@@ -378,9 +378,9 @@ fn write_one_shard_snapshot(
     shard_idx: usize,
     version: u32,
 ) !usize {
-    shard.visibility_gate.lock_shared();
-    defer shard.visibility_gate.unlock_shared();
     const live_shard = @constCast(shard);
+    live_shard.visibility_gate.lock_shared();
+    defer live_shard.visibility_gate.unlock_shared();
     live_shard.lock.lockShared();
     defer live_shard.lock.unlockShared();
 

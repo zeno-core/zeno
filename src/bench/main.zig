@@ -465,7 +465,7 @@ const ScalingBenchmarkType = enum { get, put };
 const ScalingWorkerContext = struct {
     db: *engine.Database,
     op: ScalingBenchmarkType,
-    thread_id: usize,
+    key: []const u8,
     iterations: usize,
 };
 
@@ -474,33 +474,55 @@ fn scaling_worker(ctx: ScalingWorkerContext) void {
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
-    var key_buf: [32]u8 = undefined;
-    const key = std.fmt.bufPrint(&key_buf, "worker:{d}:key", .{ctx.thread_id}) catch unreachable;
     const value = types.Value{ .integer = 123 };
 
-    const shard_idx = internal.runtime_shard.get_shard_index(key);
-    const shard = &ctx.db.state.shards[shard_idx];
-
     if (ctx.op == .put) {
-        for (0..ctx.iterations) |i| {
-            // Periodically reset shard to prevent arena bloat from overwrites
-            // In a real DB we'd have compaction, here we just want to measure throughput
-            if (i % 1000 == 0) {
-                shard.lock.lock();
-                shard.reset_unlocked();
-                shard.lock.unlock();
-                // Re-prime key after reset
-                ctx.db.put(key, &value) catch unreachable;
-            }
-            ctx.db.put(key, &value) catch unreachable;
+        for (0..ctx.iterations) |_| {
+            ctx.db.put(ctx.key, &value) catch unreachable;
         }
     } else {
         for (0..ctx.iterations) |_| {
-            var stored = (ctx.db.get(allocator, key) catch unreachable).?;
+            var stored = (ctx.db.get(allocator, ctx.key) catch unreachable).?;
             defer stored.deinit(allocator);
             std.mem.doNotOptimizeAway(stored.integer);
         }
     }
+}
+
+fn allocate_distinct_shard_worker_keys(allocator: std.mem.Allocator, thread_count: usize) ![][]u8 {
+    var keys = try allocator.alloc([]u8, thread_count);
+    var filled: usize = 0;
+    errdefer {
+        for (keys[0..filled]) |key| allocator.free(key);
+        allocator.free(keys);
+    }
+
+    var used_shards = std.StaticBitSet(internal.runtime_shard.NUM_SHARDS).initEmpty();
+    var candidate: usize = 0;
+
+    for (0..thread_count) |worker_idx| {
+        while (true) : (candidate += 1) {
+            const key = try std.fmt.allocPrint(allocator, "worker:{{scale:{d}}}:key", .{candidate});
+            const shard_idx = internal.runtime_shard.get_shard_index(key);
+            if (used_shards.isSet(shard_idx)) {
+                allocator.free(key);
+                continue;
+            }
+
+            used_shards.set(shard_idx);
+            keys[worker_idx] = key;
+            filled += 1;
+            candidate += 1;
+            break;
+        }
+    }
+
+    return keys;
+}
+
+fn free_worker_keys(allocator: std.mem.Allocator, keys: [][]u8) void {
+    for (keys) |key| allocator.free(key);
+    allocator.free(keys);
 }
 
 fn run_scaling_benchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
@@ -518,12 +540,13 @@ fn run_scaling_benchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
             const db = try open_bench_db(std.heap.page_allocator);
             defer db.close() catch unreachable;
 
+            const worker_keys = try allocate_distinct_shard_worker_keys(allocator, t_count);
+            defer free_worker_keys(allocator, worker_keys);
+
             // Pre-prime keys
             for (0..t_count) |i| {
-                var key_buf: [32]u8 = undefined;
-                const key = try std.fmt.bufPrint(&key_buf, "worker:{d}:key", .{i});
                 const value = types.Value{ .integer = @intCast(i) };
-                try db.put(key, &value);
+                try db.put(worker_keys[i], &value);
             }
 
             const iters_per_thread = ops_per_test / t_count;
@@ -535,7 +558,7 @@ fn run_scaling_benchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
                 threads[i] = try std.Thread.spawn(.{}, scaling_worker, .{ScalingWorkerContext{
                     .db = db,
                     .op = op,
-                    .thread_id = i,
+                    .key = worker_keys[i],
                     .iterations = iters_per_thread,
                 }});
             }

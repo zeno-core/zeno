@@ -22,15 +22,22 @@ Zeno is a high-performance, embedded key-value storage engine written in pure Zi
 
 ## 📊 Performance Benchmarks
 
-Zeno is built for speed. Below are baseline numbers from the latest benchmarks (ReleaseFast):
+Zeno is built for speed. Below are numbers from the latest run with `zig build bench -Doptimize=ReleaseFast`:
 
 | Operation | Throughput | Latency (Mean) |
 | :--- | :--- | :--- |
-| **DB Sharded PUT** | **~20.6M ops/sec** | **48 ns** |
-| **DB Sharded GET** | **~16.3M ops/sec** | **61 ns** |
-| **ART Lookup (Hit)** | ~106.8M ops/sec | 9 ns |
-| **ART Insert (Sequential)**| ~79.8M ops/sec | 12 ns |
-| **WAL Append (Async)** | ~70K ops/sec | 13.6 µs |
+| **DB PUT (steady)** | **21.45M ops/sec** | **46 ns** |
+| **DB GET (steady)** | **15.35M ops/sec** | **65 ns** |
+| **ART Lookup (Hit)** | 94.00M ops/sec | 10 ns |
+| **ART Insert (Sequential)**| 83.97M ops/sec | 11 ns |
+| **WAL Append (Async)** | 0.06M ops/sec (~60K) | 16.51 µs |
+
+Sharded scalability (latest run):
+
+| Workload | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads |
+| :--- | :--- | :--- | :--- | :--- | :--- |
+| **GET (Shared)** | 14.42M | 27.32M | 52.70M | 100.50M | 142.57M ops/sec |
+| **PUT (Sharded)** | 23.47M | 42.24M | 86.41M | 140.05M | 148.16M ops/sec |
 
 *Benchmarks conducted on Ubuntu 24.04.4, AMD Ryzen 7 5700X, 32GB DDR4 @ 3200MHz
 

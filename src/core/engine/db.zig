@@ -214,7 +214,6 @@ pub fn scan_prefix_from_in_view(
     return metrics.call_with_optional_latency(state, scan_ops.scan_prefix_from_in_view, .{ view, allocator, prefix, cursor, limit });
 }
 
-
 /// Scans the next range page inside a consistent read view.
 ///
 /// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.
@@ -292,6 +291,24 @@ fn total_committed_arenas_for_test(db: *Database) usize {
         shard.lock.unlockShared();
     }
     return total;
+}
+
+fn try_lock_all_shard_visibility_gates_exclusive_for_test(db: *Database) bool {
+    var locked: usize = 0;
+    while (locked < db.state.shards.len) : (locked += 1) {
+        if (!db.state.shards[locked].visibility_gate.try_lock_exclusive()) {
+            var release_idx: usize = 0;
+            while (release_idx < locked) : (release_idx += 1) {
+                db.state.shards[release_idx].visibility_gate.unlock_exclusive();
+            }
+            return false;
+        }
+    }
+    return true;
+}
+
+fn unlock_all_shard_visibility_gates_exclusive_for_test(db: *Database) void {
+    for (&db.state.shards) |*shard| shard.visibility_gate.unlock_exclusive();
 }
 
 fn expire_at_boundary(db: *Database, key: []const u8, unix_seconds: ?i64) EngineError!bool {
@@ -1224,11 +1241,11 @@ test "read view holds the visibility gate until released" {
     var view = try db.read_view();
     defer if (view.token_id != 0) view.deinit();
 
-    try testing.expect(!db.state.visibility_gate.try_lock_exclusive());
+    try testing.expect(!try_lock_all_shard_visibility_gates_exclusive_for_test(db));
 
     view.deinit();
-    try testing.expect(db.state.visibility_gate.try_lock_exclusive());
-    db.state.visibility_gate.unlock_exclusive();
+    try testing.expect(try_lock_all_shard_visibility_gates_exclusive_for_test(db));
+    unlock_all_shard_visibility_gates_exclusive_for_test(db);
 }
 
 test "read view copies release the visibility gate only once" {
@@ -1243,13 +1260,13 @@ test "read view copies release the visibility gate only once" {
     defer view.deinit();
 
     try testing.expectEqual(@as(usize, 1), db.state.active_read_views.load(.monotonic));
-    try testing.expect(!db.state.visibility_gate.try_lock_exclusive());
+    try testing.expect(!try_lock_all_shard_visibility_gates_exclusive_for_test(db));
 
     view.deinit();
 
     try testing.expectEqual(@as(usize, 0), db.state.active_read_views.load(.monotonic));
-    try testing.expect(db.state.visibility_gate.try_lock_exclusive());
-    db.state.visibility_gate.unlock_exclusive();
+    try testing.expect(try_lock_all_shard_visibility_gates_exclusive_for_test(db));
+    unlock_all_shard_visibility_gates_exclusive_for_test(db);
 }
 
 test "in-view scans reject stale read view copies" {

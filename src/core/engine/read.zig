@@ -6,13 +6,14 @@ const std = @import("std");
 const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
 const internal_mutate = @import("../internal/mutate.zig");
+const internal_ttl_index = @import("../internal/ttl_index.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const types = @import("../types.zig");
 
 /// Clones the current plain value for `key` while relying on an already-held visibility window.
 ///
-/// Time Complexity: O(n + k + v), where `n` is `key.len` for shard routing, `k` is ART lookup work, and `v` is the size of the cloned value tree.
+/// Time Complexity: O(k + v), where `k` is ART lookup work and `v` is the size of the cloned value tree.
 ///
 /// Allocator: Allocates the returned cloned value through `allocator` when the key exists.
 ///
@@ -21,20 +22,19 @@ const types = @import("../types.zig");
 /// Thread Safety: Requires a surrounding visibility window and acquires the selected shard's shared lock while reading and cloning the stored value.
 fn clone_plain_value_no_visibility(
     state: *const runtime_state.DatabaseState,
+    shard: *runtime_shard.Shard,
     allocator: std.mem.Allocator,
     key: []const u8,
 ) error_mod.EngineError!?types.Value {
-    const shard_idx = runtime_shard.get_shard_index(key);
-    const shard = @constCast(&state.shards[shard_idx]);
-
     shard.lock.lockShared();
     defer shard.lock.unlockShared();
     state.record_operation(.get, 1);
 
     const stored = shard.tree.lookup(key) orelse return null;
     if (shard.ttl_index.count() != 0) {
+        const stored_expire_at = internal_ttl_index.get_expire_at(shard, key) orelse return try stored.clone(allocator);
         const now = runtime_shard.unix_now();
-        if (!expiration.key_is_visible_unlocked(shard, key, now)) return null;
+        if (expiration.is_expired(stored_expire_at, now)) return null;
     }
     return try stored.clone(allocator);
 }
@@ -80,5 +80,5 @@ pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocat
 
     shard.visibility_gate.lock_shared();
     defer shard.visibility_gate.unlock_shared();
-    return clone_plain_value_no_visibility(state, allocator, key);
+    return clone_plain_value_no_visibility(state, shard, allocator, key);
 }

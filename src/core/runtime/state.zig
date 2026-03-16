@@ -16,6 +16,9 @@ pub const NUM_SHARDS: usize = runtime_shard.NUM_SHARDS;
 pub const StatsCounters = struct {
     ops_put_total: u64,
     overwrites_total: u64,
+    overwritten_heavy_events_total: u64,
+    overwritten_heavy_bytes_total: u64,
+    retained_heavy_bytes_estimate: u64,
     ops_get_total: u64,
     ops_delete_total: u64,
     ops_scan_total: u64,
@@ -49,6 +52,9 @@ pub const StatsCounters = struct {
 pub const RuntimeCounters = struct {
     ops_put_total: std.atomic.Value(u64),
     overwrites_total: std.atomic.Value(u64),
+    overwritten_heavy_events_total: std.atomic.Value(u64),
+    overwritten_heavy_bytes_total: std.atomic.Value(u64),
+    retained_heavy_bytes_estimate: std.atomic.Value(u64),
     ops_get_total: std.atomic.Value(u64),
     ops_delete_total: std.atomic.Value(u64),
     ops_scan_total: std.atomic.Value(u64),
@@ -93,6 +99,7 @@ pub const DatabaseState = struct {
     shards: [NUM_SHARDS]runtime_shard.Shard,
     metrics_config: types.MetricsConfig,
     counters: RuntimeCounters,
+    retained_heavy_bytes_estimate_by_shard: [NUM_SHARDS]std.atomic.Value(u64),
     latency_sample_clock: std.atomic.Value(u64),
     active_read_views: std.atomic.Value(usize),
 
@@ -126,9 +133,13 @@ pub const DatabaseState = struct {
             .shards = undefined,
             .metrics_config = metrics_config,
             .counters = RuntimeCounters.init(),
+            .retained_heavy_bytes_estimate_by_shard = undefined,
             .latency_sample_clock = std.atomic.Value(u64).init(0),
             .active_read_views = std.atomic.Value(usize).init(0),
         };
+        for (&state.retained_heavy_bytes_estimate_by_shard) |*counter_ref| {
+            counter_ref.* = std.atomic.Value(u64).init(0);
+        }
         for (&state.shards) |*shard| {
             shard.* = runtime_shard.Shard.init(base_allocator);
             shard.rebind_tree_allocator();
@@ -192,6 +203,49 @@ pub const DatabaseState = struct {
             .scan => _ = @constCast(&self.counters.ops_scan_total).fetchAdd(count, .monotonic),
             .expire => _ = @constCast(&self.counters.ops_expire_total).fetchAdd(count, .monotonic),
         }
+    }
+
+    /// Records estimated retained-heavy bytes caused by one heavy overwrite on a shard.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    pub fn record_heavy_overwrite_retained_bytes(
+        self: *const DatabaseState,
+        shard_idx: usize,
+        retained_bytes: u64,
+        overwrite_events: u64,
+    ) void {
+        if (retained_bytes == 0 and overwrite_events == 0) return;
+        if (shard_idx >= NUM_SHARDS) return;
+
+        _ = @constCast(&self.counters.overwritten_heavy_events_total).fetchAdd(overwrite_events, .monotonic);
+        _ = @constCast(&self.counters.overwritten_heavy_bytes_total).fetchAdd(retained_bytes, .monotonic);
+        _ = @constCast(&self.counters.retained_heavy_bytes_estimate).fetchAdd(retained_bytes, .monotonic);
+        _ = @constCast(&self.retained_heavy_bytes_estimate_by_shard[shard_idx]).fetchAdd(retained_bytes, .monotonic);
+    }
+
+    /// Clears one shard's retained-heavy estimate after maintenance compaction rebuilds shard storage.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    pub fn clear_retained_heavy_bytes_estimate_for_shard(self: *const DatabaseState, shard_idx: usize) void {
+        if (shard_idx >= NUM_SHARDS) return;
+
+        const shard_estimate = @constCast(&self.retained_heavy_bytes_estimate_by_shard[shard_idx]).swap(0, .monotonic);
+        if (shard_estimate == 0) return;
+        _ = @constCast(&self.counters.retained_heavy_bytes_estimate).fetchSub(shard_estimate, .monotonic);
+    }
+
+    /// Returns one shard's retained-heavy estimate.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    pub fn retained_heavy_bytes_estimate_for_shard(self: *const DatabaseState, shard_idx: usize) u64 {
+        if (shard_idx >= NUM_SHARDS) return 0;
+        return self.retained_heavy_bytes_estimate_by_shard[shard_idx].load(.monotonic);
     }
 
     /// Returns whether the current operation should pay latency instrumentation cost.
@@ -359,6 +413,9 @@ test "database state metrics start at zero" {
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 0), snapshot.ops_put_total);
     try testing.expectEqual(@as(u64, 0), snapshot.overwrites_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwritten_heavy_events_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwritten_heavy_bytes_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.retained_heavy_bytes_estimate);
     try testing.expectEqual(@as(u64, 0), snapshot.ops_get_total);
     try testing.expectEqual(@as(u64, 0), snapshot.ops_delete_total);
     try testing.expectEqual(@as(u64, 0), snapshot.ops_scan_total);
@@ -386,6 +443,9 @@ test "database state metrics disabled mode skips counters and latency" {
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 0), snapshot.ops_put_total);
     try testing.expectEqual(@as(u64, 0), snapshot.overwrites_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwritten_heavy_events_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwritten_heavy_bytes_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.retained_heavy_bytes_estimate);
     try testing.expectEqual(@as(u64, 0), snapshot.latency_samples_total);
 }
 
@@ -405,6 +465,9 @@ test "database state metrics counters only mode updates ops without latency" {
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 2), snapshot.ops_put_total);
     try testing.expectEqual(@as(u64, 3), snapshot.overwrites_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwritten_heavy_events_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwritten_heavy_bytes_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.retained_heavy_bytes_estimate);
     try testing.expectEqual(@as(u64, 1), snapshot.ops_scan_total);
     try testing.expectEqual(@as(u64, 0), snapshot.latency_samples_total);
 }
@@ -448,6 +511,9 @@ test "database state full metrics snapshot reflects latency checkpoint and fallb
     state.record_successful_checkpoint(12 * std.time.ns_per_ms, 33);
     state.record_busy_checkpoint();
     state.record_snapshot_corruption_fallback();
+    state.record_heavy_overwrite_retained_bytes(0, 1_024, 1);
+    state.record_heavy_overwrite_retained_bytes(0, 256, 2);
+    state.clear_retained_heavy_bytes_estimate_for_shard(0);
 
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 0), snapshot.overwrites_total);
@@ -459,6 +525,9 @@ test "database state full metrics snapshot reflects latency checkpoint and fallb
     try testing.expectEqual(@as(u64, 5), snapshot.latency_samples_total);
     try testing.expectEqual(@as(u64, 1), snapshot.checkpoint_count_total);
     try testing.expectEqual(@as(u64, 1), snapshot.checkpoint_busy_total);
+    try testing.expectEqual(@as(u64, 3), snapshot.overwritten_heavy_events_total);
+    try testing.expectEqual(@as(u64, 1_280), snapshot.overwritten_heavy_bytes_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.retained_heavy_bytes_estimate);
     try testing.expectEqual(@as(u64, 12), snapshot.checkpoint_duration_last_ms);
     try testing.expectEqual(@as(u64, 33), snapshot.checkpoint_lsn_last);
     try testing.expectEqual(@as(u64, 1), snapshot.snapshot_corruption_fallback_total);

@@ -27,6 +27,17 @@ pub const EngineError = error_mod.EngineError;
 pub const Database = struct {
     allocator: std.mem.Allocator,
     state: runtime_state.DatabaseState,
+    auto_compaction: AutoCompaction = .{},
+
+    /// Per-database policy state for optional heavy-overwrite auto-compaction.
+    const AutoCompaction = struct {
+        /// Triggers one compaction cycle every N heavy overwrites. `null` disables auto mode.
+        every: ?u32 = null,
+        /// Monotonic heavy-overwrite tick used for cadence modulo checks.
+        tick: std.atomic.Value(u64) = std.atomic.Value(u64).init(0),
+        /// Re-entry guard so automatic maintenance never runs concurrently.
+        in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
 
     /// Flushes and closes engine-owned resources.
     ///
@@ -76,6 +87,40 @@ pub const Database = struct {
         return metrics.call_with_latency(&self.state, lifecycle.compact_memory, .{self});
     }
 
+    /// Rebuilds one shard in place to reclaim retained arena churn.
+    ///
+    /// Time Complexity: O(n + t), where `n` is keys in the shard tree and `t` is shard TTL entries.
+    ///
+    /// Allocator: Uses explicit allocator paths for temporary clone/rebuild scratch.
+    ///
+    /// Ownership: Returns `error.InvalidShardIndex` when `shard_idx` is outside `[0, NUM_SHARDS)`.
+    ///
+    /// Thread Safety: Synchronous maintenance operation. Not safe to call concurrently
+    /// with other mutation of the same engine handle.
+    pub fn compact_shard(self: *Database, shard_idx: usize) EngineError!void {
+        return metrics.call_with_latency(&self.state, lifecycle.compact_shard, .{ self, shard_idx });
+    }
+
+    /// Rebuilds all shards in place to reclaim retained arena churn.
+    ///
+    /// Time Complexity: O(s + n + t), where `s` is shard count, `n` is total key count, and `t` is total TTL entries.
+    ///
+    /// Allocator: Uses explicit allocator paths for temporary clone/rebuild scratch.
+    ///
+    /// Calibration Notes (heavy overwrite 1 KiB payload, 50K operations):
+    /// - `compact_every=5000`: near-off total time, p99 around low microseconds, retained bytes near zero after each maintenance cycle.
+    /// - `compact_every=1000`: lower p99/max than 5000 but noticeably higher total maintenance cost.
+    /// - `compact_every<1000`: can impose disproportionate throughput cost (anti-pattern for default settings).
+    ///
+    /// Operational Guidance: Start with `compact_every=5000` and tune toward `1000`
+    /// only when tighter p99/max is more important than aggregate throughput.
+    ///
+    /// Thread Safety: Synchronous maintenance operation. Not safe to call concurrently
+    /// with other mutation of the same engine handle.
+    pub fn compact_all(self: *Database) EngineError!void {
+        return metrics.call_with_latency(&self.state, lifecycle.compact_all, .{self});
+    }
+
     /// Reads one key from the engine contract surface.
     ///
     /// Time Complexity: O(n + k + v), where `n` is `key.len` for shard routing, `k` is ART lookup work, and `v` is cloned value size when the key exists.
@@ -97,7 +142,9 @@ pub const Database = struct {
     ///
     /// Thread Safety: Safe for concurrent use with other point operations; acquires the global visibility gate exclusively before taking one shard-exclusive lock.
     pub fn put(self: *Database, key: []const u8, value: *const types.Value) EngineError!void {
-        return metrics.call_with_latency(&self.state, write.put, .{ &self.state, key, value });
+        const heavy_events_before = self.state.counters.overwritten_heavy_events_total.load(.monotonic);
+        try metrics.call_with_latency(&self.state, write.put, .{ &self.state, key, value });
+        self.maybe_run_heavy_overwrite_compaction(heavy_events_before);
     }
 
     /// Writes multiple plain key/value pairs as independent standalone mutations.
@@ -112,7 +159,35 @@ pub const Database = struct {
     ///
     /// Durability Semantics: Non-atomic as a group. On failure, any durable/live prefix applied before the failure may remain.
     pub fn put_group(self: *Database, writes: []const types.PutWrite) EngineError!void {
-        return metrics.call_with_latency(&self.state, write.put_group, .{ &self.state, writes });
+        const heavy_events_before = self.state.counters.overwritten_heavy_events_total.load(.monotonic);
+        try metrics.call_with_latency(&self.state, write.put_group, .{ &self.state, writes });
+        self.maybe_run_heavy_overwrite_compaction(heavy_events_before);
+    }
+
+    fn maybe_run_heavy_overwrite_compaction(self: *Database, heavy_events_before: u64) void {
+        const compact_every = self.auto_compaction.every orelse return;
+        const compact_every_u64: u64 = @as(u64, compact_every);
+
+        const heavy_events_after = self.state.counters.overwritten_heavy_events_total.load(.monotonic);
+        if (heavy_events_after <= heavy_events_before) return;
+
+        const events_delta = heavy_events_after - heavy_events_before;
+        const previous_tick = self.auto_compaction.tick.fetchAdd(events_delta, .monotonic);
+        const next_tick = previous_tick + events_delta;
+        if ((previous_tick / compact_every_u64) == (next_tick / compact_every_u64)) return;
+
+        if (!self.begin_heavy_overwrite_compaction()) return;
+        defer self.end_heavy_overwrite_compaction();
+
+        lifecycle.compact_all(self) catch {};
+    }
+
+    fn begin_heavy_overwrite_compaction(self: *Database) bool {
+        return self.auto_compaction.in_progress.cmpxchgStrong(false, true, .acq_rel, .monotonic) == null;
+    }
+
+    fn end_heavy_overwrite_compaction(self: *Database) void {
+        self.auto_compaction.in_progress.store(false, .release);
     }
 
     /// Deletes one plain key from the engine contract surface.
@@ -760,6 +835,15 @@ test "compact memory without a configured snapshot path returns no snapshot path
     try testing.expectError(error.NoSnapshotPath, db.compact_memory());
 }
 
+test "compact_shard validates shard index" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    try testing.expectError(error.InvalidShardIndex, db.compact_shard(runtime_shard.NUM_SHARDS));
+}
+
 test "checkpoint writes a snapshot and reopens the same visible state" {
     const testing = std.testing;
 
@@ -881,6 +965,170 @@ test "compact memory preserves visible state and reclaims committed arenas" {
     var sample = (try db.get(testing.allocator, "compact:0001")).?;
     defer sample.deinit(testing.allocator);
     try testing.expectEqual(@as(i64, 1), sample.integer);
+}
+
+test "compact_shard clears retained heavy estimate and preserves visible value" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    var payload_a = [_]u8{'a'} ** 1024;
+    var payload_b = [_]u8{'b'} ** 1024;
+
+    var first = types.Value{ .string = payload_a[0..] };
+    var second = types.Value{ .string = payload_b[0..] };
+
+    try db.put("heavy:one", &first);
+    try db.put("heavy:one", &second);
+
+    const shard_idx = runtime_shard.get_shard_index("heavy:one");
+    const before = db.state.stats_snapshot();
+    try testing.expect(before.overwritten_heavy_bytes_total > 0);
+    try testing.expect(before.retained_heavy_bytes_estimate > 0);
+    try testing.expect(db.state.retained_heavy_bytes_estimate_for_shard(shard_idx) > 0);
+
+    try db.compact_shard(shard_idx);
+
+    const after = db.state.stats_snapshot();
+    try testing.expectEqual(@as(u64, 0), after.retained_heavy_bytes_estimate);
+    try testing.expectEqual(@as(u64, 0), db.state.retained_heavy_bytes_estimate_for_shard(shard_idx));
+
+    var stored = (try db.get(testing.allocator, "heavy:one")).?;
+    defer stored.deinit(testing.allocator);
+    try testing.expectEqualStrings(payload_b[0..], stored.string);
+}
+
+test "compact_all clears retained heavy estimate across shards" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    var payload_a = [_]u8{'x'} ** 1024;
+    var payload_b = [_]u8{'y'} ** 1024;
+
+    var first = types.Value{ .string = payload_a[0..] };
+    var second = types.Value{ .string = payload_b[0..] };
+
+    try db.put("{s1}:heavy", &first);
+    try db.put("{s1}:heavy", &second);
+    try db.put("{s2}:heavy", &first);
+    try db.put("{s2}:heavy", &second);
+
+    const before = db.state.stats_snapshot();
+    try testing.expect(before.retained_heavy_bytes_estimate > 0);
+
+    try db.compact_all();
+
+    const after = db.state.stats_snapshot();
+    try testing.expectEqual(@as(u64, 0), after.retained_heavy_bytes_estimate);
+}
+
+test "heavy overwrite retained estimate grows then drops below epsilon after compact_all" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const payload_bytes: usize = 1024;
+    const overwrite_count: usize = 20_000;
+    // Conservative verification bounds (not operational thresholds):
+    // 10 MiB threshold comes from heavy overwrite math (10,240 * 1 KiB ~= 10 MiB).
+    // 1 KiB epsilon allows one live retained 1 KiB value after compaction.
+    const threshold_bytes: u64 = 10 * 1024 * 1024;
+    const epsilon_bytes: u64 = 1024;
+
+    var payload_a = [_]u8{'m'} ** payload_bytes;
+    var payload_b = [_]u8{'n'} ** payload_bytes;
+
+    var first = types.Value{ .string = payload_a[0..] };
+    var second = types.Value{ .string = payload_b[0..] };
+
+    try db.put("heavy:deterministic", &first);
+    for (0..overwrite_count) |_| {
+        try db.put("heavy:deterministic", &second);
+    }
+
+    const before = db.state.stats_snapshot();
+    try testing.expect(before.retained_heavy_bytes_estimate > threshold_bytes);
+    try testing.expect(before.overwritten_heavy_bytes_total >= before.retained_heavy_bytes_estimate);
+
+    try db.compact_all();
+
+    const after = db.state.stats_snapshot();
+    try testing.expect(after.retained_heavy_bytes_estimate <= epsilon_bytes);
+    try testing.expect(after.overwritten_heavy_bytes_total >= before.overwritten_heavy_bytes_total);
+}
+
+test "heavy_overwrite_compact_every triggers automatic maintenance on heavy overwrites" {
+    const testing = std.testing;
+
+    const db = try open(testing.allocator, .{
+        .heavy_overwrite_compact_every = 1,
+    });
+    defer db.close() catch unreachable;
+
+    var payload_a = [_]u8{'h'} ** 1024;
+    var payload_b = [_]u8{'i'} ** 1024;
+
+    var first = types.Value{ .string = payload_a[0..] };
+    var second = types.Value{ .string = payload_b[0..] };
+
+    try db.put("heavy:auto", &first);
+    for (0..32) |_| {
+        try db.put("heavy:auto", &second);
+    }
+
+    const stats = db.state.stats_snapshot();
+    try testing.expect(stats.overwritten_heavy_events_total > 0);
+    try testing.expect(stats.overwritten_heavy_bytes_total > 0);
+    try testing.expect(stats.retained_heavy_bytes_estimate <= 1024);
+}
+
+test "heavy overwrite cadence counts per-overwrite events inside one put_group" {
+    const testing = std.testing;
+
+    const db = try open(testing.allocator, .{
+        .heavy_overwrite_compact_every = 2,
+    });
+    defer db.close() catch unreachable;
+
+    var payload_a = [_]u8{'a'} ** 1024;
+    var payload_b = [_]u8{'b'} ** 1024;
+
+    var first = types.Value{ .string = payload_a[0..] };
+    var second = types.Value{ .string = payload_b[0..] };
+
+    try db.put("heavy:auto:1", &first);
+    try db.put("heavy:auto:2", &first);
+
+    try db.put_group(&.{
+        .{ .key = "heavy:auto:1", .value = &second },
+        .{ .key = "heavy:auto:2", .value = &second },
+    });
+
+    const stats = db.state.stats_snapshot();
+    try testing.expect(stats.overwritten_heavy_events_total >= 2);
+    try testing.expectEqual(@as(u64, 0), stats.retained_heavy_bytes_estimate);
+}
+
+test "heavy to scalar overwrite still records retained heavy estimate" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    var payload = [_]u8{'z'} ** 1024;
+    var heavy = types.Value{ .string = payload[0..] };
+    const scalar = types.Value{ .integer = 7 };
+
+    try db.put("heavy:to:scalar", &heavy);
+    try db.put("heavy:to:scalar", &scalar);
+
+    const stats = db.state.stats_snapshot();
+    try testing.expect(stats.overwritten_heavy_events_total >= 1);
+    try testing.expect(stats.retained_heavy_bytes_estimate >= 1024);
 }
 
 test "engine boundary latency sampling records one sample per call including errors" {
@@ -1137,6 +1385,29 @@ test "put overwrites existing plain value" {
     try testing.expectEqualStrings("updated", stored.string);
     try testing.expectEqual(@as(u64, 2), db.state.stats_snapshot().ops_put_total);
     try testing.expectEqual(@as(u64, 1), db.state.stats_snapshot().overwrites_total);
+}
+
+test "scalar point overwrites avoid allocator growth in steady state" {
+    const testing = std.testing;
+
+    var counting_state = std.testing.FailingAllocator.init(testing.allocator, .{});
+    const counting_allocator = counting_state.allocator();
+
+    const db = try create(counting_allocator);
+    defer db.close() catch unreachable;
+
+    const initial = types.Value{ .integer = 0 };
+    try db.put("counter", &initial);
+
+    const outstanding_after_first = counting_state.allocated_bytes - counting_state.freed_bytes;
+
+    for (0..20_000) |index| {
+        const next = types.Value{ .integer = @intCast(index + 1) };
+        try db.put("counter", &next);
+    }
+
+    const outstanding_after_overwrites = counting_state.allocated_bytes - counting_state.freed_bytes;
+    try testing.expect(outstanding_after_overwrites <= outstanding_after_first + 4 * 1024);
 }
 
 test "put leaves state unchanged when wal append fails" {
@@ -2330,7 +2601,7 @@ test "overwrite-only batches avoid retaining new committed arenas and remain rec
 
     const point_value = types.Value{ .integer = 9_999 };
     try db.put("batch:0000", &point_value);
-    try testing.expect(!value_is_heap_owned_for_test(db, "batch:0000"));
+    try testing.expect(value_is_heap_owned_for_test(db, "batch:0000"));
 
     const replacement = types.Value{ .integer = 8_888 };
     _ = try db.delete("batch:0000");

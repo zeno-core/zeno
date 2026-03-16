@@ -37,10 +37,17 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
     defer shard.lock.unlock();
 
     try durability.append_put_if_enabled(state, key, value);
-    const overwritten = try internal_mutate.upsert_value_unlocked(shard, key, value);
+    const outcome = try internal_mutate.upsert_value_unlocked_with_outcome(shard, key, value);
     internal_ttl_index.clear_ttl_entry(shard, key);
     state.record_operation(.put, 1);
-    if (overwritten) state.record_operation(.overwrite, 1);
+    if (outcome.overwritten) state.record_operation(.overwrite, 1);
+    if (outcome.overwritten and (outcome.previous_heavy_bytes != 0 or outcome.previous_heavy_event)) {
+        state.record_heavy_overwrite_retained_bytes(
+            shard_idx,
+            outcome.previous_heavy_bytes,
+            if (outcome.previous_heavy_event) 1 else 0,
+        );
+    }
 }
 
 /// Applies multiple plain key/value writes as independent standalone mutations.
@@ -78,13 +85,24 @@ pub fn put_group(state: *runtime_state.DatabaseState, writes: []const types.PutW
         shard.visibility_gate.lock_shared();
         shard.lock.lock();
 
+        var retained_heavy_bytes: u64 = 0;
+        var heavy_overwrite_events: u64 = 0;
+
         for (writes) |write_entry| {
             if (runtime_shard.get_shard_index(write_entry.key) != shard_idx) continue;
-            if (try internal_mutate.upsert_value_unlocked(shard, write_entry.key, write_entry.value)) {
+            const outcome = try internal_mutate.upsert_value_unlocked_with_outcome(shard, write_entry.key, write_entry.value);
+            retained_heavy_bytes += outcome.previous_heavy_bytes;
+            if (outcome.previous_heavy_event) heavy_overwrite_events += 1;
+
+            if (outcome.overwritten) {
                 overwritten += 1;
             }
             internal_ttl_index.clear_ttl_entry(shard, write_entry.key);
             applied += 1;
+        }
+
+        if (retained_heavy_bytes != 0 or heavy_overwrite_events != 0) {
+            state.record_heavy_overwrite_retained_bytes(shard_idx, retained_heavy_bytes, heavy_overwrite_events);
         }
 
         shard.lock.unlock();

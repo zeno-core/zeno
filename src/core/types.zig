@@ -36,6 +36,17 @@ pub const DatabaseOptions = struct {
     fsync_mode: FsyncMode = .always,
     fsync_interval_ms: u32 = 2,
     metrics: MetricsConfig = default_metrics_config(),
+    heavy_overwrite_compact_every: ?u32 = null,
+
+    // Maintenance note:
+    // Heavy-overwrite reclaim is currently caller-managed through explicit
+    // `Database.compact_shard(shard_idx)` and `Database.compact_all()` calls.
+    //
+    // Optional automatic cadence:
+    // `heavy_overwrite_compact_every: ?u32` where:
+    // - `null` keeps maintenance fully manual
+    // - positive values trigger one maintenance cycle every N heavy overwrites
+    // - `0` is treated as manual (`null`) for safety
 };
 
 /// Public engine value model.

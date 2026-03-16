@@ -54,6 +54,11 @@ pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Databas
     var db = try create_with_snapshot_path(allocator, options.snapshot_path, options.metrics);
     errdefer db.close() catch unreachable;
 
+    db.auto_compaction.every = if (options.heavy_overwrite_compact_every) |n|
+        if (n == 0) null else n
+    else
+        null;
+
     const snapshot_lsn = try load_snapshot_for_open(db, allocator, options.snapshot_path, options.wal_path);
 
     if (options.wal_path) |wal_path| {
@@ -184,6 +189,114 @@ pub fn compact_memory(db: *Database) EngineError!void {
     _ = storage_snapshot.load(&db.state, db.allocator, snapshot_path) catch |err| {
         return error_mod.map_persistence_error(err);
     };
+}
+
+/// Rebuilds one shard in place to reclaim retained arena churn.
+///
+/// Time Complexity: O(n + t), where:
+///  - `n` is keys in the shard tree
+///  - `t` is keys in shard TTL metadata.
+///
+/// Allocator: Uses `db.allocator` for temporary clones during rebuild.
+///
+/// Thread Safety: Synchronous maintenance operation. Blocks the selected shard by
+/// taking its exclusive visibility gate and shard-exclusive lock.
+pub fn compact_shard(db: *Database, shard_idx: usize) EngineError!void {
+    if (shard_idx >= runtime_shard.NUM_SHARDS) return error.InvalidShardIndex;
+
+    const shard = &db.state.shards[shard_idx];
+    shard.visibility_gate.lock_exclusive();
+    defer shard.visibility_gate.unlock_exclusive();
+
+    shard.lock.lock();
+    defer shard.lock.unlock();
+
+    const RetainedEntry = struct {
+        key: []u8,
+        value: Value,
+    };
+    const RetainedTtl = struct {
+        key: []u8,
+        expire_at: i64,
+    };
+
+    var retained_entries = std.ArrayList(RetainedEntry).empty;
+    defer {
+        for (retained_entries.items) |*entry| {
+            db.allocator.free(entry.key);
+            entry.value.deinit(db.allocator);
+        }
+        retained_entries.deinit(db.allocator);
+    }
+
+    var retained_ttls = std.ArrayList(RetainedTtl).empty;
+    defer {
+        for (retained_ttls.items) |entry| db.allocator.free(entry.key);
+        retained_ttls.deinit(db.allocator);
+    }
+
+    const EntryContext = struct {
+        allocator: std.mem.Allocator,
+        entries: *std.ArrayList(RetainedEntry),
+
+        fn visit(ctx_ptr: *anyopaque, key: []const u8, value: *const Value) !void {
+            const ctx: *@This() = @ptrCast(@alignCast(ctx_ptr));
+            try ctx.entries.append(ctx.allocator, .{
+                .key = try ctx.allocator.dupe(u8, key),
+                .value = try value.clone(ctx.allocator),
+            });
+        }
+    };
+
+    var entry_ctx = EntryContext{
+        .allocator = db.allocator,
+        .entries = &retained_entries,
+    };
+    _ = shard.tree.for_each(&entry_ctx, EntryContext.visit) catch |err| switch (err) {
+        error.OutOfMemory => return error.OutOfMemory,
+        else => unreachable,
+    };
+
+    var ttl_iterator = shard.ttl_index.iterator();
+    while (ttl_iterator.next()) |entry| {
+        try retained_ttls.append(db.allocator, .{
+            .key = try db.allocator.dupe(u8, entry.key_ptr.*),
+            .expire_at = entry.value_ptr.*,
+        });
+    }
+
+    var replacement = runtime_shard.Shard.init(db.allocator);
+    var replacement_transferred = false;
+    defer if (!replacement_transferred) replacement.deinit();
+    replacement.rebind_tree_allocator();
+
+    for (retained_entries.items) |*entry| {
+        _ = try internal_mutate.upsert_value_unlocked(&replacement, entry.key, &entry.value);
+    }
+    for (retained_ttls.items) |entry| {
+        try internal_ttl_index.set_ttl_entry(&replacement, entry.key, entry.expire_at);
+    }
+
+    shard.replace_storage_unlocked(replacement.arena, replacement.ttl_index, replacement.tree);
+    replacement_transferred = true;
+
+    db.state.clear_retained_heavy_bytes_estimate_for_shard(shard_idx);
+}
+
+/// Rebuilds every shard in place to reclaim retained arena churn without snapshot/WAL round-trips.
+///
+/// Time Complexity: O(s + n + t), where:
+///  - `s` is shard count
+///  - `n` is total key count across shard trees
+///  - `t` is total TTL entries across shards.
+///
+/// Allocator: Uses `db.allocator` for temporary clones during each shard rebuild.
+///
+/// Thread Safety: Synchronous maintenance operation. Blocks one shard at a time.
+pub fn compact_all(db: *Database) EngineError!void {
+    for (0..runtime_shard.NUM_SHARDS) |shard_idx| {
+        try compact_shard(db, shard_idx);
+    }
 }
 
 /// Installs one test-only probe for the checkpoint barrier.

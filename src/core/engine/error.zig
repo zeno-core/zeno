@@ -7,6 +7,7 @@ pub const EngineError = error{
     NotImplemented,
     OutOfMemory,
     KeyTooLarge,
+    InvalidShardIndex,
     NoSnapshotPath,
     CheckpointBusy,
     ActiveReadViews,

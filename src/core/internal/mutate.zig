@@ -14,6 +14,19 @@ pub const MutationError = error{
     KeyTooLarge,
 };
 
+/// Selects overwrite storage ownership for point upserts.
+pub const OverwriteOwnership = enum {
+    tree_arena,
+    heap,
+};
+
+/// Outcome returned by upsert paths with overwrite accounting details.
+pub const UpsertOutcome = struct {
+    overwritten: bool,
+    previous_heavy_bytes: u64,
+    previous_heavy_event: bool,
+};
+
 /// Validates one physical key before it enters engine mutation planning.
 ///
 /// Time Complexity: O(k), where `k` is `key.len`.
@@ -67,27 +80,69 @@ pub fn stored_value_equals_unlocked(
 ///
 /// Time Complexity: O(k + v), where `k` is `key.len` and `v` is deep-clone work for `value`.
 ///
-/// Allocator: Uses the shard arena allocator for duplicated key bytes, value storage, and nested cloned payloads.
+/// Allocator: Uses the shard arena allocator for inserts; overwrite storage strategy depends on `overwrite_ownership`.
 ///
-/// Ownership: Clones `value` into shard-owned storage and retains replaced storage inside the shard arena model.
-pub fn upsert_value_unlocked(
+/// Ownership: Clones `value` into shard-owned storage and releases previously heap-owned values when replaced.
+pub fn upsert_value_unlocked_with_overwrite_ownership_and_outcome(
     shard: *runtime_shard.Shard,
     key: []const u8,
     value: *const types.Value,
-) !bool {
+    overwrite_ownership: OverwriteOwnership,
+) !UpsertOutcome {
     if (shard.tree.find_leaf_for_exact_key(key)) |leaf| {
-        const arena_allocator = shard.arena.allocator();
-        const cloned_value = try arena_allocator.create(types.Value);
-        cloned_value.* = try value.clone(arena_allocator);
+        const previous_heavy_bytes = estimated_value_bytes(leaf.value);
+        const previous_heavy_event = previous_heavy_bytes != 0;
+
+        if (is_scalar_value(value)) {
+            if (leaf.value_owner == .heap_allocation) {
+                leaf.value.deinit(shard.base_allocator);
+            }
+            leaf.value.* = value.*;
+            return .{
+                .overwritten = true,
+                .previous_heavy_bytes = previous_heavy_bytes,
+                .previous_heavy_event = previous_heavy_event,
+            };
+        }
+
+        const ClonedOverwrite = struct {
+            value: *types.Value,
+            owner: art_node.ValueOwner,
+        };
+
+        const cloned: ClonedOverwrite = switch (overwrite_ownership) {
+            .tree_arena => blk: {
+                const arena_allocator = shard.arena.allocator();
+                const cloned_value = try arena_allocator.create(types.Value);
+                cloned_value.* = try value.clone(arena_allocator);
+                break :blk .{
+                    .value = cloned_value,
+                    .owner = art_node.ValueOwner.tree_allocator,
+                };
+            },
+            .heap => blk: {
+                const cloned_value = try shard.base_allocator.create(types.Value);
+                errdefer shard.base_allocator.destroy(cloned_value);
+                cloned_value.* = try value.clone(shard.base_allocator);
+                break :blk .{
+                    .value = cloned_value,
+                    .owner = art_node.ValueOwner.heap_allocation,
+                };
+            },
+        };
 
         const previous_value = leaf.value;
         const previous_owner = leaf.value_owner;
-        leaf.value = cloned_value;
-        leaf.value_owner = .tree_allocator;
+        leaf.value = cloned.value;
+        leaf.value_owner = cloned.owner;
         if (previous_owner == .heap_allocation) {
             free_heap_value(shard.base_allocator, previous_value);
         }
-        return true;
+        return .{
+            .overwritten = true,
+            .previous_heavy_bytes = previous_heavy_bytes,
+            .previous_heavy_event = previous_heavy_event,
+        };
     }
 
     const arena_allocator = shard.arena.allocator();
@@ -98,7 +153,83 @@ pub fn upsert_value_unlocked(
         error.OutOfMemory => return error.OutOfMemory,
         error.TreeFull, error.InvalidNodeGrowth, error.InvalidNodeType => unreachable,
     };
-    return false;
+    return .{
+        .overwritten = false,
+        .previous_heavy_bytes = 0,
+        .previous_heavy_event = false,
+    };
+}
+
+/// Clones one key and value into shard-owned ART storage, inserting or replacing the live entry.
+///
+/// Overwrite Ownership: Uses the selected ownership strategy for overwrite replacements.
+pub fn upsert_value_unlocked_with_overwrite_ownership(
+    shard: *runtime_shard.Shard,
+    key: []const u8,
+    value: *const types.Value,
+    overwrite_ownership: OverwriteOwnership,
+) !bool {
+    const outcome = try upsert_value_unlocked_with_overwrite_ownership_and_outcome(shard, key, value, overwrite_ownership);
+    return outcome.overwritten;
+}
+
+/// Clones one key and value into shard-owned ART storage, inserting or replacing the live entry.
+///
+/// Overwrite Ownership: Uses shard arena storage for overwrite replacements.
+pub fn upsert_value_unlocked(
+    shard: *runtime_shard.Shard,
+    key: []const u8,
+    value: *const types.Value,
+) !bool {
+    return upsert_value_unlocked_with_overwrite_ownership(shard, key, value, .tree_arena);
+}
+
+/// Clones one key and value into shard-owned ART storage and returns overwrite accounting details.
+///
+/// Overwrite Ownership: Uses shard arena storage for overwrite replacements.
+pub fn upsert_value_unlocked_with_outcome(
+    shard: *runtime_shard.Shard,
+    key: []const u8,
+    value: *const types.Value,
+) !UpsertOutcome {
+    return upsert_value_unlocked_with_overwrite_ownership_and_outcome(shard, key, value, .tree_arena);
+}
+
+fn is_scalar_value(value: *const types.Value) bool {
+    return switch (value.*) {
+        .null_val, .boolean, .integer, .float => true,
+        .string, .array, .object => false,
+    };
+}
+
+/// Returns whether a value is heavy (owns variable-sized payload storage).
+pub fn is_heavy_value(value: *const types.Value) bool {
+    return !is_scalar_value(value);
+}
+
+/// Estimates retained bytes for one stored value tree.
+pub fn estimated_value_bytes(value: *const types.Value) u64 {
+    return switch (value.*) {
+        .null_val => 0,
+        .boolean => 0,
+        .integer => 0,
+        .float => 0,
+        .string => |payload| payload.len,
+        .array => |items| blk: {
+            var total: u64 = 0;
+            for (items.items) |*item| total += estimated_value_bytes(item);
+            break :blk total;
+        },
+        .object => |entries| blk: {
+            var total: u64 = 0;
+            var iterator = entries.iterator();
+            while (iterator.next()) |entry| {
+                total += entry.key_ptr.*.len;
+                total += estimated_value_bytes(entry.value_ptr);
+            }
+            break :blk total;
+        },
+    };
 }
 
 /// Removes one stored key/value pair when present.

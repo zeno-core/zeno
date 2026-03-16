@@ -18,6 +18,8 @@ const scan_page_item_count: usize = 64;
 const batch_item_count: usize = 64;
 const batch_key_storage_bytes: usize = 32;
 const put_overwrite_key_cardinality: usize = 64;
+const heavy_overwrite_payload_bytes: usize = 1024;
+const heavy_overwrite_manual_compact_interval: usize = 1024;
 const put_group_item_count: usize = 16;
 const wal_group_item_count: usize = 16;
 const wal_group_keys = [_][]const u8{
@@ -41,6 +43,7 @@ const wal_group_keys = [_][]const u8{
 
 var bench_metrics_config: types.MetricsConfig = types.default_metrics_config();
 var steady_put_db: ?*engine.Database = null;
+var steady_put_heavy_manual_db: ?*engine.Database = null;
 var steady_get_db: ?*engine.Database = null;
 var steady_scan_db: ?*engine.Database = null;
 var steady_scan_view: ?types.ReadView = null;
@@ -53,6 +56,9 @@ var steady_checked_batch_insert_db: ?*engine.Database = null;
 var steady_batch_insert_seed = std.atomic.Value(usize).init(0);
 var steady_checked_batch_insert_seed = std.atomic.Value(usize).init(0);
 var steady_put_overwrite_seed = std.atomic.Value(usize).init(0);
+var steady_put_overwrite_heavy_seed = std.atomic.Value(usize).init(0);
+var steady_put_overwrite_heavy_manual_seed = std.atomic.Value(usize).init(0);
+var steady_put_overwrite_heavy_manual_ops = std.atomic.Value(usize).init(0);
 
 var steady_art_tree: ?internal.art.Tree = null;
 var steady_wal: ?internal.wal.Wal = null;
@@ -62,6 +68,7 @@ const BenchCliConfig = struct {
     run_all_metrics_modes: bool = false,
     scan_allocation_profile: bool = false,
     scan_candidate_profile: bool = false,
+    heavy_overwrite_profile: bool = false,
     metrics_config: types.MetricsConfig = types.default_metrics_config(),
 };
 
@@ -88,6 +95,15 @@ const ScanCandidateProfile = struct {
     allocated_bytes: usize,
     freed_bytes: usize,
     elapsed_ns: u64,
+};
+
+const HeavyOverwriteProfile = struct {
+    elapsed_ns: u64,
+    p50_ns: u64,
+    p99_ns: u64,
+    max_ns: u64,
+    overwritten_heavy_bytes_total: u64,
+    retained_heavy_bytes_estimate: u64,
 };
 
 fn open_bench_db(allocator: std.mem.Allocator) !*engine.Database {
@@ -125,6 +141,44 @@ const PutSteadyOverwriteCardinalityBenchmark = struct {
         const key = std.fmt.bufPrint(&key_buf, "bench:put:ovr:{d:0>2}", .{key_index}) catch unreachable;
         const value = types.Value{ .integer = @intCast(key_index) };
         db.put(key, &value) catch unreachable;
+    }
+};
+
+const PutSteadyOverwriteHeavyCardinalityBenchmark = struct {
+    pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const db = steady_put_db orelse unreachable;
+        const key_index = steady_put_overwrite_heavy_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
+
+        var key_buf: [40]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index}) catch unreachable;
+
+        var payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+        @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast(key_index % 26))));
+        const value = types.Value{ .string = payload[0..] };
+        db.put(key, &value) catch unreachable;
+    }
+};
+
+const PutSteadyOverwriteHeavyManualCompactBenchmark = struct {
+    pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const db = steady_put_heavy_manual_db orelse unreachable;
+        const key_index = steady_put_overwrite_heavy_manual_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
+
+        var key_buf: [40]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index}) catch unreachable;
+
+        var payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+        @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast(key_index % 26))));
+        const value = types.Value{ .string = payload[0..] };
+        db.put(key, &value) catch unreachable;
+
+        const op_index = steady_put_overwrite_heavy_manual_ops.fetchAdd(1, .monotonic) + 1;
+        if ((op_index % heavy_overwrite_manual_compact_interval) == 0) {
+            const shard_idx = internal.runtime_shard.get_shard_index(key);
+            db.compact_shard(shard_idx) catch unreachable;
+        }
     }
 };
 
@@ -377,6 +431,8 @@ pub fn main() !void {
         try run_scan_allocation_profile(&stdout.interface, cli_config.metrics_config);
     } else if (cli_config.scan_candidate_profile) {
         try run_scan_candidate_profile(&stdout.interface, cli_config.metrics_config);
+    } else if (cli_config.heavy_overwrite_profile) {
+        try run_heavy_overwrite_profile(&stdout.interface, cli_config.metrics_config);
     } else if (cli_config.run_all_metrics_modes) {
         const configs = [_]types.MetricsConfig{
             .{ .mode = .disabled },
@@ -435,6 +491,42 @@ fn print_throughput_summary(
             const key = std.fmt.bufPrint(&key_buf, "bench:put:ovr:{d:0>2}", .{key_index}) catch unreachable;
             const value = types.Value{ .integer = @intCast(key_index) };
             db.put(key, &value) catch unreachable;
+        }
+    }.run, allocator);
+
+    try run_and_print_throughput(writer, "put overwrite64 heavy1k steady", iterations, 1, struct {
+        fn run(_: std.mem.Allocator) void {
+            const db = steady_put_db orelse unreachable;
+            const key_index = steady_put_overwrite_heavy_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
+
+            var key_buf: [40]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index}) catch unreachable;
+
+            var payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+            @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast(key_index % 26))));
+            const value = types.Value{ .string = payload[0..] };
+            db.put(key, &value) catch unreachable;
+        }
+    }.run, allocator);
+
+    try run_and_print_throughput(writer, "put overwrite64 heavy1k manual", iterations, 1, struct {
+        fn run(_: std.mem.Allocator) void {
+            const db = steady_put_heavy_manual_db orelse unreachable;
+            const key_index = steady_put_overwrite_heavy_manual_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
+
+            var key_buf: [40]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index}) catch unreachable;
+
+            var payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+            @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast(key_index % 26))));
+            const value = types.Value{ .string = payload[0..] };
+            db.put(key, &value) catch unreachable;
+
+            const op_index = steady_put_overwrite_heavy_manual_ops.fetchAdd(1, .monotonic) + 1;
+            if ((op_index % heavy_overwrite_manual_compact_interval) == 0) {
+                const shard_idx = internal.runtime_shard.get_shard_index(key);
+                db.compact_shard(shard_idx) catch unreachable;
+            }
         }
     }.run, allocator);
 
@@ -736,6 +828,10 @@ fn parse_cli_config(allocator: std.mem.Allocator) !BenchCliConfig {
             cli.scan_candidate_profile = true;
             continue;
         }
+        if (std.mem.eql(u8, arg, "--heavy-overwrite-profile")) {
+            cli.heavy_overwrite_profile = true;
+            continue;
+        }
         return error.InvalidArgument;
     }
 
@@ -756,9 +852,133 @@ fn parse_metrics_mode(raw: []const u8) ?types.MetricsMode {
 
 fn print_usage() void {
     std.debug.print(
-        \\usage: zeno-core-bench [--metrics-mode=disabled|counters_only|sampled_latency|full|all] [--latency-sample-shift=N] [--scan-allocation-profile] [--scan-candidate-profile]
+        \\usage: zeno-core-bench [--metrics-mode=disabled|counters_only|sampled_latency|full|all] [--latency-sample-shift=N] [--scan-allocation-profile] [--scan-candidate-profile] [--heavy-overwrite-profile]
         \\
     , .{});
+}
+
+fn run_heavy_overwrite_profile(writer: anytype, metrics_config: types.MetricsConfig) !void {
+    bench_metrics_config = metrics_config;
+    try print_metrics_config(writer, metrics_config);
+    try writer.print("heavy overwrite calibration (payload=1KB, keys=64, ops=50000)\n", .{});
+    try writer.print(
+        "{s: <15} | {s: <8} | {s: <8} | {s: <10} | {s: <14} | {s: <12}\n",
+        .{ "compact_every_N", "p50", "p99", "max", "retained_final", "elapsed_total" },
+    );
+    try writer.print("--------------------------------------------------------------------------------\n", .{});
+
+    const compact_intervals = [_]usize{ 100, 500, 1_000, 5_000, 10_000 };
+    for (compact_intervals) |interval| {
+        const profile = try profile_heavy_overwrite_case(interval);
+        try print_heavy_overwrite_calibration_row(writer, interval, profile);
+    }
+
+    const off = try profile_heavy_overwrite_case(null);
+    try print_heavy_overwrite_calibration_row(writer, null, off);
+}
+
+fn print_heavy_overwrite_calibration_row(writer: anytype, compact_every_n: ?usize, profile: HeavyOverwriteProfile) !void {
+    var p50_buf: [24]u8 = undefined;
+    var p99_buf: [24]u8 = undefined;
+    var max_buf: [24]u8 = undefined;
+    var retained_buf: [24]u8 = undefined;
+    var elapsed_buf: [24]u8 = undefined;
+
+    const p50_text = format_ns_short(&p50_buf, profile.p50_ns) catch unreachable;
+    const p99_text = format_ns_short(&p99_buf, profile.p99_ns) catch unreachable;
+    const max_text = format_ns_short(&max_buf, profile.max_ns) catch unreachable;
+    const retained_text = format_bytes_short(&retained_buf, profile.retained_heavy_bytes_estimate) catch unreachable;
+    const elapsed_text = format_ns_short(&elapsed_buf, profile.elapsed_ns) catch unreachable;
+
+    var mode_buf: [24]u8 = undefined;
+    const mode_text = if (compact_every_n) |n|
+        try std.fmt.bufPrint(&mode_buf, "{d}", .{n})
+    else
+        "off";
+
+    try writer.print("{s: <15} | {s: <8} | {s: <8} | {s: <10} | {s: <14} | {s: <12}\n", .{
+        mode_text,
+        p50_text,
+        p99_text,
+        max_text,
+        retained_text,
+        elapsed_text,
+    });
+}
+
+fn format_ns_short(buf: []u8, ns: u64) ![]const u8 {
+    if (ns < 1_000) return std.fmt.bufPrint(buf, "{d}ns", .{ns});
+    if (ns < std.time.ns_per_ms) return std.fmt.bufPrint(buf, "{d:.2}us", .{@as(f64, @floatFromInt(ns)) / 1_000.0});
+    return std.fmt.bufPrint(buf, "{d:.2}ms", .{@as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(std.time.ns_per_ms))});
+}
+
+fn format_bytes_short(buf: []u8, bytes: u64) ![]const u8 {
+    if (bytes >= 1024 * 1024) {
+        return std.fmt.bufPrint(buf, "{d:.2}MB", .{@as(f64, @floatFromInt(bytes)) / (1024.0 * 1024.0)});
+    }
+    if (bytes >= 1024) {
+        return std.fmt.bufPrint(buf, "{d:.2}KB", .{@as(f64, @floatFromInt(bytes)) / 1024.0});
+    }
+    return std.fmt.bufPrint(buf, "{d}B", .{bytes});
+}
+
+fn profile_heavy_overwrite_case(compact_every_n: ?usize) !HeavyOverwriteProfile {
+    const iterations: usize = 50_000;
+
+    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    defer std.debug.assert(gpa.deinit() == .ok);
+    const allocator = gpa.allocator();
+
+    const db = try open_bench_db(allocator);
+    defer db.close() catch unreachable;
+
+    var key_buf: [40]u8 = undefined;
+    var payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+
+    for (0..put_overwrite_key_cardinality) |i| {
+        const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{i});
+        @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast(i % 26))));
+        const value = types.Value{ .string = payload[0..] };
+        try db.put(key, &value);
+    }
+
+    var latencies = try allocator.alloc(u64, iterations);
+    defer allocator.free(latencies);
+
+    var total_timer = try std.time.Timer.start();
+    for (0..iterations) |i| {
+        const key_index = i % put_overwrite_key_cardinality;
+        const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index});
+        @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast((key_index + i) % 26))));
+        const value = types.Value{ .string = payload[0..] };
+
+        var op_timer = try std.time.Timer.start();
+        try db.put(key, &value);
+        latencies[i] = op_timer.read();
+
+        if (compact_every_n) |interval| {
+            if (((i + 1) % interval) == 0) {
+                try db.compact_all();
+            }
+        }
+    }
+    const elapsed_ns = total_timer.read();
+
+    std.sort.heap(u64, latencies, {}, comptime std.sort.asc(u64));
+
+    const p50_idx = (iterations * 50) / 100;
+    const p99_idx = (iterations * 99) / 100;
+    const max_idx = iterations - 1;
+    const stats = db.state.stats_snapshot();
+
+    return .{
+        .elapsed_ns = elapsed_ns,
+        .p50_ns = latencies[p50_idx],
+        .p99_ns = latencies[p99_idx],
+        .max_ns = latencies[max_idx],
+        .overwritten_heavy_bytes_total = stats.overwritten_heavy_bytes_total,
+        .retained_heavy_bytes_estimate = stats.retained_heavy_bytes_estimate,
+    };
 }
 
 fn run_scan_allocation_profile(writer: anytype, metrics_config: types.MetricsConfig) !void {
@@ -937,6 +1157,8 @@ fn run_bench_suite(
     const put_fresh = PutFreshBenchmark{};
     const put_steady = PutSteadyBenchmark{};
     const put_steady_overwrite_cardinality = PutSteadyOverwriteCardinalityBenchmark{};
+    const put_steady_overwrite_heavy_cardinality = PutSteadyOverwriteHeavyCardinalityBenchmark{};
+    const put_steady_overwrite_heavy_manual = PutSteadyOverwriteHeavyManualCompactBenchmark{};
     const put_group_steady = PutGroupSteadyBenchmark{};
     const get_existing = GetExistingBenchmark{};
     const get_existing_steady = GetExistingSteadyBenchmark{};
@@ -955,6 +1177,8 @@ fn run_bench_suite(
     try stable_bench.addParam("put isolated", &put_fresh, .{});
     try stable_bench.addParam("put steady", &put_steady, .{});
     try stable_bench.addParam("put overwrite64 steady", &put_steady_overwrite_cardinality, .{});
+    try stable_bench.addParam("put overwrite64 heavy1k steady", &put_steady_overwrite_heavy_cardinality, .{});
+    try stable_bench.addParam("put overwrite64 heavy1k manual", &put_steady_overwrite_heavy_manual, .{});
     try stable_bench.addParam("put_group16 steady", &put_group_steady, .{});
     try stable_bench.addParam("get isolated", &get_existing, .{});
     try stable_bench.addParam("get steady", &get_existing_steady, .{});
@@ -1018,7 +1242,16 @@ fn init_steady_state_benches() !void {
             const overwrite_value = types.Value{ .integer = @intCast(i) };
             try steady_put_db.?.put(key, &overwrite_value);
         }
+
+        var heavy_payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+        for (0..put_overwrite_key_cardinality) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{i});
+            @memset(heavy_payload[0..], @as(u8, 'a' + @as(u8, @intCast(i % 26))));
+            const heavy_value = types.Value{ .string = heavy_payload[0..] };
+            try steady_put_db.?.put(key, &heavy_value);
+        }
         steady_put_overwrite_seed.store(0, .monotonic);
+        steady_put_overwrite_heavy_seed.store(0, .monotonic);
     }
 
     steady_get_db = try open_bench_db(std.heap.page_allocator);
@@ -1046,6 +1279,20 @@ fn init_steady_state_benches() !void {
 
     steady_checked_batch_insert_db = try open_bench_db(std.heap.page_allocator);
     steady_checked_batch_insert_seed.store(0, .monotonic);
+
+    steady_put_heavy_manual_db = try open_bench_db(std.heap.page_allocator);
+    {
+        var key_buf: [40]u8 = undefined;
+        var heavy_payload: [heavy_overwrite_payload_bytes]u8 = undefined;
+        for (0..put_overwrite_key_cardinality) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{i});
+            @memset(heavy_payload[0..], @as(u8, 'a' + @as(u8, @intCast(i % 26))));
+            const heavy_value = types.Value{ .string = heavy_payload[0..] };
+            try steady_put_heavy_manual_db.?.put(key, &heavy_value);
+        }
+        steady_put_overwrite_heavy_manual_seed.store(0, .monotonic);
+        steady_put_overwrite_heavy_manual_ops.store(0, .monotonic);
+    }
 
     steady_art_tree = internal.art.Tree.init(std.heap.page_allocator);
     load_scan_fixture_to_art(scan_item_count, &steady_art_tree.?);
@@ -1121,6 +1368,10 @@ fn deinit_steady_state_benches() void {
     if (steady_get_db) |db| {
         db.close() catch unreachable;
         steady_get_db = null;
+    }
+    if (steady_put_heavy_manual_db) |db| {
+        db.close() catch unreachable;
+        steady_put_heavy_manual_db = null;
     }
     if (steady_put_db) |db| {
         db.close() catch unreachable;

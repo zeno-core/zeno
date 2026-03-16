@@ -35,6 +35,104 @@ pub const NodeHeader = extern struct {
             .leaf_value = null,
         };
     }
+
+    /// Finds a child pointer by transition byte for any internal-node class.
+    ///
+    /// Time Complexity: O(1) bounded by node class implementation.
+    ///
+    /// Allocator: Does not allocate.
+    pub fn find_child(self: *const NodeHeader, key_byte: u8) ?*Node {
+        return switch (self.node_type) {
+            .node4 => @as(*const Node4, @alignCast(@fieldParentPtr("header", self))).find_child(key_byte),
+            .node16 => @as(*const Node16, @alignCast(@fieldParentPtr("header", self))).find_child(key_byte),
+            .node48 => @as(*const Node48, @alignCast(@fieldParentPtr("header", self))).find_child(key_byte),
+            .node256 => @as(*const Node256, @alignCast(@fieldParentPtr("header", self))).find_child(key_byte),
+        };
+    }
+
+    /// Returns the first present child in lexicographic edge-byte order.
+    ///
+    /// Time Complexity: O(1) for Node4/Node16 and bounded O(256) for Node48/Node256.
+    ///
+    /// Allocator: Does not allocate.
+    pub fn first_child(self: *const NodeHeader) *const Node {
+        switch (self.node_type) {
+            .node4 => {
+                const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", self)));
+                std.debug.assert(n4.header.num_children > 0);
+                return &n4.children[0];
+            },
+            .node16 => {
+                const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", self)));
+                std.debug.assert(n16.header.num_children > 0);
+                return &n16.children[0];
+            },
+            .node48 => {
+                const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", self)));
+                for (0..256) |i| {
+                    if (n48.child_index[i] != Node48.EMPTY_INDEX) {
+                        return &n48.children[n48.child_index[i]];
+                    }
+                }
+                unreachable;
+            },
+            .node256 => {
+                const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", self)));
+                for (0..256) |i| {
+                    if (!n256.children[i].is_empty()) {
+                        return &n256.children[i];
+                    }
+                }
+                unreachable;
+            },
+        }
+    }
+
+    /// Visits each present child in lexicographic edge-byte order.
+    ///
+    /// The callback returns `true` to continue iteration and `false` to stop early.
+    ///
+    /// Time Complexity: O(children) for Node4/Node16 and bounded O(256) for Node48/Node256.
+    ///
+    /// Allocator: Does not allocate.
+    pub fn for_each_child(
+        self: *const NodeHeader,
+        comptime Ctx: type,
+        ctx: Ctx,
+        comptime callback: fn (Ctx, u8, *const Node) anyerror!bool,
+    ) !void {
+        switch (self.node_type) {
+            .node4 => {
+                const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", self)));
+                for (0..n4.header.num_children) |i| {
+                    if (!try callback(ctx, n4.keys[i], &n4.children[i])) return;
+                }
+            },
+            .node16 => {
+                const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", self)));
+                for (0..n16.header.num_children) |i| {
+                    if (!try callback(ctx, n16.keys[i], &n16.children[i])) return;
+                }
+            },
+            .node48 => {
+                const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", self)));
+                for (0..256) |b| {
+                    const idx = n48.child_index[b];
+                    if (idx != Node48.EMPTY_INDEX) {
+                        if (!try callback(ctx, @intCast(b), &n48.children[idx])) return;
+                    }
+                }
+            },
+            .node256 => {
+                const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", self)));
+                for (0..256) |b| {
+                    if (!n256.children[b].is_empty()) {
+                        if (!try callback(ctx, @intCast(b), &n256.children[b])) return;
+                    }
+                }
+            },
+        }
+    }
 };
 
 /// Ownership class for one leaf's current value pointer.

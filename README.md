@@ -25,21 +25,21 @@ Zeno is built for speed. Below are numbers from the latest benchmark run:
 
 | Operation | Throughput | Latency (Mean) |
 | :--- | :--- | :--- |
-| **DB PUT (steady)** | **39.22M ops/sec** | **25 ns** |
-| **DB PUT Group16 (steady)** | **1.80M items/sec (0.11M ops/sec)** | **8.90 us** |
-| **DB GET (steady)** | **29.71M ops/sec** | **33 ns** |
-| **DB GET (steady, TTL 10% keys)** | **16.40M ops/sec** | **60 ns** |
-| **ART Lookup (Hit)** | 102.76M ops/sec | 9 ns |
-| **ART Insert (Sequential)**| 80.10M ops/sec | 12 ns |
+| **DB PUT (steady)** | **37.07M ops/sec** | **26 ns** |
+| **DB PUT Group16 (steady)** | **1.64M items/sec (0.10M ops/sec)** | **9.77 us** |
+| **DB GET (steady)** | **32.16M ops/sec** | **31 ns** |
+| **DB GET (steady, TTL 10% keys)** | **16.60M ops/sec** | **60 ns** |
+| **ART Lookup (Hit)** | 99.90M ops/sec | 10 ns |
+| **ART Insert (Sequential)**| 82.97M ops/sec | 12 ns |
 | **WAL Append (Async)** | 0.69M ops/sec | 1.46 us |
-| **WAL Append Grouped16 (Async)** | 1.03M items/sec (0.06M ops/sec) | 15.59 us |
+| **WAL Append Grouped16 (Async)** | 0.84M items/sec (0.05M ops/sec) | 19.10 us |
 
 Sharded scalability (latest run):
 
 | Workload | 1 thread | 2 threads | 4 threads | 8 threads | 16 threads |
 | :--- | :--- | :--- | :--- | :--- | :--- |
-| **GET (Shared)** | 14.51M | 26.87M | 51.52M | 100.60M | 141.17M ops/sec |
-| **PUT (Sharded)** | 41.89M | 74.32M | 132.15M | 237.10M | 277.70M ops/sec |
+| **GET (Shared)** | 28.34M | 51.47M | 103.97M | 182.91M | 256.93M ops/sec |
+| **PUT (Sharded)** | 38.79M | 72.54M | 128.74M | 247.99M | 262.48M ops/sec |
 
 *Benchmarks conducted on Ubuntu 24.04.4, AMD Ryzen 7 5700X, 32GB DDR4 @ 3200MHz*
 
@@ -53,13 +53,13 @@ This executes the full benchmark suite (steady-state, throughput summary, and sh
 
 ### Heavy Overwrite Metrics (Essential)
 
-Latest `ReleaseFast` run (after heavy-overwrite maintenance + safety fixes):
+Latest `ReleaseFast` run:
 
 | Metric | Result |
 | :--- | :--- |
-| `put overwrite64 steady` | `20.98M ops/sec` |
-| `put overwrite64 heavy1k steady` | `1.94M ops/sec` |
-| `put overwrite64 heavy1k manual` | `1.57M ops/sec` |
+| `put overwrite64 steady` | `20.32M ops/sec` |
+| `put overwrite64 heavy1k steady` | `1.82M ops/sec` |
+| `put overwrite64 heavy1k manual` | `1.71M ops/sec` |
 
 Heavy calibration command:
 

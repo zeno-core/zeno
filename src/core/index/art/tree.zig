@@ -64,37 +64,7 @@ pub const Tree = struct {
                 .leaf => |l| return l,
                 .internal => |h| {
                     if (h.leaf_value) |leaf| return leaf;
-                    cur = switch (h.node_type) {
-                        .node4 => blk: {
-                            const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", h)));
-                            std.debug.assert(n4.header.num_children > 0);
-                            break :blk &n4.children[0];
-                        },
-                        .node16 => blk: {
-                            const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", h)));
-                            std.debug.assert(n16.header.num_children > 0);
-                            break :blk &n16.children[0];
-                        },
-                        .node48 => blk: {
-                            const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", h)));
-                            // Find first occupied slot
-                            for (0..256) |i| {
-                                if (n48.child_index[i] != Node48.EMPTY_INDEX) {
-                                    break :blk &n48.children[n48.child_index[i]];
-                                }
-                            }
-                            unreachable;
-                        },
-                        .node256 => blk: {
-                            const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", h)));
-                            for (0..256) |i| {
-                                if (!n256.children[i].is_empty()) {
-                                    break :blk &n256.children[i];
-                                }
-                            }
-                            unreachable;
-                        },
-                    };
+                    cur = h.first_child();
                 },
                 .empty => unreachable,
             }
@@ -148,12 +118,7 @@ pub const Tree = struct {
                     }
 
                     const key_byte = key[depth];
-                    const next_child_ptr = switch (header.node_type) {
-                        .node4 => @as(*const Node4, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node16 => @as(*const Node16, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node48 => @as(*const Node48, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node256 => @as(*const Node256, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                    };
+                    const next_child_ptr = header.find_child(key_byte);
 
                     if (next_child_ptr) |child_ptr| {
                         current_node_ptr = child_ptr;
@@ -206,12 +171,7 @@ pub const Tree = struct {
                     }
 
                     const key_byte = key[depth];
-                    const next_child_ptr = switch (header.node_type) {
-                        .node4 => @as(*Node4, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node16 => @as(*Node16, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node48 => @as(*Node48, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node256 => @as(*Node256, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                    };
+                    const next_child_ptr = header.find_child(key_byte);
 
                     if (next_child_ptr) |child_ptr| {
                         current_node_ptr = child_ptr;
@@ -367,12 +327,7 @@ pub const Tree = struct {
                     }
 
                     const key_byte = key[depth];
-                    const next_child = switch (header.node_type) {
-                        .node4 => @as(*Node4, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node16 => @as(*Node16, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node48 => @as(*Node48, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node256 => @as(*Node256, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                    };
+                    const next_child = header.find_child(key_byte);
 
                     if (next_child) |child_ptr| {
                         node_ref = child_ptr; // Move down
@@ -496,12 +451,7 @@ pub const Tree = struct {
                         return false;
                     }
                     const key_byte = key[depth];
-                    const next_child = switch (header.node_type) {
-                        .node4 => @as(*Node4, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node16 => @as(*Node16, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node48 => @as(*Node48, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node256 => @as(*Node256, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                    };
+                    const next_child = header.find_child(key_byte);
 
                     if (next_child) |child_ptr| {
                         parent_ptr = node_ref;
@@ -605,12 +555,7 @@ pub const Tree = struct {
                     }
 
                     const key_byte = prefix[depth];
-                    const next = switch (header.node_type) {
-                        .node4 => @as(*const Node4, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node16 => @as(*const Node16, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node48 => @as(*const Node48, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                        .node256 => @as(*const Node256, @alignCast(@fieldParentPtr("header", header))).find_child(key_byte),
-                    };
+                    const next = header.find_child(key_byte);
                     if (next) |child| {
                         parent = current;
                         parent_key_byte = key_byte;
@@ -645,37 +590,16 @@ pub const Tree = struct {
             .leaf => 1,
             .internal => |header| blk: {
                 var total: usize = if (header.leaf_value != null) 1 else 0;
-                switch (header.node_type) {
-                    .node4 => {
-                        const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..n4.header.num_children) |i| {
-                            total += count_subtree_keys(&n4.children[i]);
-                        }
-                    },
-                    .node16 => {
-                        const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..n16.header.num_children) |i| {
-                            total += count_subtree_keys(&n16.children[i]);
-                        }
-                    },
-                    .node48 => {
-                        const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..256) |b| {
-                            const idx = n48.child_index[b];
-                            if (idx != Node48.EMPTY_INDEX) {
-                                total += count_subtree_keys(&n48.children[idx]);
-                            }
-                        }
-                    },
-                    .node256 => {
-                        const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..256) |b| {
-                            if (!n256.children[b].is_empty()) {
-                                total += count_subtree_keys(&n256.children[b]);
-                            }
-                        }
-                    },
-                }
+                const Ctx = struct {
+                    total: *usize,
+
+                    fn visit(ctx: @This(), edge_byte: u8, child: *const Node) anyerror!bool {
+                        _ = edge_byte;
+                        ctx.total.* += count_subtree_keys(child);
+                        return true;
+                    }
+                };
+                header.for_each_child(Ctx, .{ .total = &total }, Ctx.visit) catch unreachable;
                 break :blk total;
             },
         };
@@ -695,37 +619,17 @@ pub const Tree = struct {
                 if (header.leaf_value) |lv| {
                     try results.append(allocator, .{ .key = lv.key, .value = lv.value });
                 }
-                switch (header.node_type) {
-                    .node4 => {
-                        const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..n4.header.num_children) |i| {
-                            try collect_all(allocator, &n4.children[i], results);
-                        }
-                    },
-                    .node16 => {
-                        const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..n16.header.num_children) |i| {
-                            try collect_all(allocator, &n16.children[i], results);
-                        }
-                    },
-                    .node48 => {
-                        const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..256) |b| {
-                            const idx = n48.child_index[b];
-                            if (idx != Node48.EMPTY_INDEX) {
-                                try collect_all(allocator, &n48.children[idx], results);
-                            }
-                        }
-                    },
-                    .node256 => {
-                        const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..256) |b| {
-                            if (!n256.children[b].is_empty()) {
-                                try collect_all(allocator, &n256.children[b], results);
-                            }
-                        }
-                    },
-                }
+                const Ctx = struct {
+                    allocator: std.mem.Allocator,
+                    results: *std.ArrayList(ScanEntry),
+
+                    fn visit(ctx: @This(), edge_byte: u8, child: *const Node) anyerror!bool {
+                        _ = edge_byte;
+                        try collect_all(ctx.allocator, child, ctx.results);
+                        return true;
+                    }
+                };
+                try header.for_each_child(Ctx, .{ .allocator = allocator, .results = results }, Ctx.visit);
             },
         }
     }
@@ -783,12 +687,7 @@ pub const Tree = struct {
 
                     // Follow the next byte of the prefix into the child
                     const byte = prefix[depth];
-                    const child = switch (header.node_type) {
-                        .node4 => @as(*const Node4, @alignCast(@fieldParentPtr("header", header))).find_child(byte),
-                        .node16 => @as(*const Node16, @alignCast(@fieldParentPtr("header", header))).find_child(byte),
-                        .node48 => @as(*const Node48, @alignCast(@fieldParentPtr("header", header))).find_child(byte),
-                        .node256 => @as(*const Node256, @alignCast(@fieldParentPtr("header", header))).find_child(byte),
-                    };
+                    const child = header.find_child(byte);
                     if (child) |c| {
                         current = c;
                         depth += 1;
@@ -1138,38 +1037,33 @@ pub const Tree = struct {
         results: *std.ArrayList(ScanEntry),
         max_items: usize,
     ) anyerror!bool {
-        switch (header.node_type) {
-            .node4 => {
-                const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", header)));
-                for (0..n4.header.num_children) |i| {
-                    if (!try collect_matching_limited_no_cursor(&n4.children[i], prefix, allocator, results, max_items)) return false;
+        const Ctx = struct {
+            prefix: []const u8,
+            allocator: std.mem.Allocator,
+            results: *std.ArrayList(ScanEntry),
+            max_items: usize,
+            stopped: *bool,
+
+            fn visit(ctx: @This(), edge_byte: u8, child: *const Node) anyerror!bool {
+                _ = edge_byte;
+                const cont = try collect_matching_limited_no_cursor(child, ctx.prefix, ctx.allocator, ctx.results, ctx.max_items);
+                if (!cont) {
+                    ctx.stopped.* = true;
+                    return false;
                 }
-            },
-            .node16 => {
-                const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", header)));
-                for (0..n16.header.num_children) |i| {
-                    if (!try collect_matching_limited_no_cursor(&n16.children[i], prefix, allocator, results, max_items)) return false;
-                }
-            },
-            .node48 => {
-                const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", header)));
-                for (0..256) |b| {
-                    const idx = n48.child_index[b];
-                    if (idx != Node48.EMPTY_INDEX) {
-                        if (!try collect_matching_limited_no_cursor(&n48.children[idx], prefix, allocator, results, max_items)) return false;
-                    }
-                }
-            },
-            .node256 => {
-                const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
-                for (0..256) |b| {
-                    if (!n256.children[b].is_empty()) {
-                        if (!try collect_matching_limited_no_cursor(&n256.children[b], prefix, allocator, results, max_items)) return false;
-                    }
-                }
-            },
-        }
-        return true;
+                return true;
+            }
+        };
+
+        var stopped = false;
+        try header.for_each_child(Ctx, .{
+            .prefix = prefix,
+            .allocator = allocator,
+            .results = results,
+            .max_items = max_items,
+            .stopped = &stopped,
+        }, Ctx.visit);
+        return !stopped;
     }
 
     /// Checks if a given key is lexicographically strictly greater than the cursor.
@@ -1293,41 +1187,17 @@ pub const Tree = struct {
     ///
     /// Allocator: Does not allocate directly.
     fn range_walk_children_no_cursor(header: *const NodeHeader, state: *RangeWalkState) anyerror!void {
-        switch (header.node_type) {
-            .node4 => {
-                const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", header)));
-                for (0..n4.header.num_children) |i| {
-                    if (state.stop) return;
-                    try range_walk_node(&n4.children[i], state);
-                }
-            },
-            .node16 => {
-                const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", header)));
-                for (0..n16.header.num_children) |i| {
-                    if (state.stop) return;
-                    try range_walk_node(&n16.children[i], state);
-                }
-            },
-            .node48 => {
-                const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", header)));
-                for (0..256) |b| {
-                    if (state.stop) return;
-                    const idx = n48.child_index[b];
-                    if (idx != Node48.EMPTY_INDEX) {
-                        try range_walk_node(&n48.children[idx], state);
-                    }
-                }
-            },
-            .node256 => {
-                const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
-                for (0..256) |b| {
-                    if (state.stop) return;
-                    if (!n256.children[b].is_empty()) {
-                        try range_walk_node(&n256.children[b], state);
-                    }
-                }
-            },
-        }
+        const Ctx = struct {
+            state: *RangeWalkState,
+
+            fn visit(ctx: @This(), edge_byte: u8, child: *const Node) anyerror!bool {
+                _ = edge_byte;
+                try range_walk_node(child, ctx.state);
+                return !ctx.state.stop;
+            }
+        };
+
+        try header.for_each_child(Ctx, .{ .state = state }, Ctx.visit);
     }
 
     /// Shared traversal that seeks to the lower bound before visiting matching descendants.
@@ -1464,37 +1334,19 @@ pub const Tree = struct {
                     try visit(ctx, leaf.key, leaf.value);
                     visited.* += 1;
                 }
-                switch (header.node_type) {
-                    .node4 => {
-                        const n4 = @as(*const Node4, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..n4.header.num_children) |i| {
-                            try visit_node_all(&n4.children[i], ctx, visit, visited);
-                        }
-                    },
-                    .node16 => {
-                        const n16 = @as(*const Node16, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..n16.header.num_children) |i| {
-                            try visit_node_all(&n16.children[i], ctx, visit, visited);
-                        }
-                    },
-                    .node48 => {
-                        const n48 = @as(*const Node48, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..256) |b| {
-                            const idx = n48.child_index[b];
-                            if (idx != Node48.EMPTY_INDEX) {
-                                try visit_node_all(&n48.children[idx], ctx, visit, visited);
-                            }
-                        }
-                    },
-                    .node256 => {
-                        const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
-                        for (0..256) |b| {
-                            if (!n256.children[b].is_empty()) {
-                                try visit_node_all(&n256.children[b], ctx, visit, visited);
-                            }
-                        }
-                    },
-                }
+                const Ctx = struct {
+                    ctx: *anyopaque,
+                    visit: VisitFn,
+                    visited: *usize,
+
+                    fn visit_child(local: @This(), edge_byte: u8, child: *const Node) anyerror!bool {
+                        _ = edge_byte;
+                        try visit_node_all(child, local.ctx, local.visit, local.visited);
+                        return true;
+                    }
+                };
+
+                try header.for_each_child(Ctx, .{ .ctx = ctx, .visit = visit, .visited = visited }, Ctx.visit_child);
             },
         }
     }

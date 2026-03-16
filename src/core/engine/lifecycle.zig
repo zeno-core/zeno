@@ -165,6 +165,27 @@ pub fn checkpoint(db: *Database) EngineError!void {
     db.state.record_successful_checkpoint(checkpoint_timer.read(), checkpoint_lsn);
 }
 
+/// Rebuilds runtime-owned shard storage from a fresh checkpoint snapshot to reclaim arena-retained churn.
+///
+/// Time Complexity: O(s + n + m), where:
+///  - `s` is the runtime shard count
+///  - `n` is snapshot serialization plus load work
+///  - `m` is WAL compaction scan and rewrite work when durability is enabled.
+///
+/// Allocator: Uses `db.allocator` for snapshot write and load scratch.
+///
+/// Ownership: Returns `error.NoSnapshotPath` when `snapshot_path` was not configured for this engine handle.
+///
+/// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle. Follows the same checkpoint barrier semantics and may return `error.CheckpointBusy` when active `ReadView` handles block the barrier.
+pub fn compact_memory(db: *Database) EngineError!void {
+    const snapshot_path = db.state.snapshot_path orelse return error.NoSnapshotPath;
+    try checkpoint(db);
+
+    _ = storage_snapshot.load(&db.state, db.allocator, snapshot_path) catch |err| {
+        return error_mod.map_persistence_error(err);
+    };
+}
+
 /// Installs one test-only probe for the checkpoint barrier.
 ///
 /// Time Complexity: O(1).
@@ -296,7 +317,7 @@ fn replay_put(ctx: *anyopaque, key: []const u8, value: *const Value) !void {
     shard.lock.lock();
     defer shard.lock.unlock();
 
-    try internal_mutate.upsert_value_unlocked(shard, key, value);
+    _ = try internal_mutate.upsert_value_unlocked(shard, key, value);
     internal_ttl_index.clear_ttl_entry(shard, key);
 }
 

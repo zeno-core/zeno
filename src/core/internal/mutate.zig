@@ -74,7 +74,7 @@ pub fn upsert_value_unlocked(
     shard: *runtime_shard.Shard,
     key: []const u8,
     value: *const types.Value,
-) !void {
+) !bool {
     if (shard.tree.find_leaf_for_exact_key(key)) |leaf| {
         const arena_allocator = shard.arena.allocator();
         const cloned_value = try arena_allocator.create(types.Value);
@@ -87,7 +87,7 @@ pub fn upsert_value_unlocked(
         if (previous_owner == .heap_allocation) {
             free_heap_value(shard.base_allocator, previous_value);
         }
-        return;
+        return true;
     }
 
     const arena_allocator = shard.arena.allocator();
@@ -98,6 +98,7 @@ pub fn upsert_value_unlocked(
         error.OutOfMemory => return error.OutOfMemory,
         error.TreeFull, error.InvalidNodeGrowth, error.InvalidNodeType => unreachable,
     };
+    return false;
 }
 
 /// Removes one stored key/value pair when present.

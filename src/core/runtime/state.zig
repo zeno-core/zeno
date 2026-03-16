@@ -15,6 +15,7 @@ pub const NUM_SHARDS: usize = runtime_shard.NUM_SHARDS;
 /// Immutable snapshot of runtime-local metrics counters.
 pub const StatsCounters = struct {
     ops_put_total: u64,
+    overwrites_total: u64,
     ops_get_total: u64,
     ops_delete_total: u64,
     ops_scan_total: u64,
@@ -30,11 +31,24 @@ pub const StatsCounters = struct {
     checkpoint_duration_last_ms: u64,
     checkpoint_lsn_last: u64,
     snapshot_corruption_fallback_total: u64,
+
+    /// Creates a point-in-time snapshot of all runtime counters.
+    pub fn fromRuntime(counters: *const RuntimeCounters) StatsCounters {
+        var result: StatsCounters = undefined;
+
+        inline for (std.meta.fields(StatsCounters)) |field| {
+            @field(result, field.name) =
+                @field(counters.*, field.name).load(.monotonic);
+        }
+
+        return result;
+    }
 };
 
 /// Runtime counters kept local to engine state.
 pub const RuntimeCounters = struct {
     ops_put_total: std.atomic.Value(u64),
+    overwrites_total: std.atomic.Value(u64),
     ops_get_total: std.atomic.Value(u64),
     ops_delete_total: std.atomic.Value(u64),
     ops_scan_total: std.atomic.Value(u64),
@@ -51,31 +65,20 @@ pub const RuntimeCounters = struct {
     checkpoint_lsn_last: std.atomic.Value(u64),
     snapshot_corruption_fallback_total: std.atomic.Value(u64),
 
+    /// Initializes all runtime counters to zero.
     fn init() RuntimeCounters {
-        return .{
-            .ops_put_total = std.atomic.Value(u64).init(0),
-            .ops_get_total = std.atomic.Value(u64).init(0),
-            .ops_delete_total = std.atomic.Value(u64).init(0),
-            .ops_scan_total = std.atomic.Value(u64).init(0),
-            .ops_expire_total = std.atomic.Value(u64).init(0),
-            .latency_lt_1us_total = std.atomic.Value(u64).init(0),
-            .latency_lt_10us_total = std.atomic.Value(u64).init(0),
-            .latency_lt_100us_total = std.atomic.Value(u64).init(0),
-            .latency_lt_1ms_total = std.atomic.Value(u64).init(0),
-            .latency_ge_1ms_total = std.atomic.Value(u64).init(0),
-            .latency_samples_total = std.atomic.Value(u64).init(0),
-            .checkpoint_count_total = std.atomic.Value(u64).init(0),
-            .checkpoint_busy_total = std.atomic.Value(u64).init(0),
-            .checkpoint_duration_last_ms = std.atomic.Value(u64).init(0),
-            .checkpoint_lsn_last = std.atomic.Value(u64).init(0),
-            .snapshot_corruption_fallback_total = std.atomic.Value(u64).init(0),
-        };
+        var counters: RuntimeCounters = undefined;
+        inline for (std.meta.fields(RuntimeCounters)) |field| {
+            @field(counters, field.name) = @TypeOf(@field(counters, field.name)).init(0);
+        }
+        return counters;
     }
 };
 
 /// Operation counters tracked at the engine boundary.
 pub const OperationKind = enum {
     put,
+    overwrite,
     get,
     delete,
     scan,
@@ -167,24 +170,7 @@ pub const DatabaseState = struct {
     ///
     /// Thread Safety: Reads shared counter state through atomic loads with monotonic ordering.
     pub fn stats_snapshot(self: *const DatabaseState) StatsCounters {
-        return .{
-            .ops_put_total = self.counters.ops_put_total.load(.monotonic),
-            .ops_get_total = self.counters.ops_get_total.load(.monotonic),
-            .ops_delete_total = self.counters.ops_delete_total.load(.monotonic),
-            .ops_scan_total = self.counters.ops_scan_total.load(.monotonic),
-            .ops_expire_total = self.counters.ops_expire_total.load(.monotonic),
-            .latency_lt_1us_total = self.counters.latency_lt_1us_total.load(.monotonic),
-            .latency_lt_10us_total = self.counters.latency_lt_10us_total.load(.monotonic),
-            .latency_lt_100us_total = self.counters.latency_lt_100us_total.load(.monotonic),
-            .latency_lt_1ms_total = self.counters.latency_lt_1ms_total.load(.monotonic),
-            .latency_ge_1ms_total = self.counters.latency_ge_1ms_total.load(.monotonic),
-            .latency_samples_total = self.counters.latency_samples_total.load(.monotonic),
-            .checkpoint_count_total = self.counters.checkpoint_count_total.load(.monotonic),
-            .checkpoint_busy_total = self.counters.checkpoint_busy_total.load(.monotonic),
-            .checkpoint_duration_last_ms = self.counters.checkpoint_duration_last_ms.load(.monotonic),
-            .checkpoint_lsn_last = self.counters.checkpoint_lsn_last.load(.monotonic),
-            .snapshot_corruption_fallback_total = self.counters.snapshot_corruption_fallback_total.load(.monotonic),
-        };
+        return StatsCounters.fromRuntime(&self.counters);
     }
 
     /// Records one completed engine operation when the selected metrics mode enables counters.
@@ -200,6 +186,7 @@ pub const DatabaseState = struct {
 
         switch (kind) {
             .put => _ = @constCast(&self.counters.ops_put_total).fetchAdd(count, .monotonic),
+            .overwrite => _ = @constCast(&self.counters.overwrites_total).fetchAdd(count, .monotonic),
             .get => _ = @constCast(&self.counters.ops_get_total).fetchAdd(count, .monotonic),
             .delete => _ = @constCast(&self.counters.ops_delete_total).fetchAdd(count, .monotonic),
             .scan => _ = @constCast(&self.counters.ops_scan_total).fetchAdd(count, .monotonic),
@@ -371,6 +358,7 @@ test "database state metrics start at zero" {
 
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 0), snapshot.ops_put_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwrites_total);
     try testing.expectEqual(@as(u64, 0), snapshot.ops_get_total);
     try testing.expectEqual(@as(u64, 0), snapshot.ops_delete_total);
     try testing.expectEqual(@as(u64, 0), snapshot.ops_scan_total);
@@ -392,10 +380,12 @@ test "database state metrics disabled mode skips counters and latency" {
     defer state.deinit();
 
     state.record_operation(.put, 4);
+    state.record_operation(.overwrite, 2);
     state.record_latency_sample(500);
 
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 0), snapshot.ops_put_total);
+    try testing.expectEqual(@as(u64, 0), snapshot.overwrites_total);
     try testing.expectEqual(@as(u64, 0), snapshot.latency_samples_total);
 }
 
@@ -408,11 +398,13 @@ test "database state metrics counters only mode updates ops without latency" {
     defer state.deinit();
 
     state.record_operation(.put, 2);
+    state.record_operation(.overwrite, 3);
     state.record_operation(.scan, 1);
     state.record_latency_sample(2 * std.time.ns_per_ms);
 
     const snapshot = state.stats_snapshot();
     try testing.expectEqual(@as(u64, 2), snapshot.ops_put_total);
+    try testing.expectEqual(@as(u64, 3), snapshot.overwrites_total);
     try testing.expectEqual(@as(u64, 1), snapshot.ops_scan_total);
     try testing.expectEqual(@as(u64, 0), snapshot.latency_samples_total);
 }
@@ -458,6 +450,7 @@ test "database state full metrics snapshot reflects latency checkpoint and fallb
     state.record_snapshot_corruption_fallback();
 
     const snapshot = state.stats_snapshot();
+    try testing.expectEqual(@as(u64, 0), snapshot.overwrites_total);
     try testing.expectEqual(@as(u64, 1), snapshot.latency_lt_1us_total);
     try testing.expectEqual(@as(u64, 1), snapshot.latency_lt_10us_total);
     try testing.expectEqual(@as(u64, 1), snapshot.latency_lt_100us_total);

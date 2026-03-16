@@ -37,9 +37,10 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
     defer shard.lock.unlock();
 
     try durability.append_put_if_enabled(state, key, value);
-    try internal_mutate.upsert_value_unlocked(shard, key, value);
+    const overwritten = try internal_mutate.upsert_value_unlocked(shard, key, value);
     internal_ttl_index.clear_ttl_entry(shard, key);
     state.record_operation(.put, 1);
+    if (overwritten) state.record_operation(.overwrite, 1);
 }
 
 /// Applies multiple plain key/value writes as independent standalone mutations.
@@ -69,6 +70,7 @@ pub fn put_group(state: *runtime_state.DatabaseState, writes: []const types.PutW
     try durability.append_put_group_if_enabled(state, wal_writes);
 
     var applied: u64 = 0;
+    var overwritten: u64 = 0;
     for (0..runtime_shard.NUM_SHARDS) |shard_idx| {
         if (!touched.isSet(shard_idx)) continue;
 
@@ -78,7 +80,9 @@ pub fn put_group(state: *runtime_state.DatabaseState, writes: []const types.PutW
 
         for (writes) |write_entry| {
             if (runtime_shard.get_shard_index(write_entry.key) != shard_idx) continue;
-            try internal_mutate.upsert_value_unlocked(shard, write_entry.key, write_entry.value);
+            if (try internal_mutate.upsert_value_unlocked(shard, write_entry.key, write_entry.value)) {
+                overwritten += 1;
+            }
             internal_ttl_index.clear_ttl_entry(shard, write_entry.key);
             applied += 1;
         }
@@ -89,6 +93,7 @@ pub fn put_group(state: *runtime_state.DatabaseState, writes: []const types.PutW
 
     if (applied != @as(u64, @intCast(writes.len))) unreachable;
     state.record_operation(.put, applied);
+    state.record_operation(.overwrite, overwritten);
 }
 
 /// Deletes one plain key/value pair when present.

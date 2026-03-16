@@ -58,6 +58,24 @@ pub const Database = struct {
         return metrics.call_with_latency(&self.state, lifecycle.checkpoint, .{self});
     }
 
+    /// Rebuilds runtime shard storage from a fresh snapshot checkpoint to reclaim retained arena churn.
+    ///
+    /// Time Complexity: O(s + n + m), where:
+    ///  - `s` is the runtime shard count,
+    ///  - `n` is snapshot serialization plus load work
+    ///  - `m` is WAL compaction scan and rewrite work when durability is enabled.
+    ///
+    /// Allocator: Uses explicit allocator paths for snapshot write and load scratch.
+    ///
+    /// Ownership: Returns `error.NoSnapshotPath` when `snapshot_path` was not configured for this engine handle.
+    ///
+    /// Thread Safety: Not safe to call concurrently with other mutation of the same engine handle.
+    /// Follows checkpoint barrier semantics and may return `error.CheckpointBusy` when active
+    /// `ReadView` handles block the barrier.
+    pub fn compact_memory(self: *Database) EngineError!void {
+        return metrics.call_with_latency(&self.state, lifecycle.compact_memory, .{self});
+    }
+
     /// Reads one key from the engine contract surface.
     ///
     /// Time Complexity: O(n + k + v), where `n` is `key.len` for shard routing, `k` is ART lookup work, and `v` is cloned value size when the key exists.
@@ -731,6 +749,17 @@ test "checkpoint without a configured snapshot path returns no snapshot path" {
     try testing.expectEqual(@as(u64, 0), stats.checkpoint_lsn_last);
 }
 
+test "compact memory without a configured snapshot path returns no snapshot path" {
+    const testing = std.testing;
+
+    const db = try open(testing.allocator, .{
+        .metrics = .{ .mode = .full },
+    });
+    defer db.close() catch unreachable;
+
+    try testing.expectError(error.NoSnapshotPath, db.compact_memory());
+}
+
 test "checkpoint writes a snapshot and reopens the same visible state" {
     const testing = std.testing;
 
@@ -812,6 +841,46 @@ test "checkpoint preserves post-snapshot wal delta on reopen" {
     var beta = (try reopened.get(testing.allocator, "beta")).?;
     defer beta.deinit(testing.allocator);
     try testing.expectEqual(@as(i64, 2), beta.integer);
+}
+
+test "compact memory preserves visible state and reclaims committed arenas" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try alloc_tmp_path_test(testing.allocator, tmp, "compact-memory.snapshot");
+    defer testing.allocator.free(snapshot_path);
+
+    const db = try open(testing.allocator, .{
+        .snapshot_path = snapshot_path,
+    });
+    defer db.close() catch unreachable;
+
+    const write_count: usize = 64;
+    var values: [write_count]types.Value = undefined;
+    var writes: [write_count]types.PutWrite = undefined;
+    var key_storage: [write_count][24]u8 = undefined;
+
+    for (0..writes.len) |index| {
+        values[index] = .{ .integer = @intCast(index) };
+        const key = try std.fmt.bufPrint(&key_storage[index], "compact:{d:0>4}", .{index});
+        writes[index] = .{ .key = key, .value = &values[index] };
+    }
+
+    try db.apply_batch(&writes);
+    try testing.expect(total_committed_arenas_for_test(db) > 0);
+
+    try db.compact_memory();
+
+    try testing.expectEqual(@as(usize, 0), total_committed_arenas_for_test(db));
+    const stats = db.state.stats_snapshot();
+    try testing.expectEqual(@as(u64, 1), stats.checkpoint_count_total);
+    try testing.expectEqual(@as(u64, 0), stats.checkpoint_busy_total);
+
+    var sample = (try db.get(testing.allocator, "compact:0001")).?;
+    defer sample.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 1), sample.integer);
 }
 
 test "engine boundary latency sampling records one sample per call including errors" {
@@ -1066,6 +1135,8 @@ test "put overwrites existing plain value" {
     defer stored.deinit(testing.allocator);
 
     try testing.expectEqualStrings("updated", stored.string);
+    try testing.expectEqual(@as(u64, 2), db.state.stats_snapshot().ops_put_total);
+    try testing.expectEqual(@as(u64, 1), db.state.stats_snapshot().overwrites_total);
 }
 
 test "put leaves state unchanged when wal append fails" {
@@ -1335,6 +1406,30 @@ test "checkpoint returns busy while a read view holds global visibility gates" {
     defer view.deinit();
 
     try testing.expectError(error.CheckpointBusy, db.checkpoint());
+
+    const stats = db.state.stats_snapshot();
+    try testing.expectEqual(@as(u64, 1), stats.checkpoint_busy_total);
+    try testing.expectEqual(@as(u64, 0), stats.checkpoint_count_total);
+}
+
+test "compact memory returns busy while a read view holds global visibility gates" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const snapshot_path = try alloc_tmp_path_test(testing.allocator, tmp, "compact-memory-busy.snapshot");
+    defer testing.allocator.free(snapshot_path);
+
+    const db = try open(testing.allocator, .{
+        .snapshot_path = snapshot_path,
+    });
+    defer db.close() catch unreachable;
+
+    var view = try db.read_view();
+    defer view.deinit();
+
+    try testing.expectError(error.CheckpointBusy, db.compact_memory());
 
     const stats = db.state.stats_snapshot();
     try testing.expectEqual(@as(u64, 1), stats.checkpoint_busy_total);

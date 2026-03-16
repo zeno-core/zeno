@@ -17,6 +17,7 @@ const scan_large_item_count: usize = 4096;
 const scan_page_item_count: usize = 64;
 const batch_item_count: usize = 64;
 const batch_key_storage_bytes: usize = 32;
+const put_overwrite_key_cardinality: usize = 64;
 const put_group_item_count: usize = 16;
 const wal_group_item_count: usize = 16;
 const wal_group_keys = [_][]const u8{
@@ -51,6 +52,7 @@ var steady_checked_batch_overwrite_db: ?*engine.Database = null;
 var steady_checked_batch_insert_db: ?*engine.Database = null;
 var steady_batch_insert_seed = std.atomic.Value(usize).init(0);
 var steady_checked_batch_insert_seed = std.atomic.Value(usize).init(0);
+var steady_put_overwrite_seed = std.atomic.Value(usize).init(0);
 
 var steady_art_tree: ?internal.art.Tree = null;
 var steady_wal: ?internal.wal.Wal = null;
@@ -110,6 +112,19 @@ const PutSteadyBenchmark = struct {
         const db = steady_put_db orelse unreachable;
         const value = types.Value{ .integer = 2 };
         db.put("bench:put", &value) catch unreachable;
+    }
+};
+
+const PutSteadyOverwriteCardinalityBenchmark = struct {
+    pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
+        _ = allocator;
+        const db = steady_put_db orelse unreachable;
+        const key_index = steady_put_overwrite_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
+
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "bench:put:ovr:{d:0>2}", .{key_index}) catch unreachable;
+        const value = types.Value{ .integer = @intCast(key_index) };
+        db.put(key, &value) catch unreachable;
     }
 };
 
@@ -408,6 +423,18 @@ fn print_throughput_summary(
             const db = steady_put_db orelse unreachable;
             const value = types.Value{ .integer = 2 };
             db.put("bench:put", &value) catch unreachable;
+        }
+    }.run, allocator);
+
+    try run_and_print_throughput(writer, "put overwrite64 steady", iterations, 1, struct {
+        fn run(_: std.mem.Allocator) void {
+            const db = steady_put_db orelse unreachable;
+            const key_index = steady_put_overwrite_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
+
+            var key_buf: [32]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "bench:put:ovr:{d:0>2}", .{key_index}) catch unreachable;
+            const value = types.Value{ .integer = @intCast(key_index) };
+            db.put(key, &value) catch unreachable;
         }
     }.run, allocator);
 
@@ -909,6 +936,7 @@ fn run_bench_suite(
 
     const put_fresh = PutFreshBenchmark{};
     const put_steady = PutSteadyBenchmark{};
+    const put_steady_overwrite_cardinality = PutSteadyOverwriteCardinalityBenchmark{};
     const put_group_steady = PutGroupSteadyBenchmark{};
     const get_existing = GetExistingBenchmark{};
     const get_existing_steady = GetExistingSteadyBenchmark{};
@@ -926,6 +954,7 @@ fn run_bench_suite(
 
     try stable_bench.addParam("put isolated", &put_fresh, .{});
     try stable_bench.addParam("put steady", &put_steady, .{});
+    try stable_bench.addParam("put overwrite64 steady", &put_steady_overwrite_cardinality, .{});
     try stable_bench.addParam("put_group16 steady", &put_group_steady, .{});
     try stable_bench.addParam("get isolated", &get_existing, .{});
     try stable_bench.addParam("get steady", &get_existing_steady, .{});
@@ -982,6 +1011,14 @@ fn init_steady_state_benches() !void {
     {
         const value = types.Value{ .integer = 1 };
         try steady_put_db.?.put("bench:put", &value);
+
+        var key_buf: [32]u8 = undefined;
+        for (0..put_overwrite_key_cardinality) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovr:{d:0>2}", .{i});
+            const overwrite_value = types.Value{ .integer = @intCast(i) };
+            try steady_put_db.?.put(key, &overwrite_value);
+        }
+        steady_put_overwrite_seed.store(0, .monotonic);
     }
 
     steady_get_db = try open_bench_db(std.heap.page_allocator);

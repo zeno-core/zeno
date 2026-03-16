@@ -18,6 +18,8 @@ const scan_page_item_count: usize = 64;
 const batch_item_count: usize = 64;
 const batch_key_storage_bytes: usize = 32;
 const put_overwrite_key_cardinality: usize = 64;
+const put_steady_key_cardinality: usize = 1_000;
+const get_steady_key_cardinality: usize = 1_000;
 const heavy_overwrite_payload_bytes: usize = 1024;
 const heavy_overwrite_manual_compact_interval: usize = 1024;
 const put_group_item_count: usize = 16;
@@ -54,6 +56,8 @@ var steady_batch_overwrite_db: ?*engine.Database = null;
 var steady_batch_insert_db: ?*engine.Database = null;
 var steady_checked_batch_overwrite_db: ?*engine.Database = null;
 var steady_checked_batch_insert_db: ?*engine.Database = null;
+var steady_put_uniform_seed = std.atomic.Value(usize).init(0);
+var steady_get_uniform_seed = std.atomic.Value(usize).init(0);
 var steady_batch_insert_seed = std.atomic.Value(usize).init(0);
 var steady_checked_batch_insert_seed = std.atomic.Value(usize).init(0);
 var steady_put_overwrite_seed = std.atomic.Value(usize).init(0);
@@ -61,6 +65,8 @@ var steady_put_overwrite_heavy_seed = std.atomic.Value(usize).init(0);
 var steady_put_overwrite_heavy_manual_seed = std.atomic.Value(usize).init(0);
 var steady_put_overwrite_heavy_manual_ops = std.atomic.Value(usize).init(0);
 var steady_get_ttl_mixed_seed = std.atomic.Value(usize).init(0);
+var art_lookup_seed = std.atomic.Value(usize).init(0);
+var art_insert_seed = std.atomic.Value(usize).init(0);
 
 var steady_art_tree: ?internal.art.Tree = null;
 var steady_wal: ?internal.wal.Wal = null;
@@ -128,8 +134,11 @@ const PutSteadyBenchmark = struct {
     pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
         _ = allocator;
         const db = steady_put_db orelse unreachable;
-        const value = types.Value{ .integer = 2 };
-        db.put("bench:put", &value) catch unreachable;
+        const key_index = steady_put_uniform_seed.fetchAdd(1, .monotonic) % put_steady_key_cardinality;
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "bench:put:uniform:{d:0>4}", .{key_index}) catch unreachable;
+        const value = types.Value{ .integer = @intCast(key_index) };
+        db.put(key, &value) catch unreachable;
     }
 };
 
@@ -220,7 +229,10 @@ const GetExistingBenchmark = struct {
 const GetExistingSteadyBenchmark = struct {
     pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
         const db = steady_get_db orelse unreachable;
-        var stored = (db.get(allocator, "bench:get") catch unreachable).?;
+        const key_index = steady_get_uniform_seed.fetchAdd(1, .monotonic) % get_steady_key_cardinality;
+        var key_buf: [32]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "bench:get:uniform:{d:0>4}", .{key_index}) catch unreachable;
+        var stored = (db.get(allocator, key) catch unreachable).?;
         defer stored.deinit(allocator);
         std.mem.doNotOptimizeAway(stored.integer);
     }
@@ -405,7 +417,10 @@ const ArtLookupBenchmark = struct {
     pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
         _ = allocator;
         const tree = if (steady_art_tree) |*t| t else unreachable;
-        const value = tree.lookup("scan:0000") orelse unreachable;
+        const idx = art_lookup_seed.fetchAdd(1, .monotonic) % scan_item_count;
+        var key_buf: [16]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "scan:{d:0>4}", .{idx}) catch unreachable;
+        const value = tree.lookup(key) orelse unreachable;
         std.mem.doNotOptimizeAway(value.integer);
     }
 };
@@ -414,9 +429,11 @@ const ArtInsertBenchmark = struct {
     pub fn run(_: *const @This(), allocator: std.mem.Allocator) void {
         _ = allocator;
         const tree = if (steady_art_tree) |*t| t else unreachable;
-        var value = types.Value{ .integer = 999 };
-        // Overwrite existing key to stay steady state
-        tree.insert("scan:0000", &value) catch unreachable;
+        const idx = art_insert_seed.fetchAdd(1, .monotonic);
+        var key_buf: [24]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "art:ins:{d:0>8}", .{idx}) catch unreachable;
+        var value = types.Value{ .integer = @intCast(idx % 1_000_000) };
+        tree.insert(key, &value) catch unreachable;
     }
 };
 
@@ -479,6 +496,7 @@ pub fn main() !void {
         try run_bench_suite(allocator, &stdout.interface, cli_config.metrics_config);
         try print_throughput_summary(allocator, &stdout.interface, cli_config.metrics_config);
         try run_scaling_benchmarks(allocator, &stdout.interface);
+        try run_heavy_overwrite_profile(&stdout.interface, cli_config.metrics_config);
     }
 
     try stdout.interface.flush();
@@ -493,23 +511,30 @@ fn print_throughput_summary(
     try init_steady_state_benches();
     defer deinit_steady_state_benches();
 
-    try writer.print("\nThroughput Summary (Approximate)\n", .{});
+    const warmup_iterations: usize = 2_000;
+    const iterations: usize = 100_000;
+
+    try writer.print("\nThroughput Summary\n", .{});
+    try writer.print(
+        "conditions: {d} keys rotating, {d} warmup + {d} measured iters, WAL=batched_async, in-memory\n",
+        .{ put_steady_key_cardinality, warmup_iterations, iterations },
+    );
     try writer.print("--------------------------------------------------------------------------------\n", .{});
-    try writer.print("{s: <30} | {s: <15} | {s: <15}\n", .{ "Benchmark", "Mean Latency", "Throughput" });
+    try writer.print("{s: <32} | {s: <33} | {s: <15}\n", .{ "Benchmark", "Latency (p50/p99/max)", "Throughput" });
     try writer.print("--------------------------------------------------------------------------------\n", .{});
 
-    // We run a fixed number of iterations for throughput estimation
-    const iterations = 10_000;
-
-    try run_and_print_throughput(writer, "put steady", iterations, 1, struct {
+    try run_and_print_throughput(writer, "put steady", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const db = steady_put_db orelse unreachable;
-            const value = types.Value{ .integer = 2 };
-            db.put("bench:put", &value) catch unreachable;
+            const key_index = steady_put_uniform_seed.fetchAdd(1, .monotonic) % put_steady_key_cardinality;
+            var key_buf: [32]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "bench:put:uniform:{d:0>4}", .{key_index}) catch unreachable;
+            const value = types.Value{ .integer = @intCast(key_index) };
+            db.put(key, &value) catch unreachable;
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "put overwrite64 steady", iterations, 1, struct {
+    try run_and_print_throughput(writer, "put overwrite64 steady", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const db = steady_put_db orelse unreachable;
             const key_index = steady_put_overwrite_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
@@ -521,7 +546,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "put overwrite64 heavy1k steady", iterations, 1, struct {
+    try run_and_print_throughput(writer, "put overwrite64 heavy1k steady", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const db = steady_put_db orelse unreachable;
             const key_index = steady_put_overwrite_heavy_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
@@ -536,7 +561,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "put overwrite64 heavy1k manual", iterations, 1, struct {
+    try run_and_print_throughput(writer, "put overwrite64 heavy1k manual", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const db = steady_put_heavy_manual_db orelse unreachable;
             const key_index = steady_put_overwrite_heavy_manual_seed.fetchAdd(1, .monotonic) % put_overwrite_key_cardinality;
@@ -557,7 +582,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "put_group16 steady", iterations, put_group_item_count, struct {
+    try run_and_print_throughput(writer, "put_group16 steady", warmup_iterations, iterations, put_group_item_count, struct {
         fn run(_: std.mem.Allocator) void {
             const db = steady_put_db orelse unreachable;
 
@@ -575,16 +600,19 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "get steady", iterations, 1, struct {
+    try run_and_print_throughput(writer, "get steady", warmup_iterations, iterations, 1, struct {
         fn run(alloc: std.mem.Allocator) void {
             const db = steady_get_db orelse unreachable;
-            var stored = (db.get(alloc, "bench:get") catch unreachable).?;
+            const key_index = steady_get_uniform_seed.fetchAdd(1, .monotonic) % get_steady_key_cardinality;
+            var key_buf: [32]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "bench:get:uniform:{d:0>4}", .{key_index}) catch unreachable;
+            var stored = (db.get(alloc, key) catch unreachable).?;
             defer stored.deinit(alloc);
             std.mem.doNotOptimizeAway(stored.integer);
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "get steady ttl-mixed10", iterations, 1, struct {
+    try run_and_print_throughput(writer, "get steady ttl-mixed10", warmup_iterations, iterations, 1, struct {
         fn run(alloc: std.mem.Allocator) void {
             const db = steady_get_ttl_mixed_db orelse unreachable;
             const key_idx = steady_get_ttl_mixed_seed.fetchAdd(1, .monotonic) % 10;
@@ -609,7 +637,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "scan256 steady", 1000, 256, struct {
+    try run_and_print_throughput(writer, "scan256 steady", warmup_iterations, 1000, 256, struct {
         fn run(alloc: std.mem.Allocator) void {
             const db = steady_scan_db orelse unreachable;
             var result = db.scan_prefix(alloc, "scan:") catch unreachable;
@@ -618,7 +646,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "scan4096 steady", 100, 4096, struct {
+    try run_and_print_throughput(writer, "scan4096 steady", warmup_iterations, 100, 4096, struct {
         fn run(alloc: std.mem.Allocator) void {
             const db = steady_scan_large_db orelse unreachable;
             var result = db.scan_prefix(alloc, "scan:") catch unreachable;
@@ -627,7 +655,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "batch64 steady overwrite", 1000, 64, struct {
+    try run_and_print_throughput(writer, "batch64 steady overwrite", warmup_iterations, 1000, 64, struct {
         fn run(_: std.mem.Allocator) void {
             const db = steady_batch_overwrite_db orelse unreachable;
             var values: [batch_item_count]types.Value = undefined;
@@ -638,23 +666,29 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "art lookup", iterations, 1, struct {
+    try run_and_print_throughput(writer, "art lookup", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const tree = if (steady_art_tree) |*t| t else unreachable;
-            const value = tree.lookup("scan:0000") orelse unreachable;
+            const idx = art_lookup_seed.fetchAdd(1, .monotonic) % scan_item_count;
+            var key_buf: [16]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "scan:{d:0>4}", .{idx}) catch unreachable;
+            const value = tree.lookup(key) orelse unreachable;
             std.mem.doNotOptimizeAway(value.integer);
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "art insert", iterations, 1, struct {
+    try run_and_print_throughput(writer, "art insert", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const tree = if (steady_art_tree) |*t| t else unreachable;
-            var value = types.Value{ .integer = 999 };
-            tree.insert("scan:0000", &value) catch unreachable;
+            const idx = art_insert_seed.fetchAdd(1, .monotonic);
+            var key_buf: [24]u8 = undefined;
+            const key = std.fmt.bufPrint(&key_buf, "art:ins:{d:0>8}", .{idx}) catch unreachable;
+            var value = types.Value{ .integer = @intCast(idx % 1_000_000) };
+            tree.insert(key, &value) catch unreachable;
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "wal append", iterations, 1, struct {
+    try run_and_print_throughput(writer, "wal append", warmup_iterations, iterations, 1, struct {
         fn run(_: std.mem.Allocator) void {
             const wal = if (steady_wal) |*w| w else unreachable;
             const value = types.Value{ .integer = 42 };
@@ -662,7 +696,7 @@ fn print_throughput_summary(
         }
     }.run, allocator);
 
-    try run_and_print_throughput(writer, "wal append grouped16", iterations, wal_group_item_count, struct {
+    try run_and_print_throughput(writer, "wal append grouped16", warmup_iterations, iterations, wal_group_item_count, struct {
         fn run(_: std.mem.Allocator) void {
             const wal = if (steady_wal) |*w| w else unreachable;
 
@@ -683,35 +717,57 @@ fn print_throughput_summary(
 fn run_and_print_throughput(
     writer: anytype,
     label: []const u8,
+    warmup_iterations: usize,
     iterations: usize,
     items_per_op: usize,
     func: fn (std.mem.Allocator) void,
     allocator: std.mem.Allocator,
 ) !void {
-    var timer = try std.time.Timer.start();
-    for (0..iterations) |_| {
+    for (0..warmup_iterations) |_| {
         func(allocator);
     }
-    const elapsed = timer.read();
-    const avg_ns = elapsed / iterations;
-    const ops_per_sec = (std.time.ns_per_s * iterations) / elapsed;
+
+    var latencies = try allocator.alloc(u64, iterations);
+    defer allocator.free(latencies);
+
+    var total_elapsed: u128 = 0;
+    for (0..iterations) |i| {
+        var op_timer = try std.time.Timer.start();
+        func(allocator);
+        const op_elapsed = op_timer.read();
+        latencies[i] = op_elapsed;
+        total_elapsed += op_elapsed;
+    }
+
+    std.sort.heap(u64, latencies, {}, comptime std.sort.asc(u64));
+
+    const p50 = latencies[(iterations * 50) / 100];
+    const p99 = latencies[(iterations * 99) / 100];
+    const max = latencies[iterations - 1];
+
+    const safe_total_elapsed = if (total_elapsed == 0) @as(u128, 1) else total_elapsed;
+    const ops_per_sec = (@as(u128, std.time.ns_per_s) * iterations) / safe_total_elapsed;
     const items_per_sec = ops_per_sec * items_per_op;
 
-    var buf: [32]u8 = undefined;
-    const latency_text = if (avg_ns < 1000)
-        try std.fmt.bufPrint(&buf, "{d} ns", .{avg_ns})
-    else
-        try std.fmt.bufPrint(&buf, "{d:.2} us", .{@as(f64, @floatFromInt(avg_ns)) / 1000.0});
+    var p50_buf: [24]u8 = undefined;
+    var p99_buf: [24]u8 = undefined;
+    var max_buf: [24]u8 = undefined;
+    var latency_summary_buf: [96]u8 = undefined;
+
+    const p50_text = try format_ns_short(&p50_buf, p50);
+    const p99_text = try format_ns_short(&p99_buf, p99);
+    const max_text = try format_ns_short(&max_buf, max);
+    const latency_text = try std.fmt.bufPrint(&latency_summary_buf, "p50={s} p99={s} max={s}", .{ p50_text, p99_text, max_text });
 
     if (items_per_op > 1) {
-        try writer.print("{s: <30} | {s: <15} | {d:.2}M items/sec ({d:.2}M ops/sec)\n", .{
+        try writer.print("{s: <32} | {s: <33} | {d:.2}M items/sec ({d:.2}M ops/sec)\n", .{
             label,
             latency_text,
             @as(f64, @floatFromInt(items_per_sec)) / 1_000_000.0,
             @as(f64, @floatFromInt(ops_per_sec)) / 1_000_000.0,
         });
     } else {
-        try writer.print("{s: <30} | {s: <15} | {d:.2}M ops/sec\n", .{
+        try writer.print("{s: <32} | {s: <33} | {d:.2}M ops/sec\n", .{
             label,
             latency_text,
             @as(f64, @floatFromInt(ops_per_sec)) / 1_000_000.0,
@@ -721,10 +777,23 @@ fn run_and_print_throughput(
 
 const ScalingBenchmarkType = enum { get, put };
 
+const ScalingContention = enum {
+    /// Each thread targets a distinct shard (best case).
+    none,
+    /// All threads target the same key (worst case).
+    hotspot,
+    /// Shared 10k-key keyspace with uniform access (realistic case).
+    uniform,
+};
+
+const scaling_uniform_keyspace: usize = 10_000;
+
 const ScalingWorkerContext = struct {
     db: *engine.Database,
     op: ScalingBenchmarkType,
-    key: []const u8,
+    contention: ScalingContention,
+    key: ?[]const u8,
+    uniform_seed: ?*std.atomic.Value(usize),
     iterations: usize,
 };
 
@@ -735,16 +804,41 @@ fn scaling_worker(ctx: ScalingWorkerContext) void {
 
     const value = types.Value{ .integer = 123 };
 
-    if (ctx.op == .put) {
-        for (0..ctx.iterations) |_| {
-            ctx.db.put(ctx.key, &value) catch unreachable;
-        }
-    } else {
-        for (0..ctx.iterations) |_| {
-            var stored = (ctx.db.get(allocator, ctx.key) catch unreachable).?;
-            defer stored.deinit(allocator);
-            std.mem.doNotOptimizeAway(stored.integer);
-        }
+    switch (ctx.contention) {
+        .uniform => {
+            const seed = ctx.uniform_seed orelse unreachable;
+            if (ctx.op == .put) {
+                for (0..ctx.iterations) |_| {
+                    const idx = seed.fetchAdd(1, .monotonic) % scaling_uniform_keyspace;
+                    var key_buf: [24]u8 = undefined;
+                    const key = std.fmt.bufPrint(&key_buf, "bench:scale:u{d:0>5}", .{idx}) catch unreachable;
+                    ctx.db.put(key, &value) catch unreachable;
+                }
+            } else {
+                for (0..ctx.iterations) |_| {
+                    const idx = seed.fetchAdd(1, .monotonic) % scaling_uniform_keyspace;
+                    var key_buf: [24]u8 = undefined;
+                    const key = std.fmt.bufPrint(&key_buf, "bench:scale:u{d:0>5}", .{idx}) catch unreachable;
+                    var stored = (ctx.db.get(allocator, key) catch unreachable).?;
+                    defer stored.deinit(allocator);
+                    std.mem.doNotOptimizeAway(stored.integer);
+                }
+            }
+        },
+        else => {
+            const key = ctx.key orelse unreachable;
+            if (ctx.op == .put) {
+                for (0..ctx.iterations) |_| {
+                    ctx.db.put(key, &value) catch unreachable;
+                }
+            } else {
+                for (0..ctx.iterations) |_| {
+                    var stored = (ctx.db.get(allocator, key) catch unreachable).?;
+                    defer stored.deinit(allocator);
+                    std.mem.doNotOptimizeAway(stored.integer);
+                }
+            }
+        },
     }
 }
 
@@ -784,59 +878,128 @@ fn free_worker_keys(allocator: std.mem.Allocator, keys: [][]u8) void {
     allocator.free(keys);
 }
 
-fn run_scaling_benchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
-    try writer.print("\nSharded Scalability Benchmark\n", .{});
-    try writer.print("--------------------------------------------------------------------------------\n", .{});
-    try writer.print("{s: <15} | {s: <10} | {s: <15} | {s: <10}\n", .{ "Workload", "Threads", "Throughput", "Scaling" });
-    try writer.print("--------------------------------------------------------------------------------\n", .{});
-
+fn run_scaling_for_contention(
+    allocator: std.mem.Allocator,
+    writer: anytype,
+    op: ScalingBenchmarkType,
+    contention: ScalingContention,
+    base_throughput: f64,
+) !f64 {
     const thread_counts = [_]usize{ 1, 2, 4, 8, 16 };
     const ops_per_test = 1_000_000;
 
+    var base = base_throughput;
+    var observed_throughput: f64 = 0;
+
+    for (thread_counts) |t_count| {
+        const db = try open_bench_db(std.heap.page_allocator);
+        defer db.close() catch unreachable;
+
+        var maybe_worker_keys: ?[][]u8 = null;
+        defer if (maybe_worker_keys) |keys| free_worker_keys(allocator, keys);
+
+        var maybe_uniform_seeds: ?[]std.atomic.Value(usize) = null;
+        defer if (maybe_uniform_seeds) |seeds| allocator.free(seeds);
+
+        switch (contention) {
+            .none => {
+                const worker_keys = try allocate_distinct_shard_worker_keys(allocator, t_count);
+                maybe_worker_keys = worker_keys;
+
+                for (0..t_count) |i| {
+                    const value = types.Value{ .integer = @intCast(i) };
+                    try db.put(worker_keys[i], &value);
+                }
+            },
+            .hotspot => {
+                const value = types.Value{ .integer = 1 };
+                try db.put("bench:scale:hotspot", &value);
+            },
+            .uniform => {
+                var key_buf: [24]u8 = undefined;
+                for (0..scaling_uniform_keyspace) |i| {
+                    const key = try std.fmt.bufPrint(&key_buf, "bench:scale:u{d:0>5}", .{i});
+                    const value = types.Value{ .integer = @intCast(i) };
+                    try db.put(key, &value);
+                }
+
+                const seeds = try allocator.alloc(std.atomic.Value(usize), t_count);
+                for (0..t_count) |i| {
+                    seeds[i] = std.atomic.Value(usize).init(i * (scaling_uniform_keyspace / 64));
+                }
+                maybe_uniform_seeds = seeds;
+            },
+        }
+
+        const iters_per_thread = ops_per_test / t_count;
+        var threads = try allocator.alloc(std.Thread, t_count);
+        defer allocator.free(threads);
+
+        var timer = try std.time.Timer.start();
+        for (0..t_count) |i| {
+            const key = switch (contention) {
+                .none => maybe_worker_keys.?[i],
+                .hotspot => "bench:scale:hotspot",
+                .uniform => null,
+            };
+
+            const seed = if (contention == .uniform) &maybe_uniform_seeds.?[i] else null;
+
+            threads[i] = try std.Thread.spawn(.{}, scaling_worker, .{ScalingWorkerContext{
+                .db = db,
+                .op = op,
+                .contention = contention,
+                .key = key,
+                .uniform_seed = seed,
+                .iterations = iters_per_thread,
+            }});
+        }
+
+        for (threads) |thread| thread.join();
+        const elapsed = timer.read();
+
+        const throughput = @as(f64, @floatFromInt(ops_per_test)) /
+            (@as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(std.time.ns_per_s)));
+
+        if (t_count == 1) {
+            base = throughput;
+        }
+
+        const scaling = throughput / base;
+        const op_name = if (op == .get) "GET" else "PUT";
+
+        try writer.print("{s: <15} | {d: <10} | {d:.2}M ops/sec | {d:.2}x\n", .{
+            op_name,
+            t_count,
+            throughput / 1_000_000.0,
+            scaling,
+        });
+
+        observed_throughput = throughput;
+    }
+
+    return observed_throughput;
+}
+
+fn run_scaling_benchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
+    try writer.print("\nSharded Scalability Benchmark\n", .{});
+    try writer.print("note: 'none' = each thread on a distinct shard (best case). 'uniform' = 10k shared keys (realistic).\n", .{});
+    try writer.print("--------------------------------------------------------------------------------\n", .{});
     for ([_]ScalingBenchmarkType{ .get, .put }) |op| {
-        var base_throughput: f64 = 0;
-        for (thread_counts) |t_count| {
-            const db = try open_bench_db(std.heap.page_allocator);
-            defer db.close() catch unreachable;
+        const op_name = if (op == .get) "GET" else "PUT";
 
-            const worker_keys = try allocate_distinct_shard_worker_keys(allocator, t_count);
-            defer free_worker_keys(allocator, worker_keys);
+        for ([_]ScalingContention{ .none, .hotspot, .uniform }) |contention| {
+            const mode_name = switch (contention) {
+                .none => "no contention (best case)",
+                .hotspot => "hotspot (worst case)",
+                .uniform => "uniform 10k keys (realistic)",
+            };
 
-            // Pre-prime keys
-            for (0..t_count) |i| {
-                const value = types.Value{ .integer = @intCast(i) };
-                try db.put(worker_keys[i], &value);
-            }
-
-            const iters_per_thread = ops_per_test / t_count;
-            var threads = try allocator.alloc(std.Thread, t_count);
-            defer allocator.free(threads);
-
-            var timer = try std.time.Timer.start();
-            for (0..t_count) |i| {
-                threads[i] = try std.Thread.spawn(.{}, scaling_worker, .{ScalingWorkerContext{
-                    .db = db,
-                    .op = op,
-                    .key = worker_keys[i],
-                    .iterations = iters_per_thread,
-                }});
-            }
-
-            for (threads) |thread| thread.join();
-            const elapsed = timer.read();
-
-            const throughput = @as(f64, @floatFromInt(ops_per_test)) / (@as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(std.time.ns_per_s)));
-            if (t_count == 1) base_throughput = throughput;
-
-            const scaling = throughput / base_throughput;
-            const op_name = if (op == .get) "GET (Shared)" else "PUT (Sharded)";
-
-            try writer.print("{s: <15} | {d: <10} | {d:.2}M ops/sec | {d:.2}x\n", .{
-                op_name,
-                t_count,
-                throughput / 1_000_000.0,
-                scaling,
-            });
+            try writer.print("\n--- {s}: {s} ---\n", .{ op_name, mode_name });
+            try writer.print("{s: <15} | {s: <10} | {s: <15} | {s: <10}\n", .{ "Workload", "Threads", "Throughput", "Scaling" });
+            try writer.print("--------------------------------------------------------------------------------\n", .{});
+            _ = try run_scaling_for_contention(allocator, writer, op, contention, 0);
+            try writer.print("--------------------------------------------------------------------------------\n", .{});
         }
         try writer.print("--------------------------------------------------------------------------------\n", .{});
     }
@@ -1290,6 +1453,14 @@ fn init_steady_state_benches() !void {
         const value = types.Value{ .integer = 1 };
         try steady_put_db.?.put("bench:put", &value);
 
+        var steady_key_buf: [32]u8 = undefined;
+        for (0..put_steady_key_cardinality) |i| {
+            const key = try std.fmt.bufPrint(&steady_key_buf, "bench:put:uniform:{d:0>4}", .{i});
+            const steady_value = types.Value{ .integer = @intCast(i) };
+            try steady_put_db.?.put(key, &steady_value);
+        }
+        steady_put_uniform_seed.store(0, .monotonic);
+
         var key_buf: [32]u8 = undefined;
         for (0..put_overwrite_key_cardinality) |i| {
             const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovr:{d:0>2}", .{i});
@@ -1310,8 +1481,13 @@ fn init_steady_state_benches() !void {
 
     steady_get_db = try open_bench_db(std.heap.page_allocator);
     {
-        const value = types.Value{ .integer = 42 };
-        try steady_get_db.?.put("bench:get", &value);
+        var key_buf: [32]u8 = undefined;
+        for (0..get_steady_key_cardinality) |i| {
+            const key = try std.fmt.bufPrint(&key_buf, "bench:get:uniform:{d:0>4}", .{i});
+            const value = types.Value{ .integer = @intCast(i) };
+            try steady_get_db.?.put(key, &value);
+        }
+        steady_get_uniform_seed.store(0, .monotonic);
     }
 
     steady_get_ttl_mixed_db = try open_bench_db(std.heap.page_allocator);
@@ -1391,6 +1567,11 @@ fn load_scan_fixture_to_art(comptime count: usize, tree: *internal.art.Tree) voi
 }
 
 fn deinit_steady_state_benches() void {
+    steady_put_uniform_seed.store(0, .monotonic);
+    steady_get_uniform_seed.store(0, .monotonic);
+    art_lookup_seed.store(0, .monotonic);
+    art_insert_seed.store(0, .monotonic);
+
     if (steady_wal) |*wal| {
         wal.close();
         if (wal_bench_path) |path| {

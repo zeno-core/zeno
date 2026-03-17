@@ -211,6 +211,10 @@ pub fn compact_shard(db: *Database, shard_idx: usize) EngineError!void {
     shard.lock.lock();
     defer shard.lock.unlock();
 
+    const seq0 = shard.seq.load(.monotonic);
+    shard.seq.store(seq0 + 1, .release);
+    defer shard.seq.store(seq0 + 2, .release);
+
     const RetainedEntry = struct {
         key: []u8,
         value: Value,

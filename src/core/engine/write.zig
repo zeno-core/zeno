@@ -36,6 +36,10 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
     shard.lock.lock();
     defer shard.lock.unlock();
 
+    const seq0 = shard.seq.load(.monotonic);
+    shard.seq.store(seq0 + 1, .release);
+    defer shard.seq.store(seq0 + 2, .release);
+
     try durability.append_put_if_enabled(state, key, value);
     const outcome = try internal_mutate.upsert_value_unlocked_with_outcome(shard, key, value);
     internal_ttl_index.clear_ttl_entry(shard, key);
@@ -85,6 +89,14 @@ pub fn put_group(state: *runtime_state.DatabaseState, writes: []const types.PutW
         shard.visibility_gate.lock_shared();
         shard.lock.lock();
 
+        const seq0 = shard.seq.load(.monotonic);
+        shard.seq.store(seq0 + 1, .release);
+        errdefer {
+            shard.seq.store(seq0 + 2, .release);
+            shard.lock.unlock();
+            shard.visibility_gate.unlock_shared();
+        }
+
         var retained_heavy_bytes: u64 = 0;
         var heavy_overwrite_events: u64 = 0;
 
@@ -105,6 +117,7 @@ pub fn put_group(state: *runtime_state.DatabaseState, writes: []const types.PutW
             state.record_heavy_overwrite_retained_bytes(shard_idx, retained_heavy_bytes, heavy_overwrite_events);
         }
 
+        shard.seq.store(seq0 + 2, .release);
         shard.lock.unlock();
         shard.visibility_gate.unlock_shared();
     }
@@ -134,6 +147,10 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.En
 
     shard.lock.lock();
     defer shard.lock.unlock();
+
+    const seq0 = shard.seq.load(.monotonic);
+    shard.seq.store(seq0 + 1, .release);
+    defer shard.seq.store(seq0 + 2, .release);
 
     if (!internal_mutate.key_exists_unlocked(shard, key)) {
         internal_ttl_index.clear_ttl_entry(shard, key);

@@ -62,6 +62,7 @@ pub const CommittedArena = struct {
 pub const Shard = struct {
     lock: std.Thread.RwLock align(64) = .{},
     visibility_gate: runtime_visibility.VisibilityGate align(64) = .{},
+    seq: std.atomic.Value(u64) align(64) = .init(0),
     base_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     committed_arenas_head: ?*CommittedArena = null,
@@ -189,7 +190,7 @@ pub const Shard = struct {
         self.has_ttl_entries = false;
         self.release_committed_arenas();
         _ = self.arena.reset(.retain_capacity);
-        self.tree.root = .{ .empty = {} };
+        @atomicStore(usize, &self.tree.root, art_node.node_empty(), .release);
         self.tree.allocator = self.arena.allocator();
     }
 

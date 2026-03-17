@@ -364,10 +364,13 @@ fn apply_plan(
 
     for (plan.groups, 0..) |group, index| {
         const shard = &state.shards[group.shard_idx];
+        const seq0 = shard.seq.load(.monotonic);
+        shard.seq.store(seq0 + 1, .release);
         for (reservations[index].writes) |*reserved_write| {
             apply_reserved_write_or_panic(shard, reserved_write);
             internal_ttl_index.clear_ttl_entry(shard, reserved_write.write.key);
         }
+        shard.seq.store(seq0 + 2, .release);
         if (reservations[index].committed) |committed| {
             shard.append_committed_arena(committed);
             reservations[index].committed = null;

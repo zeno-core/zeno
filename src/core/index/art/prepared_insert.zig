@@ -130,7 +130,7 @@ const ShadowInternal = struct {
 /// Allocator: Does not allocate.
 fn recommended_shadow_child_capacity(node_type: NodeType, minimum: u16) u16 {
     return switch (node_type) {
-        .node4, .node16, .node48 => @max(minimum, Node.capacity_for(node_type)),
+        .node4, .node16, .node48 => @max(minimum, node.capacity_for(node_type)),
         .node256 => minimum,
     };
 }
@@ -201,7 +201,7 @@ pub const ShadowTree = struct {
                         .target_depth = depth,
                     };
                 },
-                .live => |live| switch (live.*) {
+                .live => |live| switch (node.node_decode(live.*)) {
                     .empty => {
                         current.* = .{ .empty = {} };
                         continue;
@@ -422,8 +422,8 @@ pub const ShadowTree = struct {
 
                     const new_leaf = try create_shadow_leaf(self.allocator, key);
                     try insert_shadow_child(self.allocator, shadow, .{ .key_byte = key[depth], .node = new_leaf });
-                    if (target_num_children == Node.capacity_for(target_node_type)) {
-                        shadow.node_type = Node.next_type(target_node_type).?;
+                    if (target_num_children == node.capacity_for(target_node_type)) {
+                        shadow.node_type = node.next_type(target_node_type).?;
                         try shadow.children.ensureTotalCapacity(
                             self.allocator,
                             recommended_shadow_child_capacity(shadow.node_type, shadow.num_children),
@@ -483,36 +483,36 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
     const target = try navigate_to_target(root, prepared);
     switch (prepared.kind) {
         .create_root_leaf => {
-            if (target.node_ref.* != .empty) return error.BatchPlanInvariantViolation;
-            target.node_ref.* = .{ .leaf = reserved.leaf orelse return error.BatchPlanInvariantViolation };
+            if (!node.node_is_empty(target.node_ref.*)) return error.BatchPlanInvariantViolation;
+            @atomicStore(usize, target.node_ref, node.node_leaf(reserved.leaf orelse return error.BatchPlanInvariantViolation), .release);
         },
         .overwrite_leaf => {
-            const leaf = switch (target.node_ref.*) {
+            const leaf = switch (node.node_decode(target.node_ref.*)) {
                 .leaf => |existing| existing,
                 else => return error.BatchPlanInvariantViolation,
             };
             if (!std.mem.eql(u8, leaf.key, prepared.expected_target_leaf_key.?)) return error.BatchPlanInvariantViolation;
-            leaf.value = reserved.value;
+            leaf.store_value(reserved.value);
             leaf.value_owner = reserved.value_owner;
         },
         .overwrite_leaf_value => {
             const header = try validate_target_internal(target.node_ref, prepared, target.depth);
-            const leaf = header.leaf_value orelse return error.BatchPlanInvariantViolation;
+            const leaf = header.load_leaf_value() orelse return error.BatchPlanInvariantViolation;
             if (!std.mem.eql(u8, leaf.key, prepared.expected_target_leaf_key.?)) return error.BatchPlanInvariantViolation;
-            leaf.value = reserved.value;
+            leaf.store_value(reserved.value);
             leaf.value_owner = reserved.value_owner;
         },
         .attach_leaf_value => {
             const header = try validate_target_internal(target.node_ref, prepared, target.depth);
-            if (header.leaf_value != null) return error.BatchPlanInvariantViolation;
-            header.leaf_value = reserved.leaf orelse return error.BatchPlanInvariantViolation;
+            if (header.load_leaf_value() != null) return error.BatchPlanInvariantViolation;
+            header.store_leaf_value(reserved.leaf orelse return error.BatchPlanInvariantViolation);
         },
         .add_child => {
             _ = try validate_target_internal(target.node_ref, prepared, target.depth);
             try node.add_child_reserved(
                 target.node_ref,
                 prepared.new_edge_byte.?,
-                .{ .leaf = reserved.leaf orelse return error.BatchPlanInvariantViolation },
+                node.node_leaf(reserved.leaf orelse return error.BatchPlanInvariantViolation),
                 null,
             );
         },
@@ -521,12 +521,12 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
             try node.add_child_reserved(
                 target.node_ref,
                 prepared.new_edge_byte.?,
-                .{ .leaf = reserved.leaf orelse return error.BatchPlanInvariantViolation },
+                node.node_leaf(reserved.leaf orelse return error.BatchPlanInvariantViolation),
                 reserved.promoted_node,
             );
         },
         .leaf_split => {
-            const old_leaf = switch (target.node_ref.*) {
+            const old_leaf = switch (node.node_decode(target.node_ref.*)) {
                 .leaf => |existing| existing,
                 else => return error.BatchPlanInvariantViolation,
             };
@@ -541,14 +541,14 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
             if (prepared.old_edge_byte) |byte| {
                 try node.add_child_reserved(&new_node, byte, target.node_ref.*, null);
             } else {
-                split.node4.header.leaf_value = old_leaf;
+                split.node4.header.store_leaf_value(old_leaf);
             }
             if (prepared.new_edge_byte) |byte| {
-                try node.add_child_reserved(&new_node, byte, .{ .leaf = reserved.leaf.? }, null);
+                try node.add_child_reserved(&new_node, byte, node.node_leaf(reserved.leaf.?), null);
             } else {
-                split.node4.header.leaf_value = reserved.leaf.?;
+                split.node4.header.store_leaf_value(reserved.leaf.?);
             }
-            target.node_ref.* = new_node;
+            @atomicStore(usize, target.node_ref, new_node, .release);
         },
         .prefix_split => {
             const header = try validate_target_internal(target.node_ref, prepared, target.depth);
@@ -565,11 +565,11 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
             var new_node = split.as_node();
             try node.add_child_reserved(&new_node, prepared.old_edge_byte.?, target.node_ref.*, null);
             if (prepared.new_edge_byte) |byte| {
-                try node.add_child_reserved(&new_node, byte, .{ .leaf = reserved.leaf.? }, null);
+                try node.add_child_reserved(&new_node, byte, node.node_leaf(reserved.leaf.?), null);
             } else {
-                split.node4.header.leaf_value = reserved.leaf.?;
+                split.node4.header.store_leaf_value(reserved.leaf.?);
             }
-            target.node_ref.* = new_node;
+            @atomicStore(usize, target.node_ref, new_node, .release);
         },
     }
 }
@@ -664,7 +664,7 @@ fn create_live_shadow_node(allocator: std.mem.Allocator, live: *const Node) !*Sh
 /// Ownership: The returned `ShadowInternal` is owned by the shadow tree, while
 /// embedded exemplar keys and live child pointers remain borrowed from the live ART.
 fn materialize_live_internal(allocator: std.mem.Allocator, current: *ShadowNode, live: *const Node) !*ShadowInternal {
-    const header = switch (live.*) {
+    const header = switch (node.node_decode(live.*)) {
         .internal => |internal| internal,
         else => unreachable,
     };
@@ -674,7 +674,7 @@ fn materialize_live_internal(allocator: std.mem.Allocator, current: *ShadowNode,
         header.prefix_len,
         header.prefix,
         Tree.find_any_leaf(live).key,
-        if (header.leaf_value) |leaf_value| leaf_value.key else null,
+        if (header.load_leaf_value()) |leaf_value| leaf_value.key else null,
         recommended_shadow_child_capacity(header.node_type, header.num_children),
     );
     const ChildCopyCtx = struct {
@@ -798,7 +798,7 @@ fn navigate_to_target(root: *Node, prepared: *const PreparedInsert) !struct { no
     var current = root;
     var depth: usize = 0;
     for (prepared.path) |step| {
-        const header = switch (current.*) {
+        const header = switch (node.node_decode(current.*)) {
             .internal => |internal| internal,
             else => return error.BatchPlanInvariantViolation,
         };
@@ -817,7 +817,7 @@ fn navigate_to_target(root: *Node, prepared: *const PreparedInsert) !struct { no
 ///
 /// Allocator: Does not allocate.
 fn validate_target_internal(node_ref: *Node, prepared: *const PreparedInsert, depth: usize) !*NodeHeader {
-    const header = switch (node_ref.*) {
+    const header = switch (node.node_decode(node_ref.*)) {
         .internal => |internal| internal,
         else => return error.BatchPlanInvariantViolation,
     };
@@ -854,7 +854,7 @@ fn validate_internal_preconditions(
     if (header.node_type != expected_node_type) return error.BatchPlanInvariantViolation;
     if (header.num_children != expected_num_children) return error.BatchPlanInvariantViolation;
     if (header.prefix_len != expected_prefix_len) return error.BatchPlanInvariantViolation;
-    if ((header.leaf_value != null) != expected_leaf_value_present) return error.BatchPlanInvariantViolation;
+    if ((header.load_leaf_value() != null) != expected_leaf_value_present) return error.BatchPlanInvariantViolation;
 
     const stored_len = @min(expected_prefix_len, MAX_PREFIX_LEN);
     if (stored_len > 0 and !std.mem.eql(u8, header.prefix[0..stored_len], expected_prefix[0..stored_len])) {
@@ -962,11 +962,11 @@ fn lookup_value_for_test(root: *const Node, key: []const u8) ?*Value {
     var current_node_ptr: *const Node = root;
     var depth: usize = 0;
 
-    while (!current_node_ptr.is_empty()) {
-        switch (current_node_ptr.*) {
+    while (!node.node_is_empty(current_node_ptr.*)) {
+        switch (node.node_decode(current_node_ptr.*)) {
             .empty => unreachable,
             .leaf => |leaf| {
-                if (std.mem.eql(u8, leaf.key, key)) return leaf.value;
+                if (std.mem.eql(u8, leaf.key, key)) return leaf.load_value();
                 return null;
             },
             .internal => |header| {
@@ -987,7 +987,7 @@ fn lookup_value_for_test(root: *const Node, key: []const u8) ?*Value {
                 }
 
                 if (depth == key.len) {
-                    return if (header.leaf_value) |leaf| leaf.value else null;
+                    return if (header.load_leaf_value()) |leaf| leaf.load_value() else null;
                 }
 
                 const child = header.find_child(key[depth]) orelse return null;
@@ -1006,7 +1006,7 @@ test "plan_insert and apply_prepared_insert create one root leaf" {
     defer arena.deinit();
     const allocator = arena.allocator();
 
-    var root = Node{ .empty = {} };
+    var root = node.node_empty();
     var shadow = try ShadowTree.init_from_live(allocator, &root);
     const prepared = try shadow.plan_insert(allocator, "alpha");
     const reserved = try reserve_insert_for_test(allocator, "alpha", .{ .integer = 7 }, prepared);
@@ -1026,7 +1026,7 @@ test "plan_insert and apply_prepared_insert overwrite an exact existing leaf" {
     const allocator = arena.allocator();
 
     const existing = try create_leaf_for_test(allocator, "alpha", .{ .integer = 1 });
-    var root = Node{ .leaf = existing };
+    var root = node.node_leaf(existing);
     var shadow = try ShadowTree.init_from_live(allocator, &root);
     const prepared = try shadow.plan_insert(allocator, "alpha");
     const reserved = try reserve_insert_for_test(allocator, "alpha", .{ .integer = 9 }, prepared);
@@ -1046,7 +1046,7 @@ test "plan_insert and apply_prepared_insert split one leaf for diverging keys" {
     const allocator = arena.allocator();
 
     const existing = try create_leaf_for_test(allocator, "alpha", .{ .integer = 1 });
-    var root = Node{ .leaf = existing };
+    var root = node.node_leaf(existing);
     var shadow = try ShadowTree.init_from_live(allocator, &root);
     const prepared = try shadow.plan_insert(allocator, "beta");
     const reserved = try reserve_insert_for_test(allocator, "beta", .{ .integer = 2 }, prepared);
@@ -1074,8 +1074,8 @@ test "plan_insert and apply_prepared_insert prefix split a compressed path" {
     root_internal.header.prefix[0] = 'a';
     root_internal.header.prefix[1] = 'b';
 
-    var root = Node{ .internal = &root_internal.header };
-    try node.add_child_reserved(&root, 'c', .{ .leaf = existing }, null);
+    var root = node.node_internal(&root_internal.header);
+    try node.add_child_reserved(&root, 'c', node.node_leaf(existing), null);
 
     var shadow = try ShadowTree.init_from_live(allocator, &root);
     const prepared = try shadow.plan_insert(allocator, "adz");
@@ -1099,12 +1099,12 @@ test "plan_insert and apply_prepared_insert grow and add one child when the node
 
     const root_internal = try allocator.create(Node4);
     root_internal.* = Node4.init();
-    var root = Node{ .internal = &root_internal.header };
+    var root = node.node_internal(&root_internal.header);
 
     const keys = [_][]const u8{ "a", "b", "c", "d" };
     for (keys, 0..) |key, index| {
         const leaf = try create_leaf_for_test(allocator, key, .{ .integer = @intCast(index + 1) });
-        try node.add_child_reserved(&root, key[0], .{ .leaf = leaf }, null);
+        try node.add_child_reserved(&root, key[0], node.node_leaf(leaf), null);
     }
 
     var shadow = try ShadowTree.init_from_live(allocator, &root);
@@ -1114,7 +1114,7 @@ test "plan_insert and apply_prepared_insert grow and add one child when the node
     try testing.expectEqual(InsertPlanKind.grow_and_add_child, prepared.kind);
     try apply_prepared_insert(&root, &prepared, &reserved);
 
-    try testing.expectEqual(NodeType.node16, root.internal.node_type);
+    try testing.expectEqual(NodeType.node16, node.node_to_internal(root).node_type);
     const stored = lookup_value_for_test(&root, "e") orelse return error.TestUnexpectedResult;
     try testing.expectEqual(@as(i64, 5), stored.integer);
 }
@@ -1162,7 +1162,7 @@ test "apply_prepared_insert detects invariant drift between planning and apply" 
     const allocator = arena.allocator();
 
     const existing = try create_leaf_for_test(allocator, "alpha", .{ .integer = 1 });
-    var root = Node{ .leaf = existing };
+    var root = node.node_leaf(existing);
     var shadow = try ShadowTree.init_from_live(allocator, &root);
     const prepared = try shadow.plan_insert(allocator, "alpha");
     const reserved = try reserve_insert_for_test(allocator, "alpha", .{ .integer = 2 }, prepared);

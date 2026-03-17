@@ -26,17 +26,32 @@ fn clone_plain_value_no_visibility(
     allocator: std.mem.Allocator,
     key: []const u8,
 ) error_mod.EngineError!?types.Value {
-    shard.lock.lockShared();
-    defer shard.lock.unlockShared();
-    state.record_operation(.get, 1);
+    while (true) {
+        const v1 = shard.seq.load(.acquire);
+        if ((v1 & 1) != 0) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
 
-    const stored = shard.tree.lookup(key) orelse return null;
-    if (shard.has_ttl_entries) {
-        const stored_expire_at = internal_ttl_index.get_expire_at(shard, key) orelse return try stored.clone(allocator);
-        const now = runtime_shard.unix_now();
-        if (expiration.is_expired(stored_expire_at, now)) return null;
+        const stored = shard.tree.lookup(key);
+
+        const v2 = shard.seq.load(.acquire);
+        if (v1 != v2) {
+            std.atomic.spinLoopHint();
+            continue;
+        }
+
+        state.record_operation(.get, 1);
+        const value_ptr = stored orelse return null;
+
+        if (shard.has_ttl_entries) {
+            const stored_expire_at = internal_ttl_index.get_expire_at(shard, key) orelse return try value_ptr.clone(allocator);
+            const now = runtime_shard.unix_now();
+            if (expiration.is_expired(stored_expire_at, now)) return null;
+        }
+
+        return try value_ptr.clone(allocator);
     }
-    return try stored.clone(allocator);
 }
 
 /// Opens one consistent read window over the current visible engine state.

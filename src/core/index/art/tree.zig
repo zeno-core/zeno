@@ -40,7 +40,7 @@ pub const KeyRange = struct {
 
 /// Root ART handle for one shard-local plain-key index.
 pub const Tree = struct {
-    root: Node = .{ .empty = {} },
+    root: Node = node.node_empty(),
     allocator: std.mem.Allocator,
 
     /// Initializes one empty ART with the provided node allocator.
@@ -58,13 +58,27 @@ pub const Tree = struct {
     /// Time Complexity: O(k) where k is the length of the string key.
     /// Allocator: Does not allocate.
     pub fn find_any_leaf(n: *const Node) *const Leaf {
-        var cur = n;
+        var cur = n.*;
         while (true) {
-            switch (cur.*) {
+            switch (node.node_decode(cur)) {
                 .leaf => |l| return l,
                 .internal => |h| {
-                    if (h.leaf_value) |leaf| return leaf;
-                    cur = h.first_child();
+                    if (h.load_leaf_value()) |leaf| return leaf;
+                    cur = h.first_child().*;
+                },
+                .empty => unreachable,
+            }
+        }
+    }
+
+    fn find_any_leaf_node(n: Node) *const Leaf {
+        var cur = n;
+        while (true) {
+            switch (node.node_decode(cur)) {
+                .leaf => |l| return l,
+                .internal => |h| {
+                    if (h.load_leaf_value()) |leaf| return leaf;
+                    cur = h.first_child().*;
                 },
                 .empty => unreachable,
             }
@@ -78,7 +92,7 @@ pub const Tree = struct {
     ///
     /// Allocator: Does not allocate.
     fn match_prefix_exact(
-        n: *const Node,
+        n: Node,
         header: *const NodeHeader,
         key: []const u8,
         depth_in: usize,
@@ -90,7 +104,7 @@ pub const Tree = struct {
             depth += 1;
         }
         if (header.prefix_len > MAX_PREFIX_LEN) {
-            const leaf = find_any_leaf(n);
+            const leaf = find_any_leaf_node(n);
             const limit = @min(leaf.key.len, key.len);
             for (MAX_PREFIX_LEN..header.prefix_len) |_| {
                 if (depth >= limit or leaf.key[depth] != key[depth]) return null;
@@ -119,35 +133,35 @@ pub const Tree = struct {
     ///
     /// Ownership: Returns a borrowed stored value pointer owned by the caller-managed tree lifetime.
     pub fn lookup(self: *const Tree, key: []const u8) ?*Value {
-        var current_node_ptr: *const Node = &self.root;
+        var current: Node = @atomicLoad(usize, &self.root, .acquire);
         var depth: usize = 0;
 
-        while (!current_node_ptr.is_empty()) {
-            switch (current_node_ptr.*) {
-                .empty => unreachable,
+        while (!node.node_is_empty(current)) {
+            switch (node.node_decode(current)) {
                 .leaf => |leaf| {
                     if (std.mem.eql(u8, leaf.key, key)) {
-                        return leaf.value;
+                        return leaf.load_value();
                     }
                     return null;
                 },
                 .internal => |header| {
-                    depth = match_prefix_exact(current_node_ptr, header, key, depth) orelse return null;
+                    depth = match_prefix_exact(current, header, key, depth) orelse return null;
 
                     if (depth == key.len) {
-                        return if (header.leaf_value) |leaf| leaf.value else null;
+                        return if (header.load_leaf_value()) |leaf| leaf.load_value() else null;
                     }
 
                     const key_byte = key[depth];
                     const next_child_ptr = header.find_child(key_byte);
 
                     if (next_child_ptr) |child_ptr| {
-                        current_node_ptr = child_ptr;
+                        current = @atomicLoad(usize, child_ptr, .acquire);
                         depth += 1;
                     } else {
                         return null;
                     }
                 },
+                .empty => unreachable,
             }
         }
         return null;
@@ -159,21 +173,20 @@ pub const Tree = struct {
     ///
     /// Allocator: Does not allocate.
     pub fn find_leaf_for_exact_key(self: *Tree, key: []const u8) ?*Leaf {
-        var current_node_ptr: *Node = &self.root;
+        var current: Node = self.root;
         var depth: usize = 0;
 
-        while (!current_node_ptr.is_empty()) {
-            switch (current_node_ptr.*) {
-                .empty => unreachable,
+        while (!node.node_is_empty(current)) {
+            switch (node.node_decode(current)) {
                 .leaf => |leaf| {
                     if (std.mem.eql(u8, leaf.key, key)) return leaf;
                     return null;
                 },
                 .internal => |header| {
-                    depth = match_prefix_exact(current_node_ptr, header, key, depth) orelse return null;
+                    depth = match_prefix_exact(current, header, key, depth) orelse return null;
 
                     if (depth == key.len) {
-                        if (header.leaf_value) |leaf| {
+                        if (header.load_leaf_value()) |leaf| {
                             if (std.mem.eql(u8, leaf.key, key)) return leaf;
                         }
                         return null;
@@ -183,12 +196,13 @@ pub const Tree = struct {
                     const next_child_ptr = header.find_child(key_byte);
 
                     if (next_child_ptr) |child_ptr| {
-                        current_node_ptr = child_ptr;
+                        current = child_ptr.*;
                         depth += 1;
                     } else {
                         return null;
                     }
                 },
+                .empty => unreachable,
             }
         }
         return null;
@@ -209,13 +223,12 @@ pub const Tree = struct {
         var node_ref: *Node = &self.root;
         var depth: usize = 0;
 
-        while (!node_ref.is_empty()) {
-            switch (node_ref.*) {
-                .empty => unreachable,
+        while (!node.node_is_empty(node_ref.*)) {
+            switch (node.node_decode(node_ref.*)) {
                 .leaf => |old_leaf| {
                     if (std.mem.eql(u8, old_leaf.key, key)) {
                         // Exact match overwrite
-                        old_leaf.value = value;
+                        old_leaf.store_value(value);
                         return;
                     }
 
@@ -234,22 +247,22 @@ pub const Tree = struct {
                         @memcpy(new_n4.header.prefix[0..max_cmp], key[depth .. depth + max_cmp]);
                     }
 
-                    var tmp_node = Node{ .internal = &new_n4.header };
+                    var tmp_node = node.node_internal(&new_n4.header);
 
                     if (i < old_leaf.key.len) {
-                        try tmp_node.add_child(self.allocator, old_leaf.key[i], node_ref.*);
+                        try node.add_child(&tmp_node, self.allocator, old_leaf.key[i], node_ref.*);
                     } else {
-                        new_n4.header.leaf_value = old_leaf;
+                        new_n4.header.store_leaf_value(old_leaf);
                     }
 
                     const new_leaf = try self.create_leaf(key, value);
                     if (i < key.len) {
-                        try tmp_node.add_child(self.allocator, key[i], Node{ .leaf = new_leaf });
+                        try node.add_child(&tmp_node, self.allocator, key[i], node.node_leaf(new_leaf));
                     } else {
-                        new_n4.header.leaf_value = new_leaf;
+                        new_n4.header.store_leaf_value(new_leaf);
                     }
 
-                    node_ref.* = tmp_node;
+                    @atomicStore(usize, node_ref, tmp_node, .release);
                     return;
                 },
                 .internal => |header| {
@@ -301,28 +314,28 @@ pub const Tree = struct {
                         }
 
                         // Add old node to new_n4
-                        var tmp_node = Node{ .internal = &new_n4.header };
-                        try tmp_node.add_child(self.allocator, any_leaf.?.key[depth], node_ref.*);
+                        var tmp_node = node.node_internal(&new_n4.header);
+                        try node.add_child(&tmp_node, self.allocator, any_leaf.?.key[depth], node_ref.*);
 
                         // Add new leaf to new_n4
                         const new_leaf = try self.create_leaf(key, value);
                         if (depth == key.len) {
-                            new_n4.header.leaf_value = new_leaf;
+                            new_n4.header.store_leaf_value(new_leaf);
                         } else {
-                            try tmp_node.add_child(self.allocator, key[depth], Node{ .leaf = new_leaf });
+                            try node.add_child(&tmp_node, self.allocator, key[depth], node.node_leaf(new_leaf));
                         }
 
                         // Replace parent ptr
-                        node_ref.* = tmp_node;
+                        @atomicStore(usize, node_ref, tmp_node, .release);
                         return;
                     }
 
                     // No mismatch, prefix traversed. Proceed to children.
                     if (depth == key.len) {
-                        if (header.leaf_value) |old_leaf| {
-                            old_leaf.value = value;
+                        if (header.load_leaf_value()) |old_leaf| {
+                            old_leaf.store_value(value);
                         } else {
-                            header.leaf_value = try self.create_leaf(key, value);
+                            header.store_leaf_value(try self.create_leaf(key, value));
                         }
                         return;
                     }
@@ -336,15 +349,16 @@ pub const Tree = struct {
                     } else {
                         // Child not found, insert here
                         const new_leaf = try self.create_leaf(key, value);
-                        try node_ref.add_child(self.allocator, key_byte, Node{ .leaf = new_leaf });
+                        try node.add_child(node_ref, self.allocator, key_byte, node.node_leaf(new_leaf));
                         return;
                     }
                 },
+                .empty => unreachable,
             }
         }
 
         // Tree is empty
-        node_ref.* = Node{ .leaf = try self.create_leaf(key, value) };
+        @atomicStore(usize, node_ref, node.node_leaf(try self.create_leaf(key, value)), .release);
     }
 
     /// Builds a planner-only shadow tree from the current live ART.
@@ -391,38 +405,37 @@ pub const Tree = struct {
         var parent_key_byte: ?u8 = null;
         var depth: usize = 0;
 
-        while (!node_ref.is_empty()) {
-            switch (node_ref.*) {
-                .empty => unreachable,
+        while (!node.node_is_empty(node_ref.*)) {
+            switch (node.node_decode(node_ref.*)) {
                 .leaf => |leaf| {
                     if (std.mem.eql(u8, leaf.key, key)) {
                         if (parent_ptr) |parent| {
-                            try parent.remove_child(self.allocator, parent_key_byte.?);
+                            try node.remove_child(parent, self.allocator, parent_key_byte.?);
                         } else {
-                            self.root = .{ .empty = {} }; // Removed root node
+                            @atomicStore(usize, &self.root, node.node_empty(), .release);
                         }
                         return true;
                     }
                     return false;
                 },
                 .internal => |header| {
-                    depth = match_prefix_exact(node_ref, header, key, depth) orelse return false;
+                    depth = match_prefix_exact(node_ref.*, header, key, depth) orelse return false;
 
                     if (depth > key.len) return false;
 
                     if (depth == key.len) {
-                        if (header.leaf_value) |old_leaf| {
+                        if (header.load_leaf_value()) |old_leaf| {
                             if (std.mem.eql(u8, old_leaf.key, key)) {
-                                header.leaf_value = null;
+                                header.store_leaf_value(null);
 
                                 if (header.num_children == 0) {
                                     if (parent_ptr) |parent| {
-                                        try parent.remove_child(self.allocator, parent_key_byte.?);
+                                        try node.remove_child(parent, self.allocator, parent_key_byte.?);
                                     } else {
-                                        self.root = Node{ .empty = {} };
+                                        @atomicStore(usize, &self.root, node.node_empty(), .release);
                                     }
                                 } else if (header.num_children == 1) {
-                                    try node_ref.shrink(self.allocator);
+                                    try node.shrink(node_ref, self.allocator);
                                 }
                                 return true;
                             }
@@ -441,6 +454,7 @@ pub const Tree = struct {
                         return false;
                     }
                 },
+                .empty => unreachable,
             }
         }
         return false;
@@ -451,13 +465,13 @@ pub const Tree = struct {
     /// Time Complexity: O(k) where k = prefix.len, plus O(N) where N is the number of descendants removed.
     /// Allocator: Recursively visits and can free matching subtree nodes using `self.allocator`.
     pub fn prune_prefix(self: *Tree, prefix: []const u8) !usize {
-        if (self.root.is_empty()) {
+        if (node.node_is_empty(self.root)) {
             return 0;
         }
 
         if (prefix.len == 0) {
             const removed_all = count_subtree_keys(&self.root);
-            self.root = .{ .empty = {} };
+            @atomicStore(usize, &self.root, node.node_empty(), .release);
             return removed_all;
         }
 
@@ -485,7 +499,7 @@ pub const Tree = struct {
         var depth: usize = 0;
 
         while (true) {
-            switch (current.*) {
+            switch (node.node_decode(current.*)) {
                 .empty => return null,
                 .leaf => |leaf| {
                     if (!std.mem.startsWith(u8, leaf.key, prefix)) return null;
@@ -554,9 +568,9 @@ pub const Tree = struct {
     fn detach_at_cut(self: *Tree, cut: PrefixCut) !void {
         if (cut.parent) |parent| {
             // Route through remove_child so existing shrink/merge logic keeps ART compact.
-            try parent.remove_child(self.allocator, cut.parent_key_byte.?);
+            try node.remove_child(parent, self.allocator, cut.parent_key_byte.?);
         } else {
-            self.root = .{ .empty = {} };
+            @atomicStore(usize, &self.root, node.node_empty(), .release);
         }
     }
 
@@ -564,11 +578,11 @@ pub const Tree = struct {
     /// Time Complexity: O(N) where N is the number of nodes in the subtree.
     /// Allocator: Does not allocate.
     fn count_subtree_keys(n: *const Node) usize {
-        return switch (n.*) {
+        return switch (node.node_decode(n.*)) {
             .empty => 0,
             .leaf => 1,
             .internal => |header| blk: {
-                var total: usize = if (header.leaf_value != null) 1 else 0;
+                var total: usize = if (header.load_leaf_value() != null) 1 else 0;
                 const Ctx = struct {
                     total: *usize,
 
@@ -589,14 +603,14 @@ pub const Tree = struct {
     /// Time Complexity: O(N) where N is the number of keys in the subtree.
     /// Allocator: Allocates memory for the results.
     fn collect_all(allocator: std.mem.Allocator, n: *const Node, results: *std.ArrayList(ScanEntry)) !void {
-        switch (n.*) {
+        switch (node.node_decode(n.*)) {
             .empty => return,
             .leaf => |leaf| {
-                try results.append(allocator, .{ .key = leaf.key, .value = leaf.value });
+                try results.append(allocator, .{ .key = leaf.key, .value = leaf.load_value() });
             },
             .internal => |header| {
-                if (header.leaf_value) |lv| {
-                    try results.append(allocator, .{ .key = lv.key, .value = lv.value });
+                if (header.load_leaf_value()) |lv| {
+                    try results.append(allocator, .{ .key = lv.key, .value = lv.load_value() });
                 }
                 const Ctx = struct {
                     allocator: std.mem.Allocator,
@@ -619,19 +633,19 @@ pub const Tree = struct {
     /// Time Complexity: O(k + N) where k = prefix.len and N is the number of matching elements.
     /// Allocator: Does not allocate internally. `results` array may allocate if its capacity is exceeded.
     pub fn scan(self: *const Tree, prefix: []const u8, allocator: std.mem.Allocator, results: *std.ArrayList(ScanEntry)) !void {
-        if (self.root.is_empty()) return;
+        if (node.node_is_empty(self.root)) return;
 
         // Navigate to the subtree root that covers `prefix`
         var current: *const Node = &self.root;
         var depth: usize = 0;
 
         while (depth <= prefix.len) {
-            switch (current.*) {
+            switch (node.node_decode(current.*)) {
                 .empty => return,
                 .leaf => |leaf| {
                     // Only emit if this leaf's key actually starts with prefix
                     if (std.mem.startsWith(u8, leaf.key, prefix)) {
-                        try results.append(allocator, .{ .key = leaf.key, .value = leaf.value });
+                        try results.append(allocator, .{ .key = leaf.key, .value = leaf.load_value() });
                     }
                     return;
                 },
@@ -694,7 +708,7 @@ pub const Tree = struct {
         results: *std.ArrayList(ScanEntry),
         max_items: usize,
     ) !bool {
-        if (self.root.is_empty()) return true;
+        if (node.node_is_empty(self.root)) return true;
         if (max_items == 0) return false;
         if (start_after_key) |cursor| {
             return collect_matching_limited_seek(&self.root, prefix, cursor, 0, allocator, results, max_items);
@@ -771,7 +785,7 @@ pub const Tree = struct {
         max_items: usize,
     ) !bool {
         if (!is_range_valid(range)) return error.InvalidRangeBounds;
-        if (self.root.is_empty()) return true;
+        if (node.node_is_empty(self.root)) return true;
         if (max_items == 0) return false;
 
         const lower_bound = effective_lower_bound(range.start, start_after_key);
@@ -809,7 +823,7 @@ pub const Tree = struct {
     /// Time Complexity: O(N) where N is the total number of items in the tree.
     /// Allocator: Does not allocate.
     pub fn for_each(self: *const Tree, ctx: *anyopaque, visit: VisitFn) !usize {
-        if (self.root.is_empty()) return 0;
+        if (node.node_is_empty(self.root)) return 0;
         var visited: usize = 0;
         try visit_node_all(&self.root, ctx, visit, &visited);
         return visited;
@@ -828,19 +842,19 @@ pub const Tree = struct {
     ) anyerror!bool {
         if (results.items.len >= max_items) return false;
 
-        switch (n.*) {
+        switch (node.node_decode(n.*)) {
             .empty => return true,
             .leaf => |leaf| {
                 if (std.mem.startsWith(u8, leaf.key, prefix)) {
-                    try results.append(allocator, .{ .key = leaf.key, .value = leaf.value });
+                    try results.append(allocator, .{ .key = leaf.key, .value = leaf.load_value() });
                     if (results.items.len >= max_items) return false;
                 }
                 return true;
             },
             .internal => |header| {
-                if (header.leaf_value) |lv| {
+                if (header.load_leaf_value()) |lv| {
                     if (std.mem.startsWith(u8, lv.key, prefix)) {
-                        try results.append(allocator, .{ .key = lv.key, .value = lv.value });
+                        try results.append(allocator, .{ .key = lv.key, .value = lv.load_value() });
                         if (results.items.len >= max_items) return false;
                     }
                 }
@@ -916,11 +930,11 @@ pub const Tree = struct {
     ) anyerror!bool {
         if (results.items.len >= max_items) return false;
 
-        switch (n.*) {
+        switch (node.node_decode(n.*)) {
             .empty => return true,
             .leaf => |leaf| {
                 if (std.mem.startsWith(u8, leaf.key, prefix) and is_after_cursor(leaf.key, cursor)) {
-                    try results.append(allocator, .{ .key = leaf.key, .value = leaf.value });
+                    try results.append(allocator, .{ .key = leaf.key, .value = leaf.load_value() });
                     if (results.items.len >= max_items) return false;
                 }
                 return true;
@@ -935,9 +949,9 @@ pub const Tree = struct {
 
                 const next_depth = step.depth;
 
-                if (header.leaf_value) |lv| {
+                if (header.load_leaf_value()) |lv| {
                     if (std.mem.startsWith(u8, lv.key, prefix) and is_after_cursor(lv.key, cursor)) {
-                        try results.append(allocator, .{ .key = lv.key, .value = lv.value });
+                        try results.append(allocator, .{ .key = lv.key, .value = lv.load_value() });
                         if (results.items.len >= max_items) return false;
                     }
                 }
@@ -989,7 +1003,7 @@ pub const Tree = struct {
                     .node256 => {
                         const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
                         for (0..256) |b| {
-                            if (n256.children[b].is_empty()) continue;
+                            if (node.node_is_empty(n256.children[b])) continue;
                             const child_byte: u8 = @intCast(b);
                             if (child_byte < cursor_byte) continue;
                             if (child_byte == cursor_byte) {
@@ -1186,10 +1200,10 @@ pub const Tree = struct {
     fn range_walk_seek_node(n: *const Node, state: *RangeWalkState, cursor: []const u8, depth: usize) anyerror!void {
         if (state.stop) return;
 
-        switch (n.*) {
+        switch (node.node_decode(n.*)) {
             .empty => return,
             .leaf => |leaf| {
-                try range_walk_maybe_visit_entry(leaf.key, leaf.value, state);
+                try range_walk_maybe_visit_entry(leaf.key, leaf.load_value(), state);
             },
             .internal => |header| {
                 const step = compare_compressed_prefix_with_cursor(n, header, depth, cursor);
@@ -1203,8 +1217,8 @@ pub const Tree = struct {
                 }
 
                 const next_depth = step.depth;
-                if (header.leaf_value) |lv| {
-                    try range_walk_maybe_visit_entry(lv.key, lv.value, state);
+                if (header.load_leaf_value()) |lv| {
+                    try range_walk_maybe_visit_entry(lv.key, lv.load_value(), state);
                 }
                 if (state.stop) return;
                 if (next_depth >= cursor.len) {
@@ -1258,7 +1272,7 @@ pub const Tree = struct {
                     .node256 => {
                         const n256 = @as(*const Node256, @alignCast(@fieldParentPtr("header", header)));
                         for (0..256) |b| {
-                            if (n256.children[b].is_empty()) continue;
+                            if (node.node_is_empty(n256.children[b])) continue;
                             const child_byte: u8 = @intCast(b);
                             if (child_byte < cursor_byte) continue;
                             if (child_byte == cursor_byte) {
@@ -1282,14 +1296,14 @@ pub const Tree = struct {
     fn range_walk_node(n: *const Node, state: *RangeWalkState) anyerror!void {
         if (state.stop) return;
 
-        switch (n.*) {
+        switch (node.node_decode(n.*)) {
             .empty => return,
             .leaf => |leaf| {
-                try range_walk_maybe_visit_entry(leaf.key, leaf.value, state);
+                try range_walk_maybe_visit_entry(leaf.key, leaf.load_value(), state);
             },
             .internal => |header| {
-                if (header.leaf_value) |lv| {
-                    try range_walk_maybe_visit_entry(lv.key, lv.value, state);
+                if (header.load_leaf_value()) |lv| {
+                    try range_walk_maybe_visit_entry(lv.key, lv.load_value(), state);
                 }
                 if (state.stop) return;
                 try range_walk_children_no_cursor(header, state);
@@ -1301,15 +1315,15 @@ pub const Tree = struct {
     /// Time Complexity: O(N) across all leaf descendants.
     /// Allocator: Does not allocate.
     fn visit_node_all(n: *const Node, ctx: *anyopaque, visit: VisitFn, visited: *usize) !void {
-        switch (n.*) {
+        switch (node.node_decode(n.*)) {
             .empty => return,
             .leaf => |leaf| {
-                try visit(ctx, leaf.key, leaf.value);
+                try visit(ctx, leaf.key, leaf.load_value());
                 visited.* += 1;
             },
             .internal => |header| {
-                if (header.leaf_value) |leaf| {
-                    try visit(ctx, leaf.key, leaf.value);
+                if (header.load_leaf_value()) |leaf| {
+                    try visit(ctx, leaf.key, leaf.load_value());
                     visited.* += 1;
                 }
                 const Ctx = struct {
@@ -1363,7 +1377,7 @@ pub const Iterator = struct {
             .prefix = prefix,
             .cursor = cursor,
         };
-        if (!tree.root.is_empty()) {
+        if (!node.node_is_empty(tree.root)) {
             try it.push(.{
                 .node = &tree.root,
                 .depth = 0,
@@ -1383,7 +1397,7 @@ pub const Iterator = struct {
     /// Time Complexity: O(k) for the first call (seek), O(1) amortized for subsequent calls.
     pub fn next(self: *Iterator) !?ScanEntry {
         while (self.peek()) |frame| {
-            switch (frame.node.*) {
+            switch (node.node_decode(frame.node.*)) {
                 .empty => {
                     self.pop();
                     continue;
@@ -1401,7 +1415,7 @@ pub const Iterator = struct {
                     }
 
                     self.pop();
-                    if (valid) return ScanEntry{ .key = leaf.key, .value = leaf.value };
+                    if (valid) return ScanEntry{ .key = leaf.key, .value = leaf.load_value() };
                     continue;
                 },
                 .internal => |header| {
@@ -1447,7 +1461,7 @@ pub const Iterator = struct {
                             }
                         }
 
-                        if (header.leaf_value) |lv| {
+                        if (header.load_leaf_value()) |lv| {
                             var lv_valid = std.mem.startsWith(u8, lv.key, self.prefix);
                             if (lv_valid and self.cursor != null) {
                                 if (std.mem.order(u8, self.cursor.?, lv.key) != .lt) {
@@ -1456,7 +1470,7 @@ pub const Iterator = struct {
                                     self.cursor = null;
                                 }
                             }
-                            if (lv_valid) return ScanEntry{ .key = lv.key, .value = lv.value };
+                            if (lv_valid) return ScanEntry{ .key = lv.key, .value = lv.load_value() };
                         }
                         continue;
                     }
@@ -1520,7 +1534,7 @@ pub const Iterator = struct {
                             while (frame.step - 1 < 256) {
                                 const i = frame.step - 1;
                                 frame.step += 1;
-                                if (n256.children[i].is_empty()) continue;
+                                if (node.node_is_empty(n256.children[i])) continue;
 
                                 const cb: u8 = @intCast(i);
                                 if (self.cursor) |c| {

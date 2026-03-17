@@ -48,6 +48,7 @@ pub fn get_expire_at(shard: *const runtime_shard.Shard, key: []const u8) ?i64 {
 pub fn clear_ttl_entry(shard: *runtime_shard.Shard, key: []const u8) void {
     if (shard.ttl_index.fetchRemove(key)) |removed| {
         shard.base_allocator.free(removed.key);
+        shard.has_ttl_entries = shard.ttl_index.count() != 0;
     }
 }
 
@@ -79,11 +80,13 @@ pub fn apply_prepared_set_ttl_entry_unlocked(
     if (shard.ttl_index.getEntry(key)) |entry| {
         if (prepared.owned_key) |owned_key| shard.base_allocator.free(owned_key);
         entry.value_ptr.* = expire_at;
+        shard.has_ttl_entries = true;
         return;
     }
 
     std.debug.assert(prepared.owned_key != null);
     shard.ttl_index.putAssumeCapacityNoClobber(prepared.owned_key.?, expire_at);
+    shard.has_ttl_entries = true;
 }
 
 /// Sets absolute expiration for `key`, updating an existing entry or inserting new owned key bytes.
@@ -94,12 +97,14 @@ pub fn apply_prepared_set_ttl_entry_unlocked(
 pub fn set_ttl_entry(shard: *runtime_shard.Shard, key: []const u8, expire_at: i64) std.mem.Allocator.Error!void {
     if (shard.ttl_index.getEntry(key)) |entry| {
         entry.value_ptr.* = expire_at;
+        shard.has_ttl_entries = true;
         return;
     }
 
     const owned_key = try shard.base_allocator.dupe(u8, key);
     errdefer shard.base_allocator.free(owned_key);
     try shard.ttl_index.put(shard.base_allocator, owned_key, expire_at);
+    shard.has_ttl_entries = true;
 }
 
 test "set_ttl_entry inserts then updates the same key" {

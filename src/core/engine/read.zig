@@ -31,7 +31,7 @@ fn clone_plain_value_no_visibility(
     state.record_operation(.get, 1);
 
     const stored = shard.tree.lookup(key) orelse return null;
-    if (shard.ttl_index.count() != 0) {
+    if (shard.has_ttl_entries) {
         const stored_expire_at = internal_ttl_index.get_expire_at(shard, key) orelse return try stored.clone(allocator);
         const now = runtime_shard.unix_now();
         if (expiration.is_expired(stored_expire_at, now)) return null;
@@ -61,7 +61,7 @@ pub fn read_view(state: *const runtime_state.DatabaseState) error_mod.EngineErro
     };
 }
 
-/// Clones the current plain value for `key` under the shared visibility gate.
+/// Clones the current plain value for `key` under the selected shard shared lock.
 ///
 /// Time Complexity: O(n + k + v), where `n` is `key.len` for shard routing, `k` is ART lookup work, and `v` is the size of the cloned value tree.
 ///
@@ -69,7 +69,7 @@ pub fn read_view(state: *const runtime_state.DatabaseState) error_mod.EngineErro
 ///
 /// Ownership: Returns a value owned by the caller when non-null. The caller must later call `deinit` with the same allocator.
 ///
-/// Thread Safety: Acquires the shared side of the shard-local visibility gate before taking the selected shard's shared lock.
+/// Thread Safety: Acquires only the selected shard's shared lock through `clone_plain_value_no_visibility`.
 pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocator, key: []const u8) error_mod.EngineError!?types.Value {
     internal_mutate.validate_key(key) catch |err| switch (err) {
         error.EmptyKey, error.KeyTooLarge => return error.KeyTooLarge,
@@ -78,7 +78,5 @@ pub fn get(state: *const runtime_state.DatabaseState, allocator: std.mem.Allocat
     const shard_idx = runtime_shard.get_shard_index(key);
     const shard = @constCast(&state.shards[shard_idx]);
 
-    shard.visibility_gate.lock_shared();
-    defer shard.visibility_gate.unlock_shared();
     return clone_plain_value_no_visibility(state, shard, allocator, key);
 }

@@ -530,6 +530,7 @@ fn put_test_ttl(state: *runtime_state.DatabaseState, key: []const u8, expire_at:
     const owned_key = try state.base_allocator.dupe(u8, key);
     errdefer state.base_allocator.free(owned_key);
     try shard.ttl_index.put(state.base_allocator, owned_key, expire_at);
+    shard.has_ttl_entries = true;
 }
 
 fn alloc_tmp_path_test(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basename: []const u8) ![]u8 {

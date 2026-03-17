@@ -67,6 +67,7 @@ pub const Shard = struct {
     committed_arenas_head: ?*CommittedArena = null,
     committed_arenas_tail: ?*CommittedArena = null,
     ttl_index: std.StringHashMapUnmanaged(i64) = .{},
+    has_ttl_entries: bool = false,
     tree: art.Tree,
 
     /// Rebinds the tree allocator interface to the shard's current arena owner.
@@ -95,6 +96,7 @@ pub const Shard = struct {
             .committed_arenas_head = null,
             .committed_arenas_tail = null,
             .ttl_index = .{},
+            .has_ttl_entries = false,
             .tree = undefined,
         };
         shard.tree = art.Tree.init(shard.arena.allocator());
@@ -153,6 +155,7 @@ pub const Shard = struct {
             self.base_allocator.free(entry.key_ptr.*);
         }
         self.ttl_index.deinit(self.base_allocator);
+        self.has_ttl_entries = false;
         self.release_committed_arenas();
         self.arena.deinit();
     }
@@ -183,6 +186,7 @@ pub const Shard = struct {
             self.base_allocator.free(entry.key_ptr.*);
         }
         self.ttl_index.clearRetainingCapacity();
+        self.has_ttl_entries = false;
         self.release_committed_arenas();
         _ = self.arena.reset(.retain_capacity);
         self.tree.root = .{ .empty = {} };
@@ -207,6 +211,7 @@ pub const Shard = struct {
         self.committed_arenas_head = null;
         self.committed_arenas_tail = null;
         self.ttl_index = ttl_index;
+        self.has_ttl_entries = self.ttl_index.count() != 0;
         self.tree = tree;
         self.tree.allocator = self.arena.allocator();
     }
@@ -242,11 +247,13 @@ test "reset_unlocked leaves the shard empty and reusable" {
     value.* = .{ .integer = 1 };
     try shard.tree.insert(try allocator.dupe(u8, "alpha"), value);
     try shard.ttl_index.put(testing.allocator, try testing.allocator.dupe(u8, "alpha"), 10);
+    shard.has_ttl_entries = true;
 
     shard.reset_unlocked();
 
     try testing.expect(shard.tree.lookup("alpha") == null);
     try testing.expectEqual(@as(usize, 0), shard.ttl_index.count());
+    try testing.expect(!shard.has_ttl_entries);
 
     const reused_value = try shard.arena.allocator().create(Value);
     reused_value.* = .{ .integer = 2 };

@@ -214,6 +214,10 @@ pub fn try_overwrite_if_exists_unlocked(
             leaf.value.deinit(shard.base_allocator);
         }
         leaf.value.* = value.*;
+        // Safety: publish with release to pair with GET's acquire load on the same
+        // pointer address. The pointer value is unchanged; this acts as a release
+        // fence ensuring the content write above is visible to readers.
+        leaf.store_value(leaf.value);
         return UpsertOutcome{
             .overwritten = true,
             .previous_heavy_bytes = previous_heavy_bytes,

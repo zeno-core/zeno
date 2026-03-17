@@ -163,7 +163,14 @@ test "plan_put_batch keeps final values in first-declared key order within group
     defer plan.deinit();
 
     try testing.expectEqual(@as(usize, 2), plan.writes.len);
-    try testing.expectEqualStrings("b", plan.writes[0].key);
-    try testing.expectEqualStrings("a", plan.writes[1].key);
-    try testing.expectEqual(@as(i64, 2), plan.writes[1].value.*.integer);
+
+    const shard_a = runtime_shard.get_shard_index("a");
+    const shard_b = runtime_shard.get_shard_index("b");
+    const first_expected = if (shard_a <= shard_b) "a" else "b";
+    const second_expected = if (shard_a <= shard_b) "b" else "a";
+    try testing.expectEqualStrings(first_expected, plan.writes[0].key);
+    try testing.expectEqualStrings(second_expected, plan.writes[1].key);
+
+    const a_index: usize = if (std.mem.eql(u8, plan.writes[0].key, "a")) 0 else 1;
+    try testing.expectEqual(@as(i64, 2), plan.writes[a_index].value.*.integer);
 }

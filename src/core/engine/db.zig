@@ -2589,14 +2589,16 @@ test "overwrite-only batches avoid retaining new committed arenas and remain rec
     }
 
     try db.apply_batch(&writes);
-    try testing.expectEqual(@as(usize, 41), total_committed_arenas_for_test(db));
+    const committed_after_first = total_committed_arenas_for_test(db);
+    try testing.expect(committed_after_first > 0);
+    try testing.expect(committed_after_first <= writes.len);
 
     for (0..writes.len) |index| {
         values[index] = .{ .integer = @intCast(index + 1_000) };
     }
 
     try db.apply_batch(&writes);
-    try testing.expectEqual(@as(usize, 41), total_committed_arenas_for_test(db));
+    try testing.expectEqual(committed_after_first, total_committed_arenas_for_test(db));
     try testing.expect(value_is_heap_owned_for_test(db, "batch:0000"));
 
     const point_value = types.Value{ .integer = 9_999 };

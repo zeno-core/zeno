@@ -8,7 +8,7 @@ const art_node = @import("../index/art/node.zig");
 const runtime_visibility = @import("visibility.zig");
 
 /// Number of shards in the runtime execution state.
-pub const NUM_SHARDS: usize = 64;
+pub const NUM_SHARDS: usize = 256;
 
 /// Extracts the first non-empty hash tag from `key` using `{tag}` syntax.
 ///

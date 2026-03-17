@@ -36,6 +36,18 @@ pub const NodeHeader = extern struct {
         };
     }
 
+    /// Copies shared metadata (child count, compressed prefix, leaf value) from another header.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate.
+    pub fn copy_meta_from(self: *NodeHeader, src: *const NodeHeader) void {
+        self.num_children = src.num_children;
+        self.prefix_len = src.prefix_len;
+        self.prefix = src.prefix;
+        self.leaf_value = src.leaf_value;
+    }
+
     /// Finds a child pointer by transition byte for any internal-node class.
     ///
     /// Time Complexity: O(1) bounded by node class implementation.
@@ -213,10 +225,7 @@ pub const Node = union(enum) {
                         const n4: *Node4 = @alignCast(@fieldParentPtr("header", header));
                         const n16 = try allocator.create(Node16);
                         n16.* = Node16.init();
-                        n16.header.num_children = n4.header.num_children;
-                        n16.header.prefix_len = n4.header.prefix_len;
-                        n16.header.prefix = n4.header.prefix;
-                        n16.header.leaf_value = n4.header.leaf_value;
+                        n16.header.copy_meta_from(&n4.header);
 
                         for (0..n4.header.num_children) |i| {
                             n16.keys[i] = n4.keys[i];
@@ -228,10 +237,7 @@ pub const Node = union(enum) {
                         const n16 = @as(*Node16, @alignCast(@fieldParentPtr("header", header)));
                         const n48 = try allocator.create(Node48);
                         n48.* = Node48.init();
-                        n48.header.num_children = n16.header.num_children;
-                        n48.header.prefix_len = n16.header.prefix_len;
-                        n48.header.prefix = n16.header.prefix;
-                        n48.header.leaf_value = n16.header.leaf_value;
+                        n48.header.copy_meta_from(&n16.header);
 
                         for (0..n16.header.num_children) |i| {
                             const k = n16.keys[i];
@@ -245,10 +251,7 @@ pub const Node = union(enum) {
                         const n48 = @as(*Node48, @alignCast(@fieldParentPtr("header", header)));
                         const n256 = try allocator.create(Node256);
                         n256.* = Node256.init();
-                        n256.header.num_children = n48.header.num_children;
-                        n256.header.prefix_len = n48.header.prefix_len;
-                        n256.header.prefix = n48.header.prefix;
-                        n256.header.leaf_value = n48.header.leaf_value;
+                        n256.header.copy_meta_from(&n48.header);
 
                         for (0..256) |i| {
                             const idx = n48.child_index[i];
@@ -406,10 +409,7 @@ pub const Node = union(enum) {
                         if (n16.header.num_children <= 4) {
                             const n4 = try allocator.create(Node4);
                             n4.* = Node4.init();
-                            n4.header.num_children = n16.header.num_children;
-                            n4.header.prefix_len = n16.header.prefix_len;
-                            n4.header.prefix = n16.header.prefix;
-                            n4.header.leaf_value = n16.header.leaf_value;
+                            n4.header.copy_meta_from(&n16.header);
 
                             for (0..n16.header.num_children) |i| {
                                 n4.keys[i] = n16.keys[i];
@@ -423,10 +423,7 @@ pub const Node = union(enum) {
                         if (n48.header.num_children <= 16) {
                             const n16 = try allocator.create(Node16);
                             n16.* = Node16.init();
-                            n16.header.num_children = n48.header.num_children;
-                            n16.header.prefix_len = n48.header.prefix_len;
-                            n16.header.prefix = n48.header.prefix;
-                            n16.header.leaf_value = n48.header.leaf_value;
+                            n16.header.copy_meta_from(&n48.header);
 
                             var child_idx: usize = 0;
                             for (0..256) |i| {
@@ -445,10 +442,7 @@ pub const Node = union(enum) {
                         if (n256.header.num_children <= 48) {
                             const n48 = try allocator.create(Node48);
                             n48.* = Node48.init();
-                            n48.header.num_children = n256.header.num_children;
-                            n48.header.prefix_len = n256.header.prefix_len;
-                            n48.header.prefix = n256.header.prefix;
-                            n48.header.leaf_value = n256.header.leaf_value;
+                            n48.header.copy_meta_from(&n256.header);
 
                             var pos: usize = 0;
                             for (0..256) |i| {

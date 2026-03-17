@@ -71,6 +71,46 @@ pub const Tree = struct {
         }
     }
 
+    /// Walks the compressed prefix of an internal node against `key` starting at `depth`.
+    /// Returns the updated depth when all prefix bytes match, or null on mismatch.
+    ///
+    /// Time Complexity: O(p) where `p` is the compressed-prefix length.
+    ///
+    /// Allocator: Does not allocate.
+    fn match_prefix_exact(
+        n: *const Node,
+        header: *const NodeHeader,
+        key: []const u8,
+        depth_in: usize,
+    ) ?usize {
+        var depth = depth_in;
+        const max_cmp = @min(header.prefix_len, MAX_PREFIX_LEN);
+        for (0..max_cmp) |i| {
+            if (depth >= key.len or header.prefix[i] != key[depth]) return null;
+            depth += 1;
+        }
+        if (header.prefix_len > MAX_PREFIX_LEN) {
+            const leaf = find_any_leaf(n);
+            const limit = @min(leaf.key.len, key.len);
+            for (MAX_PREFIX_LEN..header.prefix_len) |_| {
+                if (depth >= limit or leaf.key[depth] != key[depth]) return null;
+                depth += 1;
+            }
+        }
+        return depth;
+    }
+
+    /// Allocates and initializes one leaf for `key` and `value`.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Allocates one `Leaf` via `self.allocator`.
+    fn create_leaf(self: *Tree, key: []const u8, value: *Value) !*Leaf {
+        const leaf = try self.allocator.create(Leaf);
+        leaf.* = .{ .key = key, .value = value };
+        return leaf;
+    }
+
     /// Resolves the stored value pointer for one exact key when present.
     ///
     /// Time Complexity: O(k), where `k` is `key.len`.
@@ -92,26 +132,7 @@ pub const Tree = struct {
                     return null;
                 },
                 .internal => |header| {
-                    // Path compression check
-                    if (header.prefix_len > 0) {
-                        const max_cmp = @min(header.prefix_len, MAX_PREFIX_LEN);
-                        for (0..max_cmp) |i| {
-                            if (depth >= key.len or header.prefix[i] != key[depth]) {
-                                return null;
-                            }
-                            depth += 1;
-                        }
-                        if (header.prefix_len > MAX_PREFIX_LEN) {
-                            const leaf = Tree.find_any_leaf(current_node_ptr);
-                            const limit = @min(leaf.key.len, key.len);
-                            for (MAX_PREFIX_LEN..header.prefix_len) |_| {
-                                if (depth >= limit or leaf.key[depth] != key[depth]) {
-                                    return null;
-                                }
-                                depth += 1;
-                            }
-                        }
-                    }
+                    depth = match_prefix_exact(current_node_ptr, header, key, depth) orelse return null;
 
                     if (depth == key.len) {
                         return if (header.leaf_value) |leaf| leaf.value else null;
@@ -149,19 +170,7 @@ pub const Tree = struct {
                     return null;
                 },
                 .internal => |header| {
-                    const max_cmp = @min(header.prefix_len, MAX_PREFIX_LEN);
-                    for (0..max_cmp) |i| {
-                        if (depth >= key.len or header.prefix[i] != key[depth]) return null;
-                        depth += 1;
-                    }
-                    if (header.prefix_len > MAX_PREFIX_LEN) {
-                        const leaf = Tree.find_any_leaf(current_node_ptr);
-                        const limit = @min(leaf.key.len, key.len);
-                        for (MAX_PREFIX_LEN..header.prefix_len) |_| {
-                            if (depth >= limit or leaf.key[depth] != key[depth]) return null;
-                            depth += 1;
-                        }
-                    }
+                    depth = match_prefix_exact(current_node_ptr, header, key, depth) orelse return null;
 
                     if (depth == key.len) {
                         if (header.leaf_value) |leaf| {
@@ -233,13 +242,10 @@ pub const Tree = struct {
                         new_n4.header.leaf_value = old_leaf;
                     }
 
+                    const new_leaf = try self.create_leaf(key, value);
                     if (i < key.len) {
-                        const new_leaf = try self.allocator.create(Leaf);
-                        new_leaf.* = .{ .key = key, .value = value };
                         try tmp_node.add_child(self.allocator, key[i], Node{ .leaf = new_leaf });
                     } else {
-                        const new_leaf = try self.allocator.create(Leaf);
-                        new_leaf.* = .{ .key = key, .value = value };
                         new_n4.header.leaf_value = new_leaf;
                     }
 
@@ -299,13 +305,10 @@ pub const Tree = struct {
                         try tmp_node.add_child(self.allocator, any_leaf.?.key[depth], node_ref.*);
 
                         // Add new leaf to new_n4
+                        const new_leaf = try self.create_leaf(key, value);
                         if (depth == key.len) {
-                            const new_leaf = try self.allocator.create(Leaf);
-                            new_leaf.* = .{ .key = key, .value = value };
                             new_n4.header.leaf_value = new_leaf;
                         } else {
-                            const new_leaf = try self.allocator.create(Leaf);
-                            new_leaf.* = .{ .key = key, .value = value };
                             try tmp_node.add_child(self.allocator, key[depth], Node{ .leaf = new_leaf });
                         }
 
@@ -319,9 +322,7 @@ pub const Tree = struct {
                         if (header.leaf_value) |old_leaf| {
                             old_leaf.value = value;
                         } else {
-                            const new_leaf = try self.allocator.create(Leaf);
-                            new_leaf.* = .{ .key = key, .value = value };
-                            header.leaf_value = new_leaf;
+                            header.leaf_value = try self.create_leaf(key, value);
                         }
                         return;
                     }
@@ -334,9 +335,7 @@ pub const Tree = struct {
                         depth += 1;
                     } else {
                         // Child not found, insert here
-                        const new_leaf = try self.allocator.create(Leaf);
-                        new_leaf.* = .{ .key = key, .value = value };
-
+                        const new_leaf = try self.create_leaf(key, value);
                         try node_ref.add_child(self.allocator, key_byte, Node{ .leaf = new_leaf });
                         return;
                     }
@@ -345,9 +344,7 @@ pub const Tree = struct {
         }
 
         // Tree is empty
-        const new_leaf = try self.allocator.create(Leaf);
-        new_leaf.* = .{ .key = key, .value = value };
-        node_ref.* = Node{ .leaf = new_leaf };
+        node_ref.* = Node{ .leaf = try self.create_leaf(key, value) };
     }
 
     /// Builds a planner-only shadow tree from the current live ART.
@@ -409,25 +406,7 @@ pub const Tree = struct {
                     return false;
                 },
                 .internal => |header| {
-                    // Path compression check
-                    const p_len = header.prefix_len;
-                    const max_cmp = @min(p_len, MAX_PREFIX_LEN);
-                    for (0..max_cmp) |i| {
-                        if (depth >= key.len or header.prefix[i] != key[depth]) {
-                            return false;
-                        }
-                        depth += 1;
-                    }
-                    if (p_len > MAX_PREFIX_LEN) {
-                        const leaf = Tree.find_any_leaf(node_ref);
-                        const limit = @min(leaf.key.len, key.len);
-                        for (MAX_PREFIX_LEN..p_len) |_| {
-                            if (depth >= limit or leaf.key[depth] != key[depth]) {
-                                return false;
-                            }
-                            depth += 1;
-                        }
-                    }
+                    depth = match_prefix_exact(node_ref, header, key, depth) orelse return false;
 
                     if (depth > key.len) return false;
 
@@ -1148,8 +1127,7 @@ pub const Tree = struct {
         if (start_after_key == null) return .{ .cursor = range_start.?, .inclusive = true };
 
         return switch (std.mem.order(u8, range_start.?, start_after_key.?)) {
-            .lt => .{ .cursor = start_after_key.?, .inclusive = false },
-            .eq => .{ .cursor = start_after_key.?, .inclusive = false },
+            .lt, .eq => .{ .cursor = start_after_key.?, .inclusive = false },
             .gt => .{ .cursor = range_start.?, .inclusive = true },
         };
     }

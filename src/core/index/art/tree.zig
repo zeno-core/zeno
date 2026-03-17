@@ -262,7 +262,7 @@ pub const Tree = struct {
                         new_n4.header.store_leaf_value(new_leaf);
                     }
 
-                    @atomicStore(usize, node_ref, tmp_node, .release);
+                    @atomicStore(usize, node_ref, tmp_node, .monotonic);
                     return;
                 },
                 .internal => |header| {
@@ -326,7 +326,7 @@ pub const Tree = struct {
                         }
 
                         // Replace parent ptr
-                        @atomicStore(usize, node_ref, tmp_node, .release);
+                        @atomicStore(usize, node_ref, tmp_node, .monotonic);
                         return;
                     }
 
@@ -358,7 +358,7 @@ pub const Tree = struct {
         }
 
         // Tree is empty
-        @atomicStore(usize, node_ref, node.node_leaf(try self.create_leaf(key, value)), .release);
+        @atomicStore(usize, node_ref, node.node_leaf(try self.create_leaf(key, value)), .monotonic);
     }
 
     /// Builds a planner-only shadow tree from the current live ART.
@@ -412,7 +412,7 @@ pub const Tree = struct {
                         if (parent_ptr) |parent| {
                             try node.remove_child(parent, self.allocator, parent_key_byte.?);
                         } else {
-                            @atomicStore(usize, &self.root, node.node_empty(), .release);
+                            @atomicStore(usize, &self.root, node.node_empty(), .monotonic);
                         }
                         return true;
                     }
@@ -432,7 +432,7 @@ pub const Tree = struct {
                                     if (parent_ptr) |parent| {
                                         try node.remove_child(parent, self.allocator, parent_key_byte.?);
                                     } else {
-                                        @atomicStore(usize, &self.root, node.node_empty(), .release);
+                                        @atomicStore(usize, &self.root, node.node_empty(), .monotonic);
                                     }
                                 } else if (header.num_children == 1) {
                                     try node.shrink(node_ref, self.allocator);
@@ -471,7 +471,7 @@ pub const Tree = struct {
 
         if (prefix.len == 0) {
             const removed_all = count_subtree_keys(&self.root);
-            @atomicStore(usize, &self.root, node.node_empty(), .release);
+            @atomicStore(usize, &self.root, node.node_empty(), .monotonic);
             return removed_all;
         }
 
@@ -570,7 +570,7 @@ pub const Tree = struct {
             // Route through remove_child so existing shrink/merge logic keeps ART compact.
             try node.remove_child(parent, self.allocator, cut.parent_key_byte.?);
         } else {
-            @atomicStore(usize, &self.root, node.node_empty(), .release);
+            @atomicStore(usize, &self.root, node.node_empty(), .monotonic);
         }
     }
 

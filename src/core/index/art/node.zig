@@ -56,7 +56,7 @@ pub const NodeHeader = extern struct {
 
     pub inline fn store_leaf_value(self: *NodeHeader, leaf: ?*Leaf) void {
         const raw: usize = if (leaf) |l| @intFromPtr(l) else 0;
-        @atomicStore(usize, @as(*usize, @ptrCast(&self.leaf_value)), raw, .release);
+        @atomicStore(usize, @as(*usize, @ptrCast(&self.leaf_value)), raw, .monotonic);
     }
 
     /// Finds a child pointer by transition byte for any internal-node class.
@@ -177,7 +177,7 @@ pub const Leaf = struct {
     }
 
     pub inline fn store_value(self: *Leaf, v: *Value) void {
-        @atomicStore(*Value, &self.value, v, .release);
+        @atomicStore(*Value, &self.value, v, .monotonic);
     }
 };
 
@@ -288,7 +288,7 @@ pub fn grow(self: *Node, allocator: std.mem.Allocator) !void {
                 n16.keys[i] = n4.keys[i];
                 n16.children[i] = n4.children[i];
             }
-            @atomicStore(usize, self, node_internal(&n16.header), .release);
+            @atomicStore(usize, self, node_internal(&n16.header), .monotonic);
         },
         .node16 => {
             const n16 = @as(*Node16, @alignCast(@fieldParentPtr("header", header)));
@@ -302,7 +302,7 @@ pub fn grow(self: *Node, allocator: std.mem.Allocator) !void {
                 n48.children[i] = n16.children[i];
                 n48.present |= (@as(u64, 1) << @intCast(i));
             }
-            @atomicStore(usize, self, node_internal(&n48.header), .release);
+            @atomicStore(usize, self, node_internal(&n48.header), .monotonic);
         },
         .node48 => {
             const n48 = @as(*Node48, @alignCast(@fieldParentPtr("header", header)));
@@ -316,7 +316,7 @@ pub fn grow(self: *Node, allocator: std.mem.Allocator) !void {
                     n256.children[i] = n48.children[idx];
                 }
             }
-            @atomicStore(usize, self, node_internal(&n256.header), .release);
+            @atomicStore(usize, self, node_internal(&n256.header), .monotonic);
         },
         .node256 => return error.TreeFull,
     }
@@ -350,7 +350,7 @@ pub fn add_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8, child:
             }
             n4.keys[i] = key_byte;
             n4.children[i] = child;
-            @atomicStore(u16, &n4.header.num_children, count + 1, .release);
+            @atomicStore(u16, &n4.header.num_children, count + 1, .monotonic);
         },
         .node16 => {
             const n16 = @as(*Node16, @alignCast(@fieldParentPtr("header", header)));
@@ -370,7 +370,7 @@ pub fn add_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8, child:
             }
             n16.keys[i] = key_byte;
             n16.children[i] = child;
-            @atomicStore(u16, &n16.header.num_children, count + 1, .release);
+            @atomicStore(u16, &n16.header.num_children, count + 1, .monotonic);
         },
         .node48 => {
             const n48 = @as(*Node48, @alignCast(@fieldParentPtr("header", header)));
@@ -383,12 +383,12 @@ pub fn add_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8, child:
             n48.present |= (@as(u64, 1) << @intCast(pos));
 
             n48.children[pos] = child;
-            @atomicStore(u8, &n48.child_index[key_byte], @intCast(pos), .release);
+            @atomicStore(u8, &n48.child_index[key_byte], @intCast(pos), .monotonic);
             n48.header.num_children += 1;
         },
         .node256 => {
             const n256 = @as(*Node256, @alignCast(@fieldParentPtr("header", header)));
-            @atomicStore(usize, &n256.children[key_byte], child, .release);
+            @atomicStore(usize, &n256.children[key_byte], child, .monotonic);
             n256.header.num_children += 1;
         },
     }
@@ -406,13 +406,13 @@ pub fn shrink(self: *Node, allocator: std.mem.Allocator) !void {
         .node4 => {
             const n4 = @as(*Node4, @alignCast(@fieldParentPtr("header", header)));
             if (n4.header.num_children == 0) {
-                @atomicStore(usize, self, node_leaf(n4.header.load_leaf_value().?), .release);
+                @atomicStore(usize, self, node_leaf(n4.header.load_leaf_value().?), .monotonic);
                 return;
             }
             if (n4.header.num_children == 1 and n4.header.load_leaf_value() == null) {
                 const child = n4.children[0];
                 if (node_is_leaf(child)) {
-                    @atomicStore(usize, self, child, .release);
+                    @atomicStore(usize, self, child, .monotonic);
                 } else {
                     const child_header = node_to_internal(child);
                     const combined_len = @as(usize, n4.header.prefix_len) + child_header.prefix_len + 1;
@@ -445,7 +445,7 @@ pub fn shrink(self: *Node, allocator: std.mem.Allocator) !void {
                     child_header.prefix_len = @intCast(combined_len);
                     child_header.prefix = new_prefix;
 
-                    @atomicStore(usize, self, child, .release);
+                    @atomicStore(usize, self, child, .monotonic);
                 }
             }
         },
@@ -460,7 +460,7 @@ pub fn shrink(self: *Node, allocator: std.mem.Allocator) !void {
                     n4.keys[i] = n16.keys[i];
                     n4.children[i] = n16.children[i];
                 }
-                @atomicStore(usize, self, node_internal(&n4.header), .release);
+                @atomicStore(usize, self, node_internal(&n4.header), .monotonic);
             }
         },
         .node48 => {
@@ -479,7 +479,7 @@ pub fn shrink(self: *Node, allocator: std.mem.Allocator) !void {
                         child_idx += 1;
                     }
                 }
-                @atomicStore(usize, self, node_internal(&n16.header), .release);
+                @atomicStore(usize, self, node_internal(&n16.header), .monotonic);
             }
         },
         .node256 => {
@@ -498,7 +498,7 @@ pub fn shrink(self: *Node, allocator: std.mem.Allocator) !void {
                         pos += 1;
                     }
                 }
-                @atomicStore(usize, self, node_internal(&n48.header), .release);
+                @atomicStore(usize, self, node_internal(&n48.header), .monotonic);
             }
         },
     }
@@ -528,7 +528,7 @@ pub fn remove_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8) !vo
                 n4.keys[pos] = n4.keys[pos + 1];
                 n4.children[pos] = n4.children[pos + 1];
             }
-            @atomicStore(u16, &n4.header.num_children, next_count, .release);
+            @atomicStore(u16, &n4.header.num_children, next_count, .monotonic);
             if (next_count <= 1) {
                 try shrink(self, allocator);
             }
@@ -547,7 +547,7 @@ pub fn remove_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8) !vo
                 n16.keys[pos] = n16.keys[pos + 1];
                 n16.children[pos] = n16.children[pos + 1];
             }
-            @atomicStore(u16, &n16.header.num_children, next_count, .release);
+            @atomicStore(u16, &n16.header.num_children, next_count, .monotonic);
             if (next_count <= 4) {
                 try shrink(self, allocator);
             }
@@ -557,7 +557,7 @@ pub fn remove_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8) !vo
             const pos = n48.child_index[key_byte];
             if (pos == Node48.EMPTY_INDEX) return;
 
-            @atomicStore(u8, &n48.child_index[key_byte], Node48.EMPTY_INDEX, .release);
+            @atomicStore(u8, &n48.child_index[key_byte], Node48.EMPTY_INDEX, .monotonic);
             n48.present &= ~(@as(u64, 1) << @intCast(pos));
             n48.header.num_children -= 1;
 
@@ -568,7 +568,7 @@ pub fn remove_child(self: *Node, allocator: std.mem.Allocator, key_byte: u8) !vo
         .node256 => {
             const n256 = @as(*Node256, @alignCast(@fieldParentPtr("header", header)));
             if (!node_is_empty(n256.children[key_byte])) {
-                @atomicStore(usize, &n256.children[key_byte], node_empty(), .release);
+                @atomicStore(usize, &n256.children[key_byte], node_empty(), .monotonic);
                 n256.header.num_children -= 1;
                 if (n256.header.num_children <= 48) {
                     try shrink(self, allocator);
@@ -635,7 +635,7 @@ fn promote_into_reserved(self: *Node, promoted: ReservedInternalNode) !void {
                 n16.keys[i] = n4.keys[i];
                 n16.children[i] = n4.children[i];
             }
-            @atomicStore(usize, self, promoted.as_node(), .release);
+            @atomicStore(usize, self, promoted.as_node(), .monotonic);
         },
         .node16 => {
             if (promoted.node_type() != .node48) return error.InvalidNodeGrowth;
@@ -652,7 +652,7 @@ fn promote_into_reserved(self: *Node, promoted: ReservedInternalNode) !void {
                 n48.children[i] = n16.children[i];
                 n48.present |= (@as(u64, 1) << @intCast(i));
             }
-            @atomicStore(usize, self, promoted.as_node(), .release);
+            @atomicStore(usize, self, promoted.as_node(), .monotonic);
         },
         .node48 => {
             if (promoted.node_type() != .node256) return error.InvalidNodeGrowth;
@@ -669,7 +669,7 @@ fn promote_into_reserved(self: *Node, promoted: ReservedInternalNode) !void {
                     n256.children[i] = n48.children[idx];
                 }
             }
-            @atomicStore(usize, self, promoted.as_node(), .release);
+            @atomicStore(usize, self, promoted.as_node(), .monotonic);
         },
         .node256 => return error.TreeFull,
     }
@@ -706,7 +706,7 @@ pub fn add_child_reserved(self: *Node, key_byte: u8, child: Node, promoted: ?Res
             }
             n4.keys[i] = key_byte;
             n4.children[i] = child;
-            @atomicStore(u16, &n4.header.num_children, count + 1, .release);
+            @atomicStore(u16, &n4.header.num_children, count + 1, .monotonic);
         },
         .node16 => {
             const n16 = @as(*Node16, @alignCast(@fieldParentPtr("header", current)));
@@ -722,7 +722,7 @@ pub fn add_child_reserved(self: *Node, key_byte: u8, child: Node, promoted: ?Res
             }
             n16.keys[i] = key_byte;
             n16.children[i] = child;
-            @atomicStore(u16, &n16.header.num_children, count + 1, .release);
+            @atomicStore(u16, &n16.header.num_children, count + 1, .monotonic);
         },
         .node48 => {
             const n48 = @as(*Node48, @alignCast(@fieldParentPtr("header", current)));
@@ -730,13 +730,13 @@ pub fn add_child_reserved(self: *Node, key_byte: u8, child: Node, promoted: ?Res
             std.debug.assert(pos < 48);
             n48.present |= (@as(u64, 1) << @intCast(pos));
             n48.children[pos] = child;
-            @atomicStore(u8, &n48.child_index[key_byte], @intCast(pos), .release);
+            @atomicStore(u8, &n48.child_index[key_byte], @intCast(pos), .monotonic);
             n48.header.num_children += 1;
         },
         .node256 => {
             const n256 = @as(*Node256, @alignCast(@fieldParentPtr("header", current)));
             std.debug.assert(node_is_empty(n256.children[key_byte]));
-            @atomicStore(usize, &n256.children[key_byte], child, .release);
+            @atomicStore(usize, &n256.children[key_byte], child, .monotonic);
             n256.header.num_children += 1;
         },
     }

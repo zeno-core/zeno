@@ -484,7 +484,7 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
     switch (prepared.kind) {
         .create_root_leaf => {
             if (!node.node_is_empty(target.node_ref.*)) return error.BatchPlanInvariantViolation;
-            @atomicStore(usize, target.node_ref, node.node_leaf(reserved.leaf orelse return error.BatchPlanInvariantViolation), .release);
+            @atomicStore(usize, target.node_ref, node.node_leaf(reserved.leaf orelse return error.BatchPlanInvariantViolation), .monotonic);
         },
         .overwrite_leaf => {
             const leaf = switch (node.node_decode(target.node_ref.*)) {
@@ -548,7 +548,7 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
             } else {
                 split.node4.header.store_leaf_value(reserved.leaf.?);
             }
-            @atomicStore(usize, target.node_ref, new_node, .release);
+            @atomicStore(usize, target.node_ref, new_node, .monotonic);
         },
         .prefix_split => {
             const header = try validate_target_internal(target.node_ref, prepared, target.depth);
@@ -569,7 +569,7 @@ pub fn apply_prepared_insert(root: *Node, prepared: *const PreparedInsert, reser
             } else {
                 split.node4.header.store_leaf_value(reserved.leaf.?);
             }
-            @atomicStore(usize, target.node_ref, new_node, .release);
+            @atomicStore(usize, target.node_ref, new_node, .monotonic);
         },
     }
 }

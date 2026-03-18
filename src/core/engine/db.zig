@@ -1025,7 +1025,7 @@ test "compact_all clears retained heavy estimate across shards" {
     try testing.expectEqual(@as(u64, 0), after.retained_heavy_bytes_estimate);
 }
 
-test "heavy overwrite retained estimate grows then drops below epsilon after compact_all" {
+test "heavy overwrite retained estimate stays low with heap-owned overwrites" {
     const testing = std.testing;
 
     const db = try create(testing.allocator);
@@ -1033,11 +1033,11 @@ test "heavy overwrite retained estimate grows then drops below epsilon after com
 
     const payload_bytes: usize = 1024;
     const overwrite_count: usize = 20_000;
-    // Conservative verification bounds (not operational thresholds):
-    // 10 MiB threshold comes from heavy overwrite math (10,240 * 1 KiB ~= 10 MiB).
-    // 1 KiB epsilon allows one live retained 1 KiB value after compaction.
-    const threshold_bytes: u64 = 10 * 1024 * 1024;
+    // With heap-owned heavy overwrites, retention should stay bounded near the
+    // initial arena-owned value for this key rather than growing per overwrite.
     const epsilon_bytes: u64 = 1024;
+    const low_retention_factor: u64 = 4;
+    const low_retention_ceiling = epsilon_bytes * low_retention_factor;
 
     var payload_a = [_]u8{'m'} ** payload_bytes;
     var payload_b = [_]u8{'n'} ** payload_bytes;
@@ -1051,13 +1051,18 @@ test "heavy overwrite retained estimate grows then drops below epsilon after com
     }
 
     const before = db.state.stats_snapshot();
-    try testing.expect(before.retained_heavy_bytes_estimate > threshold_bytes);
+    try testing.expect(before.retained_heavy_bytes_estimate <= low_retention_ceiling);
     try testing.expect(before.overwritten_heavy_bytes_total >= before.retained_heavy_bytes_estimate);
 
     try db.compact_all();
 
     const after = db.state.stats_snapshot();
-    try testing.expect(after.retained_heavy_bytes_estimate <= epsilon_bytes);
+    try testing.expect(after.retained_heavy_bytes_estimate <= low_retention_ceiling);
+    const retained_delta = if (before.retained_heavy_bytes_estimate >= after.retained_heavy_bytes_estimate)
+        before.retained_heavy_bytes_estimate - after.retained_heavy_bytes_estimate
+    else
+        after.retained_heavy_bytes_estimate - before.retained_heavy_bytes_estimate;
+    try testing.expect(retained_delta <= epsilon_bytes);
     try testing.expect(after.overwritten_heavy_bytes_total >= before.overwritten_heavy_bytes_total);
 }
 

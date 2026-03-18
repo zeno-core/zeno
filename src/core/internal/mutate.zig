@@ -80,17 +80,18 @@ pub fn stored_value_equals_unlocked(
 ///
 /// Time Complexity: O(k + v), where `k` is `key.len` and `v` is deep-clone work for `value`.
 ///
-/// Allocator: Uses the shard arena allocator for inserts; overwrite storage strategy depends on `overwrite_ownership`.
+/// Allocator: Uses the shard arena allocator for inserts; heavy overwrites allocate on the base allocator so replaced values can be freed individually.
 ///
-/// Ownership: Clones `value` into shard-owned storage and releases previously heap-owned values when replaced.
+/// Ownership: Inserts clone into shard-owned arena storage; heavy overwrites clone into heap-owned storage and release previously heap-owned values when replaced.
 pub fn upsert_value_unlocked_with_overwrite_ownership_and_outcome(
     shard: *runtime_shard.Shard,
     key: []const u8,
     value: *const types.Value,
-    overwrite_ownership: OverwriteOwnership,
+    _: OverwriteOwnership,
 ) !UpsertOutcome {
     if (shard.tree.find_leaf_for_exact_key(key)) |leaf| {
-        const previous_heavy_bytes = estimated_value_bytes(leaf.value);
+        const previous_owner = leaf.value_owner;
+        const previous_heavy_bytes = if (previous_owner == .tree_allocator) estimated_value_bytes(leaf.value) else 0;
         const previous_heavy_event = previous_heavy_bytes != 0;
 
         if (is_scalar_value(value)) {
@@ -110,29 +111,18 @@ pub fn upsert_value_unlocked_with_overwrite_ownership_and_outcome(
             owner: art_node.ValueOwner,
         };
 
-        const cloned: ClonedOverwrite = switch (overwrite_ownership) {
-            .tree_arena => blk: {
-                const arena_allocator = shard.arena.allocator();
-                const cloned_value = try arena_allocator.create(types.Value);
-                cloned_value.* = try value.clone(arena_allocator);
-                break :blk .{
-                    .value = cloned_value,
-                    .owner = art_node.ValueOwner.tree_allocator,
-                };
-            },
-            .heap => blk: {
-                const cloned_value = try shard.base_allocator.create(types.Value);
-                errdefer shard.base_allocator.destroy(cloned_value);
-                cloned_value.* = try value.clone(shard.base_allocator);
-                break :blk .{
-                    .value = cloned_value,
-                    .owner = art_node.ValueOwner.heap_allocation,
-                };
-            },
+        // Heavy overwrite always uses heap so the next overwrite can free this value.
+        const cloned: ClonedOverwrite = blk: {
+            const cloned_value = try shard.base_allocator.create(types.Value);
+            errdefer shard.base_allocator.destroy(cloned_value);
+            cloned_value.* = try value.clone(shard.base_allocator);
+            break :blk .{
+                .value = cloned_value,
+                .owner = art_node.ValueOwner.heap_allocation,
+            };
         };
 
         const previous_value = leaf.value;
-        const previous_owner = leaf.value_owner;
         leaf.value = cloned.value;
         leaf.value_owner = cloned.owner;
         if (previous_owner == .heap_allocation) {
@@ -205,12 +195,13 @@ pub fn try_overwrite_if_exists_unlocked(
     value: *const types.Value,
 ) !?UpsertOutcome {
     const leaf = shard.tree.find_leaf_for_exact_key(key) orelse return null;
+    const previous_owner = leaf.value_owner;
 
-    const previous_heavy_bytes = estimated_value_bytes(leaf.value);
+    const previous_heavy_bytes = if (previous_owner == .tree_allocator) estimated_value_bytes(leaf.value) else 0;
     const previous_heavy_event = previous_heavy_bytes != 0;
 
     if (is_scalar_value(value)) {
-        if (leaf.value_owner == .heap_allocation) {
+        if (previous_owner == .heap_allocation) {
             leaf.value.deinit(shard.base_allocator);
         }
         leaf.value.* = value.*;
@@ -225,14 +216,16 @@ pub fn try_overwrite_if_exists_unlocked(
         };
     }
 
-    const arena_allocator = shard.arena.allocator();
-    const cloned_value = try arena_allocator.create(types.Value);
-    cloned_value.* = try value.clone(arena_allocator);
+    // Clone new heavy value onto the heap so the next overwrite can free it.
+    // Arena-owned values cannot be individually freed; using heap ownership here
+    // bounds arena accumulation to at most the initial insert value per key.
+    const cloned_value = try shard.base_allocator.create(types.Value);
+    errdefer shard.base_allocator.destroy(cloned_value);
+    cloned_value.* = try value.clone(shard.base_allocator);
 
     const previous_value = leaf.value;
-    const previous_owner = leaf.value_owner;
     leaf.store_value(cloned_value);
-    leaf.value_owner = .tree_allocator;
+    leaf.value_owner = .heap_allocation;
     if (previous_owner == .heap_allocation) {
         free_heap_value(shard.base_allocator, previous_value);
     }

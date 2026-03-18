@@ -29,6 +29,7 @@ pub const Database = struct {
     state: runtime_state.DatabaseState,
     auto_compaction: AutoCompaction = .{},
     auto_wal_checkpoint: AutoWalCheckpoint = .{},
+    ttl_sweeper: TtlSweeper = .{},
 
     /// Per-database policy state for optional heavy-overwrite auto-compaction.
     const AutoCompaction = struct {
@@ -47,6 +48,16 @@ pub const Database = struct {
         max_bytes: ?u64 = null,
         /// Re-entry guard so automatic WAL checkpoints never run concurrently.
         in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    };
+
+    /// Per-database state for the optional background TTL expiry sweep thread.
+    const TtlSweeper = struct {
+        /// Sweep interval in milliseconds. Only meaningful when `thread != null`.
+        interval_ms: u32 = 1_000,
+        /// Set to `true` to signal the sweep thread to stop.
+        stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+        /// The running sweep thread, or `null` when the sweeper is not active.
+        thread: ?std.Thread = null,
     };
 
     /// Flushes and closes engine-owned resources.
@@ -226,6 +237,48 @@ pub const Database = struct {
     /// Releases the auto-checkpoint re-entry guard.
     fn end_wal_checkpoint(self: *Database) void {
         self.auto_wal_checkpoint.in_progress.store(false, .release);
+    }
+
+    /// Starts the background TTL sweep thread with the given interval.
+    ///
+    /// Time Complexity: O(1).
+    ///
+    /// Allocator: Does not allocate beyond the OS thread stack.
+    ///
+    /// Thread Safety: Must be called before the engine handle is shared across threads.
+    pub fn start_ttl_sweeper(self: *Database, interval_ms: u32) !void {
+        self.ttl_sweeper.interval_ms = interval_ms;
+        self.ttl_sweeper.stop.store(false, .release);
+        self.ttl_sweeper.thread = try std.Thread.spawn(.{}, ttl_sweep_thread_main, .{self});
+    }
+
+    /// Signals the sweep thread to stop and joins it.
+    ///
+    /// Time Complexity: O(1) plus thread join latency (at most one sweep interval).
+    ///
+    /// Allocator: Does not allocate.
+    ///
+    /// Thread Safety: Safe to call from the engine owner thread during close.
+    pub fn stop_ttl_sweeper(self: *Database) void {
+        self.ttl_sweeper.stop.store(true, .release);
+        if (self.ttl_sweeper.thread) |thread| {
+            thread.join();
+            self.ttl_sweeper.thread = null;
+        }
+    }
+
+    fn ttl_sweep_thread_main(db: *Database) void {
+        const interval_ns = @as(u64, db.ttl_sweeper.interval_ms) * std.time.ns_per_ms;
+
+        while (!db.ttl_sweeper.stop.load(.acquire)) {
+            std.Thread.sleep(interval_ns);
+            if (db.ttl_sweeper.stop.load(.acquire)) break;
+
+            for (0..runtime_state.NUM_SHARDS) |shard_idx| {
+                if (db.ttl_sweeper.stop.load(.acquire)) break;
+                expiration.sweep_expired_entries_for_shard(&db.state, shard_idx, db.allocator);
+            }
+        }
     }
 
     /// Deletes one plain key from the engine contract surface.
@@ -3054,4 +3107,119 @@ test "max_wal_bytes null leaves checkpoint scheduling fully manual" {
 
     const stats = db.state.stats_snapshot();
     try testing.expectEqual(@as(u64, 0), stats.checkpoint_count_total);
+}
+
+test "sweep_expired_entries_for_shard removes expired keys from art and ttl index" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("sweep:alpha", &value);
+    try db.put("sweep:beta", &value);
+
+    // Set both keys as already expired.
+    try set_ttl_for_test(db, "sweep:alpha", runtime_shard.unix_now() - 10);
+    try set_ttl_for_test(db, "sweep:beta", runtime_shard.unix_now() - 10);
+
+    const shard_idx_alpha = runtime_shard.get_shard_index("sweep:alpha");
+    const shard_idx_beta = runtime_shard.get_shard_index("sweep:beta");
+
+    expiration.sweep_expired_entries_for_shard(&db.state, shard_idx_alpha, testing.allocator);
+    expiration.sweep_expired_entries_for_shard(&db.state, shard_idx_beta, testing.allocator);
+
+    try testing.expect((try db.get(testing.allocator, "sweep:alpha")) == null);
+    try testing.expect((try db.get(testing.allocator, "sweep:beta")) == null);
+    try testing.expect(!has_ttl_for_test(db, "sweep:alpha"));
+    try testing.expect(!has_ttl_for_test(db, "sweep:beta"));
+    try testing.expect(!has_stored_key_for_test(db, "sweep:alpha"));
+    try testing.expect(!has_stored_key_for_test(db, "sweep:beta"));
+}
+
+test "sweep_expired_entries_for_shard preserves non-expired keys" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 7 };
+    try db.put("sweep:live", &value);
+    try set_ttl_for_test(db, "sweep:live", runtime_shard.unix_now() + 60);
+
+    const shard_idx = runtime_shard.get_shard_index("sweep:live");
+    expiration.sweep_expired_entries_for_shard(&db.state, shard_idx, testing.allocator);
+
+    try testing.expect(has_stored_key_for_test(db, "sweep:live"));
+    try testing.expect(has_ttl_for_test(db, "sweep:live"));
+
+    var stored = (try db.get(testing.allocator, "sweep:live")).?;
+    defer stored.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 7), stored.integer);
+}
+
+test "sweep_expired_entries_for_shard skips shards with no ttl entries" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("sweep:notttl", &value);
+
+    // No TTL set, has_ttl_entries should be false for this shard
+    const shard_idx = runtime_shard.get_shard_index("sweep:notttl");
+    try testing.expect(!db.state.shards[shard_idx].has_ttl_entries);
+
+    // Should be a no-op — key must remain
+    expiration.sweep_expired_entries_for_shard(&db.state, shard_idx, testing.allocator);
+    try testing.expect(has_stored_key_for_test(db, "sweep:notttl"));
+}
+
+test "ttl_sweep_interval_ms starts background cleanup of expired keys" {
+    const testing = std.testing;
+
+    const db = try open(testing.allocator, .{
+        .ttl_sweep_interval_ms = 20,
+    });
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 3 };
+    try db.put("sweep:bg", &value);
+    try set_ttl_for_test(db, "sweep:bg", runtime_shard.unix_now() - 1);
+
+    // Wait for at least two sweep cycles
+    std.Thread.sleep(80 * std.time.ns_per_ms);
+
+    try testing.expect(!has_stored_key_for_test(db, "sweep:bg"));
+    try testing.expect(!has_ttl_for_test(db, "sweep:bg"));
+}
+
+test "ttl_sweep_interval_ms null leaves cleanup lazy only" {
+    const testing = std.testing;
+
+    const db = try open(testing.allocator, .{
+        .ttl_sweep_interval_ms = null,
+    });
+    defer db.close() catch unreachable;
+
+    const value = types.Value{ .integer = 1 };
+    try db.put("sweep:lazy", &value);
+    try set_ttl_for_test(db, "sweep:lazy", runtime_shard.unix_now() - 1);
+
+    // No background sweep; key should still be in ttl_index and ART
+    try testing.expect(has_ttl_for_test(db, "sweep:lazy"));
+    try testing.expect(has_stored_key_for_test(db, "sweep:lazy"));
+    // But invisible to get()
+    try testing.expect((try db.get(testing.allocator, "sweep:lazy")) == null);
+}
+
+test "close stops the sweep thread cleanly" {
+    const testing = std.testing;
+
+    const db = try open(testing.allocator, .{
+        .ttl_sweep_interval_ms = 50,
+    });
+    // Verify close does not hang or deadlock with a running sweep thread
+    try db.close();
 }

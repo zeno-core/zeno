@@ -47,6 +47,14 @@ pub const DatabaseOptions = struct {
     /// workloads. Lower values cause more frequent checkpoints; values below ~1 MiB may
     /// impose noticeable checkpoint overhead on write-heavy workloads.
     max_wal_bytes: ?u64 = null,
+    /// Interval in milliseconds between background TTL sweep passes.
+    /// When set, a background thread wakes every `ttl_sweep_interval_ms` milliseconds
+    /// and removes expired entries from the TTL index and ART of each shard.
+    /// `null` leaves TTL cleanup fully lazy (only happens when expired keys are accessed).
+    ///
+    /// Operational guidance: 1_000 ms (1 second) is a safe starting point. Lower values
+    /// reclaim memory faster at the cost of more frequent shard locking.
+    ttl_sweep_interval_ms: ?u32 = null,
 
     // Maintenance note:
     // Heavy-overwrite reclaim is currently caller-managed through explicit

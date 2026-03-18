@@ -77,6 +77,9 @@ pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Databas
     }
 
     try purge_expired_after_recovery(&db.state);
+    if (options.ttl_sweep_interval_ms) |interval_ms| {
+        db.start_ttl_sweeper(interval_ms) catch |err| return error_mod.map_persistence_error(err);
+    }
     return db;
 }
 
@@ -114,6 +117,9 @@ fn create_with_snapshot_path(
 /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle.
 pub fn close(db: *Database) EngineError!void {
     if (db.state.active_read_views.load(.monotonic) != 0) return error.ActiveReadViews;
+    // Stop the sweep thread before tearing down shard state. The thread accesses
+    // shard memory; it must be joined before `db.state.deinit()` frees it.
+    db.stop_ttl_sweeper();
     if (db.state.wal) |*wal| {
         if (wal.needs_close_fsync()) {
             wal.fsync() catch return error.WalFlushFailed;

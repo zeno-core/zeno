@@ -3,6 +3,7 @@
 //! Allocator: Uses the shard arena model for committed point-write ownership.
 
 const std = @import("std");
+const art = @import("../index/art/tree.zig");
 const durability = @import("durability.zig");
 const expiration = @import("expiration.zig");
 const error_mod = @import("error.zig");
@@ -207,4 +208,107 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.En
 
     state.record_operation(.delete, 1);
     return true;
+}
+
+/// Removes all keys whose name starts with `prefix` from all shards.
+///
+/// Iterates every shard, collects matching key names under the shard lock,
+/// then removes each via the standard value-teardown path so heap-owned
+/// values are freed correctly. Emits one WAL DELETE record per removed key
+/// when durability is enabled.
+///
+/// Time Complexity: O(s * (k + N)), where `s` is shard count, `k` is
+/// `prefix.len` for ART navigation, and `N` is total matching keys.
+///
+/// Allocator: Uses `state.base_allocator` for a temporary per-shard key
+/// list. Allocation is O(matching keys in shard); freed before moving to
+/// the next shard.
+///
+/// Ownership: Does not return owned data.
+///
+/// Durability Semantics: Non-atomic across shards. On failure, any DELETE
+/// records already appended to the WAL for earlier shards remain durable;
+/// the in-memory state matches what was durably logged.
+///
+/// Thread Safety: Acquires the shared visibility gate and shard-exclusive
+/// lock per shard. Uses the seqlock bracket for ART modifications so
+/// concurrent lock-free GET readers observe a consistent state.
+pub fn delete_prefix(
+    state: *runtime_state.DatabaseState,
+    prefix: []const u8,
+    allocator: std.mem.Allocator,
+) error_mod.EngineError!u64 {
+    var total_deleted: u64 = 0;
+
+    for (&state.shards) |*shard| {
+        // Collect matching key slices (borrowed from ART, valid while shard lock held)
+        var matching = std.ArrayList([]const u8).empty;
+        defer {
+            for (matching.items) |k| allocator.free(k);
+            matching.deinit(allocator);
+        }
+
+        {
+            shard.visibility_gate.lock_shared();
+            defer shard.visibility_gate.unlock_shared();
+
+            shard.lock.lockShared();
+            defer shard.lock.unlockShared();
+
+            var scan_results = std.ArrayList(art.ScanEntry).empty;
+            defer scan_results.deinit(allocator);
+
+            shard.tree.scan(prefix, allocator, &scan_results) catch return error.OutOfMemory;
+
+            const now = runtime_shard.unix_now();
+            for (scan_results.items) |entry| {
+                // Skip keys that are TTL-expired and already invisible
+                if (shard.has_ttl_entries) {
+                    if (internal_ttl_index.get_expire_at(shard, entry.key)) |exp| {
+                        if (expiration.is_expired(exp, now)) continue;
+                    }
+                }
+                // Dupe the key so we own it after the shared lock releases
+                const owned_key = allocator.dupe(u8, entry.key) catch return error.OutOfMemory;
+                matching.append(allocator, owned_key) catch {
+                    allocator.free(owned_key);
+                    return error.OutOfMemory;
+                };
+            }
+        }
+
+        if (matching.items.len == 0) continue;
+
+        // Append WAL DELETE records for all matching keys before modifying in-memory state
+        // If any WAL append fails, return immediately, no in-memory changes have been made yet
+        for (matching.items) |key| {
+            try durability.append_delete_if_enabled(state, key);
+        }
+
+        // Remove from ART and TTL index under exclusive shard lock + seqlock bracket
+        {
+            shard.visibility_gate.lock_shared();
+            defer shard.visibility_gate.unlock_shared();
+
+            shard.lock.lock();
+            defer shard.lock.unlock();
+
+            const seq0 = shard.seq.load(.monotonic);
+            shard.seq.store(seq0 + 1, .release);
+            defer shard.seq.store(seq0 + 2, .release);
+
+            for (matching.items) |key| {
+                _ = internal_mutate.remove_stored_value_unlocked(shard, key) catch {};
+                internal_ttl_index.clear_ttl_entry(shard, key);
+            }
+        }
+
+        total_deleted += @intCast(matching.items.len);
+    }
+
+    if (total_deleted > 0) {
+        state.record_operation(.delete, total_deleted);
+    }
+
+    return total_deleted;
 }

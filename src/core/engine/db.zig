@@ -308,6 +308,30 @@ pub const Database = struct {
         return result;
     }
 
+    /// Removes all keys whose name starts with `prefix` and returns the deleted count.
+    ///
+    /// Time Complexity: O(s * (k + N)), where `s` is shard count, `k` is `prefix.len`,
+    /// and `N` is total matching key count across all shards.
+    ///
+    /// Allocator: Uses the engine base allocator for temporary per-shard key collection.
+    ///
+    /// Ownership: Does not return owned data.
+    ///
+    /// Durability Semantics: Non-atomic across shards. Emits one WAL DELETE per removed
+    /// key. On failure, durably logged deletes for earlier shards remain applied.
+    ///
+    /// Thread Safety: Safe for concurrent use with point reads; acquires shared visibility
+    /// gate and shard-exclusive lock per shard sequentially.
+    pub fn delete_prefix(self: *Database, prefix: []const u8) EngineError!u64 {
+        const deleted = try metrics.call_with_latency(
+            &self.state,
+            write.delete_prefix,
+            .{ &self.state, prefix, self.allocator },
+        );
+        if (deleted > 0) self.maybe_run_wal_checkpoint();
+        return deleted;
+    }
+
     /// Sets or clears key expiration at an absolute unix-second timestamp.
     ///
     /// Time Complexity: O(n + k), where `n` is `key.len` for shard routing and `k` is shard-local lookup plus optional TTL metadata update work.
@@ -3319,4 +3343,131 @@ test "engine boundary latency sampling counts exists calls" {
     const before = latency_samples_for_test(db);
     _ = try db.exists("latency:exists");
     try testing.expectEqual(before + 1, latency_samples_for_test(db));
+}
+
+test "delete_prefix removes all matching keys and returns count" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const v = types.Value{ .integer = 1 };
+    try db.put("user:1", &v);
+    try db.put("user:2", &v);
+    try db.put("user:3", &v);
+    try db.put("session:a", &v);
+
+    const deleted = try db.delete_prefix("user:");
+    try testing.expectEqual(@as(u64, 3), deleted);
+
+    try testing.expect((try db.get(testing.allocator, "user:1")) == null);
+    try testing.expect((try db.get(testing.allocator, "user:2")) == null);
+    try testing.expect((try db.get(testing.allocator, "user:3")) == null);
+
+    var session = (try db.get(testing.allocator, "session:a")).?;
+    defer session.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 1), session.integer);
+}
+
+test "delete_prefix returns zero when no keys match" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const v = types.Value{ .integer = 1 };
+    try db.put("alpha:1", &v);
+
+    const deleted = try db.delete_prefix("beta:");
+    try testing.expectEqual(@as(u64, 0), deleted);
+
+    var alpha = (try db.get(testing.allocator, "alpha:1")).?;
+    defer alpha.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 1), alpha.integer);
+}
+
+test "delete_prefix skips expired keys" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const v = types.Value{ .integer = 1 };
+    try db.put("ttl:live", &v);
+    try db.put("ttl:dead", &v);
+    try set_ttl_for_test(db, "ttl:dead", runtime_shard.unix_now() - 1);
+
+    const deleted = try db.delete_prefix("ttl:");
+    try testing.expectEqual(@as(u64, 1), deleted);
+    try testing.expect((try db.get(testing.allocator, "ttl:live")) == null);
+    try testing.expect((try db.get(testing.allocator, "ttl:dead")) == null);
+}
+
+test "delete_prefix frees heap-owned values without leaking" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    // Write a large payload so overwrite promotes value to heap_allocation.
+    var buf_a = [_]u8{'a'} ** 1024;
+    var buf_b = [_]u8{'b'} ** 1024;
+    var first = types.Value{ .string = buf_a[0..] };
+    var second = types.Value{ .string = buf_b[0..] };
+
+    try db.put("heap:key", &first);
+    try db.put("heap:key", &second);
+
+    const deleted = try db.delete_prefix("heap:");
+    try testing.expectEqual(@as(u64, 1), deleted);
+    try testing.expect((try db.get(testing.allocator, "heap:key")) == null);
+}
+
+test "delete_prefix with wal records deletes and survives reopen" {
+    const testing = std.testing;
+
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const wal_path = try alloc_tmp_path_test(testing.allocator, tmp, "delete-prefix.wal");
+    defer testing.allocator.free(wal_path);
+
+    {
+        const db = try open(testing.allocator, .{
+            .wal_path = wal_path,
+            .fsync_mode = .none,
+        });
+        defer db.close() catch unreachable;
+
+        const v = types.Value{ .integer = 42 };
+        try db.put("ns:one", &v);
+        try db.put("ns:two", &v);
+        try db.put("keep:this", &v);
+
+        const deleted = try db.delete_prefix("ns:");
+        try testing.expectEqual(@as(u64, 2), deleted);
+    }
+
+    const reopened = try open(testing.allocator, .{
+        .wal_path = wal_path,
+        .fsync_mode = .none,
+    });
+    defer reopened.close() catch unreachable;
+
+    try testing.expect((try reopened.get(testing.allocator, "ns:one")) == null);
+    try testing.expect((try reopened.get(testing.allocator, "ns:two")) == null);
+
+    var kept = (try reopened.get(testing.allocator, "keep:this")).?;
+    defer kept.deinit(testing.allocator);
+    try testing.expectEqual(@as(i64, 42), kept.integer);
+}
+
+test "delete_prefix on empty database returns zero" {
+    const testing = std.testing;
+
+    const db = try create(testing.allocator);
+    defer db.close() catch unreachable;
+
+    const deleted = try db.delete_prefix("any:");
+    try testing.expectEqual(@as(u64, 0), deleted);
 }

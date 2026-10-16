@@ -93,6 +93,7 @@ pub const OperationKind = enum {
 
 /// Full database runtime state, including shards, visibility coordination, and local counters.
 pub const DatabaseState = struct {
+    io: std.Io,
     base_allocator: std.mem.Allocator,
     wal: ?storage_wal.Wal = null,
     snapshot_path: ?[]const u8 = null,
@@ -109,9 +110,11 @@ pub const DatabaseState = struct {
     ///
     /// Allocator: Does not allocate during state construction; stores `base_allocator` so shards can later allocate owned key/value data.
     ///
+    /// Ownership: Borrows `io`; its provider must outlive this state.
+    ///
     /// Thread Safety: Must be called before the state is shared across threads.
-    pub fn init(base_allocator: std.mem.Allocator, snapshot_path: ?[]const u8) DatabaseState {
-        return initWithMetrics(base_allocator, snapshot_path, types.defaultMetricsConfig());
+    pub fn init(io: std.Io, base_allocator: std.mem.Allocator, snapshot_path: ?[]const u8) DatabaseState {
+        return initWithMetrics(io, base_allocator, snapshot_path, types.defaultMetricsConfig());
     }
 
     /// Initializes runtime state for one engine handle with explicit metrics behavior.
@@ -120,13 +123,17 @@ pub const DatabaseState = struct {
     ///
     /// Allocator: Does not allocate during state construction; stores `base_allocator` so shards can later allocate owned key/value data.
     ///
+    /// Ownership: Borrows `io`; its provider must outlive this state.
+    ///
     /// Thread Safety: Must be called before the state is shared across threads.
     pub fn initWithMetrics(
+        io: std.Io,
         base_allocator: std.mem.Allocator,
         snapshot_path: ?[]const u8,
         metrics_config: types.MetricsConfig,
     ) DatabaseState {
         var state = DatabaseState{
+            .io = io,
             .base_allocator = base_allocator,
             .wal = null,
             .snapshot_path = snapshot_path,
@@ -141,7 +148,7 @@ pub const DatabaseState = struct {
             counter_ref.* = std.atomic.Value(u64).init(0);
         }
         for (&state.shards) |*shard| {
-            shard.* = runtime_shard.Shard.init(base_allocator);
+            shard.* = runtime_shard.Shard.init(io, base_allocator);
             shard.rebindTreeAllocator();
         }
         return state;
@@ -407,7 +414,7 @@ fn latencySampleMask(shift: u8) u64 {
 test "database state metrics start at zero" {
     const testing = std.testing;
 
-    var state = DatabaseState.init(testing.allocator, null);
+    var state = DatabaseState.init(std.testing.io, testing.allocator, null);
     defer state.deinit();
 
     const snapshot = state.statsSnapshot();
@@ -431,7 +438,7 @@ test "database state metrics start at zero" {
 test "database state metrics disabled mode skips counters and latency" {
     const testing = std.testing;
 
-    var state = DatabaseState.initWithMetrics(testing.allocator, null, .{
+    var state = DatabaseState.initWithMetrics(std.testing.io, testing.allocator, null, .{
         .mode = .disabled,
     });
     defer state.deinit();
@@ -452,7 +459,7 @@ test "database state metrics disabled mode skips counters and latency" {
 test "database state metrics counters only mode updates ops without latency" {
     const testing = std.testing;
 
-    var state = DatabaseState.initWithMetrics(testing.allocator, null, .{
+    var state = DatabaseState.initWithMetrics(std.testing.io, testing.allocator, null, .{
         .mode = .counters_only,
     });
     defer state.deinit();
@@ -475,7 +482,7 @@ test "database state metrics counters only mode updates ops without latency" {
 test "database state sampled latency mode records only selected calls" {
     const testing = std.testing;
 
-    var state = DatabaseState.initWithMetrics(testing.allocator, null, .{
+    var state = DatabaseState.initWithMetrics(std.testing.io, testing.allocator, null, .{
         .mode = .sampled_latency,
         .latency_sample_shift = 2,
     });
@@ -498,7 +505,7 @@ test "database state sampled latency mode records only selected calls" {
 test "database state full metrics snapshot reflects latency checkpoint and fallback updates" {
     const testing = std.testing;
 
-    var state = DatabaseState.initWithMetrics(testing.allocator, null, .{
+    var state = DatabaseState.initWithMetrics(std.testing.io, testing.allocator, null, .{
         .mode = .full,
     });
     defer state.deinit();

@@ -43,7 +43,6 @@ pub fn scanPrefixFromInView(
     return engine_db.scanPrefixFromInView(view, allocator, prefix, cursor, limit);
 }
 
-
 /// Scans the next range page inside a consistent read view.
 ///
 /// Time Complexity: O(s log s + p * (k + log s + v)), where `s` is shard count, `p` is emitted page size, `k` is ART seek work for one shard refill, and `v` is total cloned value size.

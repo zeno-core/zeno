@@ -20,8 +20,8 @@ pub fn callWithLatency(
     if (!state.shouldRecordLatency()) {
         return @call(.auto, operation, args);
     }
-    var timer = std.time.Timer.start() catch unreachable;
-    defer state.recordLatencySample(timer.read());
+    const started = std.Io.Clock.awake.now(state.io);
+    defer state.recordLatencySample(@intCast(started.durationTo(std.Io.Clock.awake.now(state.io)).toNanoseconds()));
     return @call(.auto, operation, args);
 }
 
@@ -44,9 +44,9 @@ pub fn callWithOptionalLatency(
     } else {
         return @call(.auto, operation, args);
     }
-    var timer = std.time.Timer.start() catch unreachable;
+    const started = std.Io.Clock.awake.now(state.?.io);
     defer if (state) |resolved_state| {
-        resolved_state.recordLatencySample(timer.read());
+        resolved_state.recordLatencySample(@intCast(started.durationTo(std.Io.Clock.awake.now(resolved_state.io)).toNanoseconds()));
     };
     return @call(.auto, operation, args);
 }
@@ -58,7 +58,7 @@ fn incrementCounter(counter: *u32) void {
 test "call_with_latency skips latency counters when disabled" {
     const testing = std.testing;
 
-    var state = runtime_state.DatabaseState.initWithMetrics(testing.allocator, null, .{
+    var state = runtime_state.DatabaseState.initWithMetrics(std.testing.io, testing.allocator, null, .{
         .mode = .disabled,
     });
     defer state.deinit();
@@ -73,7 +73,7 @@ test "call_with_latency skips latency counters when disabled" {
 test "call_with_optional_latency records when full mode is enabled" {
     const testing = std.testing;
 
-    var state = runtime_state.DatabaseState.initWithMetrics(testing.allocator, null, .{
+    var state = runtime_state.DatabaseState.initWithMetrics(std.testing.io, testing.allocator, null, .{
         .mode = .full,
     });
     defer state.deinit();

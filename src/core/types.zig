@@ -49,7 +49,7 @@ pub const DatabaseOptions = struct {
     /// impose noticeable checkpoint overhead on write-heavy workloads.
     max_wal_bytes: ?u64 = null,
     /// Interval in milliseconds between background TTL sweep passes.
-    /// When set, a background thread wakes every `ttl_sweep_interval_ms` milliseconds
+    /// When set, a concurrent task wakes every `ttl_sweep_interval_ms` milliseconds
     /// and removes expired entries from the TTL index and ART of each shard.
     /// `null` leaves TTL cleanup fully lazy (only happens when expired keys are accessed).
     ///

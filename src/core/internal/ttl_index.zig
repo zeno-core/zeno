@@ -110,7 +110,7 @@ pub fn setTtlEntry(shard: *runtime_shard.Shard, key: []const u8, expireAt: i64) 
 test "set_ttl_entry inserts then updates the same key" {
     const testing = std.testing;
 
-    var shard = runtime_shard.Shard.init(testing.allocator);
+    var shard = runtime_shard.Shard.init(std.testing.io, testing.allocator);
     defer shard.deinit();
 
     try setTtlEntry(&shard, "ttl:key", 10);
@@ -123,7 +123,7 @@ test "set_ttl_entry inserts then updates the same key" {
 test "clear_ttl_entry removes metadata and frees owned key bytes" {
     const testing = std.testing;
 
-    var shard = runtime_shard.Shard.init(testing.allocator);
+    var shard = runtime_shard.Shard.init(std.testing.io, testing.allocator);
     defer shard.deinit();
 
     try setTtlEntry(&shard, "ttl:key", 10);
@@ -134,7 +134,7 @@ test "clear_ttl_entry removes metadata and frees owned key bytes" {
 test "prepared ttl entry publishes without allocating" {
     const testing = std.testing;
 
-    var shard = runtime_shard.Shard.init(testing.allocator);
+    var shard = runtime_shard.Shard.init(std.testing.io, testing.allocator);
     defer shard.deinit();
 
     const prepared = try prepareSetTtlEntry(&shard, "ttl:key");

@@ -1,10 +1,11 @@
 .{
     .name = .zeno,
-    .version = "0.15.2",
+    .version = "0.16.0",
+    .minimum_zig_version = "0.16.0",
     .dependencies = .{
         .zbench = .{
-            .url = "https://github.com/hendriknielaender/zBench/archive/refs/tags/v0.12.0.tar.gz",
-            .hash = "zbench-0.11.1-YTdc7zkmAQBWI99esNFueJc9GuzK-KaU6Nfr1ZXhNGmc",
+            .url = "https://github.com/hendriknielaender/zBench/archive/refs/tags/v0.13.0.tar.gz",
+            .hash = "zbench-0.13.0-YTdc7xVBAQCCMC-IdLLuotBeiNNNm8k9Pi2V4VYqrwfI",
         },
     },
     .paths = .{

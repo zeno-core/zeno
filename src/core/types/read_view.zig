@@ -15,7 +15,7 @@ const ReadViewToken = struct {
 };
 
 var next_read_view_token_id = std.atomic.Value(u64).init(1);
-var read_view_tokens_mutex: std.Thread.Mutex = .{};
+var read_view_tokens_mutex: std.Io.Mutex = .init;
 var read_view_tokens = std.AutoHashMapUnmanaged(u64, ReadViewToken){};
 
 /// Registers one active read-view token for a borrowed runtime-state handle.
@@ -28,13 +28,14 @@ var read_view_tokens = std.AutoHashMapUnmanaged(u64, ReadViewToken){};
 ///
 /// Thread Safety: Serializes registry mutation through `read_view_tokens_mutex`.
 fn registerReadViewToken(
+    io: std.Io,
     runtime_state: *const anyopaque,
     active_read_views: *ReadViewCounter,
     opened_at_unix_seconds: i64,
 ) std.mem.Allocator.Error!u64 {
     const token_id = next_read_view_token_id.fetchAdd(1, .monotonic);
-    read_view_tokens_mutex.lock();
-    defer read_view_tokens_mutex.unlock();
+    read_view_tokens_mutex.lockUncancelable(io);
+    defer read_view_tokens_mutex.unlock(io);
     try read_view_tokens.put(std.heap.page_allocator, token_id, .{
         .runtime_state = runtime_state,
         .active_read_views = active_read_views,
@@ -52,9 +53,9 @@ fn registerReadViewToken(
 /// Ownership: Returns borrowed registry payload that remains valid only while the token stays active.
 ///
 /// Thread Safety: Serializes registry access through `read_view_tokens_mutex`.
-fn getReadViewToken(token_id: u64) ?ReadViewToken {
-    read_view_tokens_mutex.lock();
-    defer read_view_tokens_mutex.unlock();
+fn getReadViewToken(io: std.Io, token_id: u64) ?ReadViewToken {
+    read_view_tokens_mutex.lockUncancelable(io);
+    defer read_view_tokens_mutex.unlock(io);
     return read_view_tokens.get(token_id);
 }
 
@@ -67,15 +68,16 @@ fn getReadViewToken(token_id: u64) ?ReadViewToken {
 /// Ownership: Transfers the removed token payload to the caller, which then becomes responsible for releasing the borrowed visibility hold exactly once.
 ///
 /// Thread Safety: Serializes registry mutation through `read_view_tokens_mutex`.
-fn releaseReadViewToken(token_id: u64) ?ReadViewToken {
-    read_view_tokens_mutex.lock();
-    defer read_view_tokens_mutex.unlock();
+fn releaseReadViewToken(io: std.Io, token_id: u64) ?ReadViewToken {
+    read_view_tokens_mutex.lockUncancelable(io);
+    defer read_view_tokens_mutex.unlock(io);
     const removed = read_view_tokens.fetchRemove(token_id) orelse return null;
     return removed.value;
 }
 
 /// Consistent-read window handle for the physical `zeno-core` engine contract.
 pub const ReadView = struct {
+    io: std.Io,
     token_id: u64,
 
     /// Registers one active read-view token and returns an initialized handle.
@@ -84,15 +86,17 @@ pub const ReadView = struct {
     ///
     /// Allocator: Uses `std.heap.page_allocator` only for registry growth.
     ///
-    /// Ownership: The returned handle borrows `runtime_state` and owns one registry token tracked until `deinit`.
+    /// Ownership: The returned handle borrows `io` and `runtime_state` and owns one registry token tracked until `deinit`; the I/O provider must outlive the handle.
     pub fn init(
+        io: std.Io,
         runtime_state: *const anyopaque,
         active_read_views: *ReadViewCounter,
         opened_at_unix_seconds: i64,
     ) std.mem.Allocator.Error!ReadView {
-        const token_id = try registerReadViewToken(runtime_state, active_read_views, opened_at_unix_seconds);
+        const token_id = try registerReadViewToken(io, runtime_state, active_read_views, opened_at_unix_seconds);
         _ = active_read_views.fetchAdd(1, .monotonic);
         return .{
+            .io = io,
             .token_id = token_id,
         };
     }
@@ -105,7 +109,7 @@ pub const ReadView = struct {
     ///
     /// Ownership: Returns the borrowed runtime-state pointer only while the registry token is still active.
     pub fn resolveRuntimeState(self: *const ReadView) ?*const anyopaque {
-        const token = getReadViewToken(self.token_id) orelse return null;
+        const token = getReadViewToken(self.io, self.token_id) orelse return null;
         return token.runtime_state;
     }
 
@@ -119,7 +123,7 @@ pub const ReadView = struct {
     ///
     /// Thread Safety: Not thread-safe; callers must not race `deinit` against other mutation of the same `ReadView` handle.
     pub fn deinit(self: *ReadView) void {
-        const token = releaseReadViewToken(self.token_id) orelse {
+        const token = releaseReadViewToken(self.io, self.token_id) orelse {
             self.token_id = 0;
             return;
         };
@@ -138,6 +142,6 @@ pub const ReadView = struct {
 ///
 /// Ownership: Returns the borrowed timestamp only while the registry token is still active.
 pub fn resolveOpenedAtUnixSeconds(view: *const ReadView) ?i64 {
-    const token = getReadViewToken(view.token_id) orelse return null;
+    const token = getReadViewToken(view.io, view.token_id) orelse return null;
     return token.opened_at_unix_seconds;
 }

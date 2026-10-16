@@ -34,8 +34,10 @@ var checkpoint_barrier_test_probe: ?*CheckpointBarrierTestProbe = null;
 /// Time Complexity: O(s), where `s` is the runtime shard count.
 ///
 /// Allocator: Allocates the engine handle from `allocator`.
-pub fn create(allocator: Allocator) EngineError!*Database {
-    return createWithSnapshotPath(allocator, null, types.defaultMetricsConfig());
+///
+/// Ownership: Borrows `io`; its provider must outlive the database, read views, and background workers.
+pub fn create(io: std.Io, allocator: Allocator) EngineError!*Database {
+    return createWithSnapshotPath(io, allocator, null, types.defaultMetricsConfig());
 }
 
 /// Opens an engine handle and routes persistence work through storage-owned modules.
@@ -50,8 +52,10 @@ pub fn create(allocator: Allocator) EngineError!*Database {
 /// paths for snapshot load and WAL replay scratch when persistence is configured.
 ///
 /// Thread Safety: Not thread-safe during open; recovery mutates runtime state before the database handle is published to callers.
-pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Database {
-    var db = try createWithSnapshotPath(allocator, options.snapshot_path, options.metrics);
+///
+/// Ownership: Borrows `io`; its provider must outlive the database, read views, and background workers.
+pub fn open(io: std.Io, allocator: Allocator, options: DatabaseOptions) EngineError!*Database {
+    var db = try createWithSnapshotPath(io, allocator, options.snapshot_path, options.metrics);
     errdefer db.close() catch unreachable;
 
     db.auto_compaction.every = if (options.heavy_overwrite_compact_every) |n|
@@ -69,7 +73,7 @@ pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Databas
             .delete = replayDelete,
             .expire = replayExpire,
         };
-        db.state.wal = storage_wal.open(wal_path, .{
+        db.state.wal = storage_wal.open(db.state.io, wal_path, .{
             .fsync_mode = options.fsync_mode,
             .fsync_interval_ms = options.fsync_interval_ms,
             .min_lsn = snapshot_lsn,
@@ -91,6 +95,7 @@ pub fn open(allocator: Allocator, options: DatabaseOptions) EngineError!*Databas
 ///
 /// Ownership: Borrows `snapshot_path`; the caller must keep those bytes valid for the lifetime of the returned engine handle.
 fn createWithSnapshotPath(
+    io: std.Io,
     allocator: Allocator,
     snapshot_path: ?[]const u8,
     metrics_config: types.MetricsConfig,
@@ -100,7 +105,7 @@ fn createWithSnapshotPath(
 
     db.* = .{
         .allocator = allocator,
-        .state = DatabaseState.initWithMetrics(allocator, snapshot_path, metrics_config),
+        .state = DatabaseState.initWithMetrics(io, allocator, snapshot_path, metrics_config),
     };
     db.state.rebindShardAllocators();
     return db;
@@ -147,7 +152,7 @@ pub fn close(db: *Database) EngineError!void {
 ///
 /// Thread Safety: Not thread-safe; caller must ensure exclusive ownership of the engine handle. Writers and new readers are blocked globally during the brief checkpoint barrier, active `ReadView` handles holding the shared visibility gate cause one fail-fast `error.CheckpointBusy` response instead of waiting, and writers are blocked globally again during each shard-serialization window.
 pub fn checkpoint(db: *Database) EngineError!void {
-    var checkpoint_timer = std.time.Timer.start() catch unreachable;
+    const checkpoint_started = std.Io.Clock.awake.now(db.state.io);
     const snapshot_path = db.state.snapshot_path orelse return error.NoSnapshotPath;
 
     notifyCheckpointBarrierAttemptForTest();
@@ -157,12 +162,12 @@ pub fn checkpoint(db: *Database) EngineError!void {
     }
     notifyCheckpointBarrierAcquiredForTest();
 
-    for (&db.state.shards) |*shard| shard.lock.lock();
+    for (&db.state.shards) |*shard| shard.lock.lockUncancelable(shard.io);
     const checkpoint_lsn: u64 = if (db.state.wal) |wal|
         if (wal.next_lsn > 0) wal.next_lsn - 1 else 0
     else
         0;
-    for (&db.state.shards) |*shard| shard.lock.unlock();
+    for (&db.state.shards) |*shard| shard.lock.unlock(shard.io);
 
     db.state.unlockAllShardsExclusive();
 
@@ -174,7 +179,7 @@ pub fn checkpoint(db: *Database) EngineError!void {
         wal.truncateUpToLsn(checkpoint_lsn) catch |err| return error_mod.mapPersistenceError(err);
     }
 
-    db.state.recordSuccessfulCheckpoint(checkpoint_timer.read(), checkpoint_lsn);
+    db.state.recordSuccessfulCheckpoint(@intCast(checkpoint_started.durationTo(std.Io.Clock.awake.now(db.state.io)).toNanoseconds()), checkpoint_lsn);
 }
 
 /// Rebuilds runtime-owned shard storage from a fresh checkpoint snapshot to reclaim arena-retained churn.
@@ -215,8 +220,8 @@ pub fn compactShard(db: *Database, shard_idx: usize) EngineError!void {
     shard.visibility_gate.lockExclusive();
     defer shard.visibility_gate.unlockExclusive();
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     const seq0 = shard.seq.load(.monotonic);
     shard.seq.store(seq0 + 1, .release);
@@ -276,7 +281,7 @@ pub fn compactShard(db: *Database, shard_idx: usize) EngineError!void {
         });
     }
 
-    var replacement = runtime_shard.Shard.init(db.allocator);
+    var replacement = runtime_shard.Shard.init(db.state.io, db.allocator);
     var replacement_transferred = false;
     defer if (!replacement_transferred) replacement.deinit();
     replacement.rebindTreeAllocator();
@@ -337,12 +342,12 @@ fn notifyCheckpointBarrierAcquiredForTest() void {
 /// Time Complexity: O(1), excluding filesystem metadata access.
 ///
 /// Allocator: Does not allocate.
-fn walFileHasContent(wal_path: ?[]const u8) bool {
+fn walFileHasContent(io: std.Io, wal_path: ?[]const u8) bool {
     const path = wal_path orelse return false;
-    const file = std.fs.cwd().openFile(path, .{}) catch return false;
-    defer file.close();
+    const file = std.Io.Dir.cwd().openFile(io, path, .{}) catch return false;
+    defer file.close(io);
 
-    const size = file.getEndPos() catch return false;
+    const size = file.length(io) catch return false;
     return size > 0;
 }
 
@@ -365,7 +370,7 @@ fn loadSnapshotForOpen(
         } else |err| switch (err) {
             error.FileNotFound => return 0,
             error.SnapshotCorrupted => {
-                const wal_has_content = walFileHasContent(wal_path);
+                const wal_has_content = walFileHasContent(db.state.io, wal_path);
                 if (!wal_has_content) return error.SnapshotCorrupted;
 
                 db.state.recordSnapshotCorruptionFallback();
@@ -399,11 +404,11 @@ fn resetRuntimeShardsForRecovery(state: *DatabaseState) void {
 ///
 /// Thread Safety: Not thread-safe; recovery owns the runtime state exclusively before the engine handle is published.
 fn purgeExpiredAfterRecovery(state: *DatabaseState) !void {
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
 
     for (&state.shards) |*shard| {
-        shard.lock.lock();
-        defer shard.lock.unlock();
+        shard.lock.lockUncancelable(shard.io);
+        defer shard.lock.unlock(shard.io);
 
         var expired_keys = std.ArrayList([]u8).empty;
         defer {
@@ -438,8 +443,8 @@ fn replayPut(ctx: *anyopaque, key: []const u8, value: *const Value) !void {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     _ = try internal_mutate.upsertValueUnlocked(shard, key, value);
     internal_ttl_index.clearTtlEntry(shard, key);
@@ -457,8 +462,8 @@ fn replayDelete(ctx: *anyopaque, key: []const u8) !void {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     _ = try internal_mutate.removeStoredValueUnlocked(shard, key);
     internal_ttl_index.clearTtlEntry(shard, key);
@@ -476,8 +481,8 @@ fn replayExpire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     if (!internal_mutate.keyExistsUnlocked(shard, key)) {
         internal_ttl_index.clearTtlEntry(shard, key);
@@ -494,7 +499,7 @@ fn allocTmpPathTest(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basen
 test "create initializes runtime state without storage handles" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer close(db) catch unreachable;
 
     try testing.expect(db.state.wal == null);
@@ -513,7 +518,7 @@ test "load_snapshot_for_open records corruption fallback when replayable wal exi
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try create(testing.allocator);
+        const db = try create(std.testing.io, testing.allocator);
         defer close(db) catch unreachable;
 
         const value = Value{ .integer = 1 };
@@ -522,16 +527,16 @@ test "load_snapshot_for_open records corruption fallback when replayable wal exi
     }
 
     {
-        const wal_file = try std.fs.cwd().createFile(wal_path, .{ .truncate = true });
-        defer wal_file.close();
-        try wal_file.writeAll("wal");
+        const wal_file = try std.Io.Dir.cwd().createFile(std.testing.io, wal_path, .{ .truncate = true });
+        defer wal_file.close(std.testing.io);
+        try wal_file.writeStreamingAll(std.testing.io, "wal");
     }
 
-    const file = try std.fs.cwd().openFile(snapshot_path, .{ .mode = .read_write });
-    defer file.close();
-    try file.writeAll("bad!");
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, snapshot_path, .{ .mode = .read_write });
+    defer file.close(std.testing.io);
+    try file.writeStreamingAll(std.testing.io, "bad!");
 
-    const db = try createWithSnapshotPath(testing.allocator, snapshot_path, types.defaultMetricsConfig());
+    const db = try createWithSnapshotPath(std.testing.io, testing.allocator, snapshot_path, types.defaultMetricsConfig());
     defer close(db) catch unreachable;
 
     try testing.expectEqual(@as(u64, 0), try loadSnapshotForOpen(db, testing.allocator, snapshot_path, wal_path));
@@ -552,7 +557,7 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     defer testing.allocator.free(empty_wal_path);
 
     {
-        const db = try create(testing.allocator);
+        const db = try create(std.testing.io, testing.allocator);
         defer close(db) catch unreachable;
 
         const value = Value{ .integer = 1 };
@@ -561,18 +566,18 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     }
 
     {
-        const wal_file = try std.fs.cwd().createFile(empty_wal_path, .{ .truncate = true });
-        wal_file.close();
+        const wal_file = try std.Io.Dir.cwd().createFile(std.testing.io, empty_wal_path, .{ .truncate = true });
+        wal_file.close(std.testing.io);
     }
 
     {
-        const file = try std.fs.cwd().openFile(snapshot_path, .{ .mode = .read_write });
-        defer file.close();
-        try file.writeAll("bad!");
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, snapshot_path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        try file.writeStreamingAll(std.testing.io, "bad!");
     }
 
     {
-        const db = try createWithSnapshotPath(testing.allocator, snapshot_path, types.defaultMetricsConfig());
+        const db = try createWithSnapshotPath(std.testing.io, testing.allocator, snapshot_path, types.defaultMetricsConfig());
         defer close(db) catch unreachable;
 
         try testing.expectError(error.SnapshotCorrupted, loadSnapshotForOpen(db, testing.allocator, snapshot_path, missing_wal_path));
@@ -580,7 +585,7 @@ test "load_snapshot_for_open leaves fallback metric unchanged when corruption ca
     }
 
     {
-        const db = try createWithSnapshotPath(testing.allocator, snapshot_path, types.defaultMetricsConfig());
+        const db = try createWithSnapshotPath(std.testing.io, testing.allocator, snapshot_path, types.defaultMetricsConfig());
         defer close(db) catch unreachable;
 
         try testing.expectError(error.SnapshotCorrupted, loadSnapshotForOpen(db, testing.allocator, snapshot_path, empty_wal_path));

@@ -26,8 +26,6 @@ fn clonePlainValueNoVisibility(
     allocator: std.mem.Allocator,
     key: []const u8,
 ) error_mod.EngineError!?types.Value {
-    _ = state;
-
     while (true) {
         const v1 = shard.seq.load(.acquire);
         if ((v1 & 1) != 0) {
@@ -47,7 +45,7 @@ fn clonePlainValueNoVisibility(
 
         if (shard.has_ttl_entries) {
             const stored_expire_at = internal_ttl_index.getExpireAt(shard, key) orelse return try value_ptr.clone(allocator);
-            const now = runtime_shard.unixNow();
+            const now = runtime_shard.unixNow(state.io);
             if (expiration.isExpired(stored_expire_at, now)) return null;
         }
 
@@ -68,8 +66,6 @@ fn checkKeyExistsNoVisibility(
     shard: *runtime_shard.Shard,
     key: []const u8,
 ) bool {
-    _ = state;
-
     while (true) {
         const v1 = shard.seq.load(.acquire);
         if ((v1 & 1) != 0) {
@@ -89,7 +85,7 @@ fn checkKeyExistsNoVisibility(
 
         if (shard.has_ttl_entries) {
             const stored_expire_at = internal_ttl_index.getExpireAt(shard, key) orelse return true;
-            const now = runtime_shard.unixNow();
+            const now = runtime_shard.unixNow(state.io);
             if (expiration.isExpired(stored_expire_at, now)) return false;
         }
 
@@ -110,9 +106,10 @@ pub fn readView(state: *const runtime_state.DatabaseState) error_mod.EngineError
     state.lockAllShardsShared();
 
     return types.ReadView.init(
+        state.io,
         state,
         @constCast(&state.active_read_views),
-        runtime_shard.unixNow(),
+        runtime_shard.unixNow(state.io),
     ) catch {
         state.unlockAllShardsShared();
         return error.OutOfMemory;

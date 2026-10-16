@@ -259,7 +259,7 @@ fn appendPlanToWal(
     try durability.appendPutBatchIfEnabled(state, allocator, writes);
 }
 
-fn maybePauseAfterVisibilityGate() void {
+fn maybePauseAfterVisibilityGate(io: std.Io) void {
     if (!builtin.is_test) return;
     if (!pause_after_visibility_gate.swap(false, .acq_rel)) return;
 
@@ -270,7 +270,7 @@ fn maybePauseAfterVisibilityGate() void {
     }
 
     while (!resume_after_visibility_gate.load(.acquire)) {
-        std.Thread.sleep(100 * std.time.ns_per_us);
+        io.sleep(.fromMicroseconds(100), .awake) catch unreachable;
     }
 }
 
@@ -282,9 +282,9 @@ fn applyPlan(
 ) error_mod.EngineError!void {
     state.lockAllShardsExclusive();
     defer state.unlockAllShardsExclusive();
-    maybePauseAfterVisibilityGate();
+    maybePauseAfterVisibilityGate(state.io);
 
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
     for (guards) |guard| {
         if (!guardHolds(state, guard, now)) return error.GuardFailed;
     }
@@ -296,12 +296,12 @@ fn applyPlan(
     defer {
         while (acquired > 0) {
             acquired -= 1;
-            state.shards[plan.groups[acquired].shard_idx].lock.unlock();
+            state.shards[plan.groups[acquired].shard_idx].lock.unlock(state.io);
         }
     }
 
     for (plan.groups) |group| {
-        state.shards[group.shard_idx].lock.lock();
+        state.shards[group.shard_idx].lock.lockUncancelable(state.io);
         acquired += 1;
     }
 

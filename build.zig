@@ -1,5 +1,14 @@
+//! Package modules, tests, and benchmark build graph.
+//! Time Complexity: O(1) build graph construction.
+//! Allocator: Build nodes and options use the build allocator.
+
 const std = @import("std");
 
+/// Configures the exported module and executable test and benchmark steps.
+///
+/// Time Complexity: O(1).
+///
+/// Allocator: Uses the build allocator for graph nodes and generated options.
 pub fn build(b: *std.Build) void {
     const target = b.standardTargetOptions(.{});
     const optimize = b.standardOptimizeOption(.{});
@@ -11,6 +20,7 @@ pub fn build(b: *std.Build) void {
     const zeno_module = b.addModule("zeno", .{
         .root_source_file = b.path("src/zeno.zig"),
         .target = target,
+        .optimize = optimize,
     });
     zeno_module.addOptions("config", zeno_options);
 
@@ -51,6 +61,10 @@ pub fn build(b: *std.Build) void {
     });
     bench_exe.root_module.addImport("zeno", bench_zeno_module);
     bench_exe.root_module.addImport("zbench", zbench_dep.module("zbench"));
+
+    const check_step = b.step("check", "Compile tests and benchmarks without running them");
+    check_step.dependOn(&module_tests.step);
+    check_step.dependOn(&bench_exe.step);
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run zeno-core benchmarks");

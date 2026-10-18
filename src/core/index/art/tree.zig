@@ -1359,7 +1359,7 @@ pub const Iterator = struct {
     cursor: ?[]const u8,
     inline_stack: [inline_stack_capacity]Frame = undefined,
     inline_len: usize = 0,
-    spill_stack: std.ArrayListUnmanaged(Frame) = .empty,
+    spill_stack: std.ArrayList(Frame) = .empty,
 
     pub const Frame = struct {
         node: *const Node,

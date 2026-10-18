@@ -34,8 +34,8 @@ pub fn put(state: *runtime_state.DatabaseState, key: []const u8, value: *const t
     shard.visibility_gate.lockShared();
     defer shard.visibility_gate.unlockShared();
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     // Fast path: key already exists - overwrite without seq bracket.
     // No ART structural changes; leaf.storeValue() provides release ordering.
@@ -110,7 +110,7 @@ pub fn putGroup(state: *runtime_state.DatabaseState, writes: []const types.PutWr
 
         const shard = &state.shards[shard_idx];
         shard.visibility_gate.lockShared();
-        shard.lock.lock();
+        shard.lock.lockUncancelable(shard.io);
 
         // Pre-scan: check if any write for this shard needs a structural insert.
         // Structural insert = key does not yet exist in the ART.
@@ -130,7 +130,7 @@ pub fn putGroup(state: *runtime_state.DatabaseState, writes: []const types.PutWr
         }
         errdefer {
             if (needs_bracket) shard.seq.store(seq0 + 2, .release);
-            shard.lock.unlock();
+            shard.lock.unlock(shard.io);
             shard.visibility_gate.unlockShared();
         }
 
@@ -155,7 +155,7 @@ pub fn putGroup(state: *runtime_state.DatabaseState, writes: []const types.PutWr
         }
 
         if (needs_bracket) shard.seq.store(seq0 + 2, .release);
-        shard.lock.unlock();
+        shard.lock.unlock(shard.io);
         shard.visibility_gate.unlockShared();
     }
 
@@ -182,8 +182,8 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.En
     shard.visibility_gate.lockShared();
     defer shard.visibility_gate.unlockShared();
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     const seq0 = shard.seq.load(.monotonic);
     shard.seq.store(seq0 + 1, .release);
@@ -194,7 +194,7 @@ pub fn delete(state: *runtime_state.DatabaseState, key: []const u8) error_mod.En
         return false;
     }
 
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
     if (!expiration.keyIsVisibleUnlocked(shard, key, now)) {
         _ = try internal_mutate.removeStoredValueUnlocked(shard, key);
         internal_ttl_index.clearTtlEntry(shard, key);
@@ -252,15 +252,15 @@ pub fn deletePrefix(
             shard.visibility_gate.lockShared();
             defer shard.visibility_gate.unlockShared();
 
-            shard.lock.lockShared();
-            defer shard.lock.unlockShared();
+            shard.lock.lockSharedUncancelable(shard.io);
+            defer shard.lock.unlockShared(shard.io);
 
             var scan_results = std.ArrayList(art.ScanEntry).empty;
             defer scan_results.deinit(allocator);
 
             shard.tree.scan(prefix, allocator, &scan_results) catch return error.OutOfMemory;
 
-            const now = runtime_shard.unixNow();
+            const now = runtime_shard.unixNow(state.io);
             for (scan_results.items) |entry| {
                 // Skip keys that are TTL-expired and already invisible
                 if (shard.has_ttl_entries) {
@@ -290,8 +290,8 @@ pub fn deletePrefix(
             shard.visibility_gate.lockShared();
             defer shard.visibility_gate.unlockShared();
 
-            shard.lock.lock();
-            defer shard.lock.unlock();
+            shard.lock.lockUncancelable(shard.io);
+            defer shard.lock.unlock(shard.io);
 
             const seq0 = shard.seq.load(.monotonic);
             shard.seq.store(seq0 + 1, .release);

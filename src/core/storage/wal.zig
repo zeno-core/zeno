@@ -1,7 +1,7 @@
 //! Storage-owned WAL handle for live append paths and WAL-backed open.
 //! Time Complexity: Appends are O(k + v) by key and serialized value size; open is O(n) over existing WAL bytes when replay runs.
 //! Allocator: Uses the caller-provided allocator for owned path/state and temporary serialization scratch.
-//! Thread Safety: Shared `Wal` instances serialize append state internally and coordinate with the optional async flush thread through atomics and a mutex.
+//! Thread Safety: Shared `Wal` instances serialize append state internally and coordinate with the optional async flush task through atomics and a mutex.
 
 const std = @import("std");
 const builtin = @import("builtin");
@@ -87,15 +87,18 @@ pub const PutBatchWrite = struct {
 
 /// Shared mutable runtime state guarded by the WAL mutex and atomics.
 const FlushState = struct {
-    file: std.fs.File,
-    mutex: std.Thread.Mutex,
+    io: std.Io,
+    file_lifetime: std.Io.RwLock = .init,
+    append_offset: u64,
+    file: std.Io.File,
+    mutex: std.Io.Mutex,
     dirty: std.atomic.Value(bool),
     last_appended_lsn: std.atomic.Value(u64),
     last_fsync_lsn: std.atomic.Value(u64),
     flush_error: std.atomic.Value(u8),
-    stop_flush_thread: std.atomic.Value(bool),
+    stop_flush_task: std.atomic.Value(bool),
     fsync_interval_ms: u32,
-    flush_thread: ?std.Thread,
+    flush_task: ?std.Io.Future(void),
     bytes_written_total: std.atomic.Value(u64),
     bytes_since_compact: std.atomic.Value(u64),
 };
@@ -113,7 +116,7 @@ const EncodedAppendRecord = struct {
 ///
 /// Allocator: Owns the copied path and flush state through `allocator`; per-call append scratch also uses that allocator.
 ///
-/// Thread Safety: Point and batch append operations serialize through the internal WAL mutex and coordinate with the optional async flush thread through atomics.
+/// Thread Safety: Point and batch append operations serialize through the internal WAL mutex and coordinate with the optional async flush task through atomics.
 pub const Wal = struct {
     path: []u8,
     next_lsn: u64,
@@ -127,42 +130,47 @@ pub const Wal = struct {
     ///
     /// Allocator: Allocates owned path/state using `allocator`.
     ///
-    /// Ownership: Owns the returned path copy and flush state until `close`.
+    /// Ownership: Owns the returned path copy and flush state until `close`; borrows `io` for that lifetime.
     ///
     /// Thread Safety: Safe for concurrent append callers after open returns; replay itself runs before the handle is published to other threads.
     pub fn open(
+        io: std.Io,
         path: []const u8,
         options: WalOptions,
         applier: anytype,
         allocator: std.mem.Allocator,
     ) !Wal {
-        if (std.fs.path.dirname(path)) |dir_path| {
-            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        if (std.Io.Dir.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) {
+                const dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+                dir.close(io);
+            }
         }
-        const file = try std.fs.cwd().createFile(path, .{
+        const file = try std.Io.Dir.cwd().createFile(io, path, .{
             .read = true,
             .truncate = false,
         });
-        errdefer file.close();
+        errdefer file.close(io);
 
         const owned_path = try allocator.dupe(u8, path);
         errdefer allocator.free(owned_path);
 
-        const replay_result = try storage_replay.replay(applier, allocator, file, options.min_lsn);
-        try file.seekFromEnd(0);
+        const replay_result = try storage_replay.replay(io, applier, allocator, file, options.min_lsn);
 
         const state = try allocator.create(FlushState);
         errdefer allocator.destroy(state);
         state.* = .{
+            .io = io,
+            .append_offset = try file.length(io),
             .file = file,
-            .mutex = .{},
+            .mutex = .init,
             .dirty = std.atomic.Value(bool).init(false),
             .last_appended_lsn = std.atomic.Value(u64).init(0),
             .last_fsync_lsn = std.atomic.Value(u64).init(0),
             .flush_error = std.atomic.Value(u8).init(0),
-            .stop_flush_thread = std.atomic.Value(bool).init(false),
+            .stop_flush_task = std.atomic.Value(bool).init(false),
             .fsync_interval_ms = options.fsync_interval_ms,
-            .flush_thread = null,
+            .flush_task = null,
             .bytes_written_total = std.atomic.Value(u64).init(0),
             .bytes_since_compact = std.atomic.Value(u64).init(0),
         };
@@ -177,7 +185,7 @@ pub const Wal = struct {
         errdefer wal.close();
 
         if (wal.fsync_mode == .batched_async) {
-            wal.state.flush_thread = try std.Thread.spawn(.{}, flushThreadMain, .{wal.state});
+            wal.state.flush_task = try io.concurrent(flushTaskMain, .{wal.state});
         }
 
         return wal;
@@ -248,8 +256,8 @@ pub const Wal = struct {
             return error.WalFlushFailed;
         }
 
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
+        self.state.mutex.lockUncancelable(self.state.io);
+        defer self.state.mutex.unlock(self.state.io);
 
         if (self.fsync_mode == .batched_async and self.state.flush_error.load(.acquire) != 0) {
             return error.WalFlushFailed;
@@ -262,7 +270,7 @@ pub const Wal = struct {
         }
 
         const last_lsn = self.next_lsn - 1;
-        try writeAllTracked(self.state.file, envelope.items);
+        try writeAllTracked(self.state, envelope.items);
         _ = self.state.bytes_written_total.fetchAdd(envelope.items.len, .monotonic);
         _ = self.state.bytes_since_compact.fetchAdd(envelope.items.len, .monotonic);
         self.state.last_appended_lsn.store(last_lsn, .release);
@@ -352,8 +360,8 @@ pub const Wal = struct {
             return error.WalFlushFailed;
         }
 
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
+        self.state.mutex.lockUncancelable(self.state.io);
+        defer self.state.mutex.unlock(self.state.io);
 
         if (self.fsync_mode == .batched_async and self.state.flush_error.load(.acquire) != 0) {
             return error.WalFlushFailed;
@@ -387,7 +395,7 @@ pub const Wal = struct {
         }
 
         const commit_lsn = begin_lsn + @as(u64, @intCast(writes.len)) + 1;
-        try writeAllTracked(self.state.file, envelope.items);
+        try writeAllTracked(self.state, envelope.items);
         _ = self.state.bytes_written_total.fetchAdd(envelope.items.len, .monotonic);
         _ = self.state.bytes_since_compact.fetchAdd(envelope.items.len, .monotonic);
         self.state.last_appended_lsn.store(commit_lsn, .release);
@@ -402,22 +410,9 @@ pub const Wal = struct {
     ///
     /// Allocator: Does not allocate.
     ///
-    /// Thread Safety: Duplicates the file descriptor under the internal WAL mutex, then performs the actual `fsync` without holding that mutex.
+    /// Thread Safety: Holds a shared file-lifetime lock across sync, captures the target LSN under the WAL mutex, and permits concurrent appends.
     pub fn fsync(self: *Wal) !void {
-        const handle = blk: {
-            self.state.mutex.lock();
-            errdefer self.state.mutex.unlock();
-            const dup_fd = try std.posix.dup(self.state.file.handle);
-            self.state.mutex.unlock();
-            break :blk dup_fd;
-        };
-        defer std.posix.close(handle);
-
-        try performFsync(handle);
-
-        const appended = self.state.last_appended_lsn.load(.acquire);
-        storeMaxLsn(&self.state.last_fsync_lsn, appended);
-        self.state.dirty.store(false, .release);
+        try flushState(self.state, false);
     }
 
     /// Compacts this WAL by removing records with `lsn <= max_lsn_inclusive`.
@@ -433,13 +428,15 @@ pub const Wal = struct {
     ///
     /// Thread Safety: Serializes with other append and close operations through the internal WAL mutex.
     pub fn truncateUpToLsn(self: *Wal, max_lsn_inclusive: u64) !void {
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
+        self.state.file_lifetime.lockUncancelable(self.state.io);
+        defer self.state.file_lifetime.unlock(self.state.io);
+        self.state.mutex.lockUncancelable(self.state.io);
+        defer self.state.mutex.unlock(self.state.io);
 
         const newest_lsn: u64 = if (self.next_lsn > 0) self.next_lsn - 1 else 0;
         if (newest_lsn <= max_lsn_inclusive) {
-            try self.state.file.setEndPos(0);
-            try self.state.file.seekTo(0);
+            try self.state.file.setLength(self.state.io, 0);
+            self.state.append_offset = 0;
             storeMaxLsn(&self.state.last_fsync_lsn, newest_lsn);
             self.state.dirty.store(false, .release);
             self.state.bytes_since_compact.store(0, .monotonic);
@@ -450,21 +447,22 @@ pub const Wal = struct {
         defer self.allocator.free(tmp_path);
 
         const old_file = self.state.file;
-        var tmp_file = try std.fs.cwd().createFile(tmp_path, .{
+        var tmp_file = try std.Io.Dir.cwd().createFile(self.state.io, tmp_path, .{
             .read = true,
             .truncate = true,
         });
         var promoted_tmp_file = false;
-        defer if (!promoted_tmp_file) tmp_file.close();
-        errdefer std.fs.cwd().deleteFile(tmp_path) catch {};
+        defer if (!promoted_tmp_file) tmp_file.close(self.state.io);
+        errdefer std.Io.Dir.cwd().deleteFile(self.state.io, tmp_path) catch {};
 
-        try storage_replay.compactUpToLsn(self.allocator, old_file, tmp_file, max_lsn_inclusive);
-        try std.posix.fsync(tmp_file.handle);
-        try tmp_file.seekFromEnd(0);
+        try storage_replay.compactUpToLsn(self.state.io, self.allocator, old_file, tmp_file, max_lsn_inclusive);
+        try tmp_file.sync(self.state.io);
+        const compacted_length = try tmp_file.length(self.state.io);
 
-        try std.fs.cwd().rename(tmp_path, self.path);
-        old_file.close();
+        try std.Io.Dir.cwd().rename(tmp_path, std.Io.Dir.cwd(), self.path, self.state.io);
+        old_file.close(self.state.io);
         self.state.file = tmp_file;
+        self.state.append_offset = compacted_length;
         promoted_tmp_file = true;
         self.state.bytes_since_compact.store(0, .monotonic);
         storeMaxLsn(&self.state.last_fsync_lsn, newest_lsn);
@@ -501,15 +499,15 @@ pub const Wal = struct {
 
     /// Closes the WAL handle and releases storage-owned resources.
     ///
-    /// Time Complexity: O(1) CPU work plus optional async flush join latency.
+    /// Time Complexity: O(1) CPU work plus optional concurrent flush completion latency.
     ///
     /// Allocator: Frees the owned path and flush state through `self.allocator`.
     ///
     /// Thread Safety: Not safe to race with other operations; callers must ensure the enclosing engine state has stopped issuing WAL appends before `close`.
     pub fn close(self: *Wal) void {
         if (self.fsync_mode == .batched_async) {
-            self.state.stop_flush_thread.store(true, .release);
-            if (self.state.flush_thread) |thread| thread.join();
+            self.state.stop_flush_task.store(true, .release);
+            if (self.state.flush_task) |*task| task.cancel(self.state.io);
 
             const dirty = self.state.dirty.load(.acquire);
             const last_appended = self.state.last_appended_lsn.load(.acquire);
@@ -519,7 +517,7 @@ pub const Wal = struct {
             }
         }
 
-        self.state.file.close();
+        self.state.file.close(self.state.io);
         self.allocator.destroy(self.state);
         self.allocator.free(self.path);
     }
@@ -534,7 +532,7 @@ pub const Wal = struct {
     fn maybeFsyncInline(self: *Wal, lsn: u64) !void {
         switch (self.fsync_mode) {
             .always => {
-                try performFsync(self.state.file.handle);
+                try performFsync(self.state.io, self.state.file);
                 storeMaxLsn(&self.state.last_fsync_lsn, lsn);
                 self.state.dirty.store(false, .release);
             },
@@ -557,8 +555,8 @@ pub const Wal = struct {
             return error.WalFlushFailed;
         }
 
-        self.state.mutex.lock();
-        defer self.state.mutex.unlock();
+        self.state.mutex.lockUncancelable(self.state.io);
+        defer self.state.mutex.unlock(self.state.io);
 
         if (self.fsync_mode == .batched_async and self.state.flush_error.load(.acquire) != 0) {
             return error.WalFlushFailed;
@@ -575,7 +573,7 @@ pub const Wal = struct {
             var stack_record: [small_record_stack_capacity]u8 = undefined;
             const encoded = encodeRecordInto(stack_record[0..], lsn, tag, key, value_bytes);
 
-            try writeAllTracked(self.state.file, encoded);
+            try writeAllTracked(self.state, encoded);
             _ = self.state.bytes_written_total.fetchAdd(encoded.len, .monotonic);
             _ = self.state.bytes_since_compact.fetchAdd(encoded.len, .monotonic);
             self.state.last_appended_lsn.store(lsn, .release);
@@ -595,7 +593,7 @@ pub const Wal = struct {
         const crc = std.hash.crc.Crc32.hash(buf.items[4..]);
         std.mem.writeInt(u32, @ptrCast(buf.items[0..4]), crc, .little);
 
-        try writeAllTracked(self.state.file, buf.items);
+        try writeAllTracked(self.state, buf.items);
         _ = self.state.bytes_written_total.fetchAdd(buf.items.len, .monotonic);
         _ = self.state.bytes_since_compact.fetchAdd(buf.items.len, .monotonic);
         self.state.last_appended_lsn.store(lsn, .release);
@@ -672,26 +670,27 @@ fn encodeRecordInto(dst: []u8, lsn: u64, tag: u8, key: []const u8, value_bytes: 
 ///
 /// Thread Safety: The returned handle is safe for concurrent append callers after open returns; replay happens before the handle becomes shared.
 pub fn open(
+    io: std.Io,
     path: []const u8,
     options: WalOptions,
     applier: anytype,
     allocator: std.mem.Allocator,
 ) !Wal {
-    return Wal.open(path, options, applier, allocator);
+    return Wal.open(io, path, options, applier, allocator);
 }
 
-/// Runs the background fsync loop for `.batched_async` WAL handles.
+/// Runs the concurrent fsync loop for `.batched_async` WAL handles.
 ///
 /// Time Complexity: O(1) per idle iteration plus optional filesystem-dependent fsync latency when dirty data is present.
 ///
 /// Allocator: Does not allocate.
 ///
 /// Thread Safety: Coordinates only through `FlushState` atomics and the WAL mutex.
-fn flushThreadMain(state: *FlushState) void {
+fn flushTaskMain(state: *FlushState) void {
     const interval_ns = @max(@as(u64, state.fsync_interval_ms), 1) * std.time.ns_per_ms;
-    while (!state.stop_flush_thread.load(.acquire)) {
-        std.Thread.sleep(interval_ns);
-        if (state.stop_flush_thread.load(.acquire)) break;
+    while (!state.stop_flush_task.load(.acquire)) {
+        state.io.sleep(.fromNanoseconds(interval_ns), .awake) catch return;
+        if (state.stop_flush_task.load(.acquire)) break;
         flushOnce(state) catch {};
     }
 }
@@ -702,32 +701,41 @@ fn flushThreadMain(state: *FlushState) void {
 ///
 /// Allocator: Does not allocate.
 ///
-/// Thread Safety: Uses the WAL mutex to snapshot the target file descriptor and LSN before fsyncing without the mutex held.
+/// Thread Safety: Protects the file generation across sync and captures the target LSN under the WAL mutex.
 fn flushOnce(state: *FlushState) !void {
-    const snapshot = blk: {
-        state.mutex.lock();
-        errdefer state.mutex.unlock();
+    try flushState(state, true);
+}
 
-        if (!state.dirty.load(.acquire)) {
-            state.mutex.unlock();
-            return;
-        }
+/// Synchronizes one captured WAL generation while keeping its file alive.
+///
+/// Time Complexity: O(1) CPU work plus filesystem sync latency.
+///
+/// Allocator: Does not allocate.
+///
+/// Thread Safety: Acquires the file lifetime lock before the append mutex, captures
+/// the durable target under that mutex, and allows appends during the actual sync.
+fn flushState(state: *FlushState, only_dirty: bool) !void {
+    const previous_protection = state.io.swapCancelProtection(.blocked);
+    defer _ = state.io.swapCancelProtection(previous_protection);
+    state.file_lifetime.lockSharedUncancelable(state.io);
+    defer state.file_lifetime.unlockShared(state.io);
 
-        const target_lsn = state.last_appended_lsn.load(.acquire);
-        const dup_fd = try std.posix.dup(state.file.handle);
-        state.dirty.store(false, .release);
-        state.mutex.unlock();
-        break :blk .{ .target_lsn = target_lsn, .dup_fd = dup_fd };
-    };
-    defer std.posix.close(snapshot.dup_fd);
+    state.mutex.lockUncancelable(state.io);
+    if (only_dirty and !state.dirty.load(.acquire)) {
+        state.mutex.unlock(state.io);
+        return;
+    }
+    const target_lsn = state.last_appended_lsn.load(.acquire);
+    const file = state.file;
+    state.dirty.store(false, .release);
+    state.mutex.unlock(state.io);
 
-    performFsync(snapshot.dup_fd) catch |err| {
+    performFsync(state.io, file) catch |err| {
         state.flush_error.store(1, .release);
         state.dirty.store(true, .release);
         return err;
     };
-
-    storeMaxLsn(&state.last_fsync_lsn, snapshot.target_lsn);
+    storeMaxLsn(&state.last_fsync_lsn, target_lsn);
 }
 
 /// Raises one atomic LSN watermark when `candidate` is newer.
@@ -844,6 +852,13 @@ fn validateRecordBoundsForTag(tag: u8, key: []const u8, value_bytes: []const u8)
     try validateRecordBounds(key, value_bytes);
 }
 
+const FsyncTestProbe = struct {
+    entered: std.Io.Event = .unset,
+    resume_sync: std.Io.Event = .unset,
+};
+
+var fsync_test_probe: ?*FsyncTestProbe = null;
+
 var g_fail_next_write = std.atomic.Value(bool).init(false);
 var g_fail_next_fsync = std.atomic.Value(bool).init(false);
 
@@ -854,23 +869,30 @@ var g_fail_next_fsync = std.atomic.Value(bool).init(false);
 /// Allocator: Does not allocate.
 ///
 /// Ownership: Borrows `bytes` for the duration of the write only.
-fn writeAllTracked(file: std.fs.File, bytes: []const u8) !void {
+fn writeAllTracked(state: *FlushState, bytes: []const u8) !void {
     if (builtin.is_test and g_fail_next_write.swap(false, .acq_rel)) {
         return error.SimulatedWriteFailure;
     }
-    try file.writeAll(bytes);
+    try state.file.writePositionalAll(state.io, bytes, state.append_offset);
+    state.append_offset += bytes.len;
 }
 
-/// Forces one file descriptor to stable storage, honoring test fault injection when enabled.
+/// Forces one file to stable storage, honoring test fault injection when enabled.
 ///
 /// Time Complexity: O(1) CPU work plus filesystem-dependent fsync latency.
 ///
 /// Allocator: Does not allocate.
-fn performFsync(fd: std.posix.fd_t) !void {
+fn performFsync(io: std.Io, file: std.Io.File) !void {
+    if (builtin.is_test) {
+        if (fsync_test_probe) |probe| {
+            probe.entered.set(io);
+            probe.resume_sync.waitUncancelable(io);
+        }
+    }
     if (builtin.is_test and g_fail_next_fsync.swap(false, .acq_rel)) {
         return error.SimulatedFsyncFailure;
     }
-    try std.posix.fsync(fd);
+    try file.sync(io);
 }
 
 /// Exposes test-only fault injection hooks for WAL append and fsync paths.
@@ -908,9 +930,9 @@ pub const test_hooks = if (builtin.is_test) struct {
 ///
 /// Ownership: Caller owns the returned slice.
 fn readAllTest(allocator: std.mem.Allocator, path: []const u8) ![]u8 {
-    const file = try std.fs.cwd().openFile(path, .{});
-    defer file.close();
-    return try file.readToEndAlloc(allocator, 1 << 20);
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{});
+    defer file.close(std.testing.io);
+    return try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, allocator, .limited(1 << 20));
 }
 
 /// Extracts WAL record tags from a test byte stream.
@@ -1096,7 +1118,7 @@ fn replayCollectorExpire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !
 /// Ownership: Borrows `key` and `value_bytes` for the duration of the call only.
 fn writeCraftedRecordTest(
     allocator: std.mem.Allocator,
-    file: std.fs.File,
+    file: std.Io.File,
     lsn: u64,
     tag: u8,
     key: []const u8,
@@ -1115,7 +1137,7 @@ fn writeCraftedRecordTest(
 
     const crc = std.hash.crc.Crc32.hash(buf.items[4..]);
     std.mem.writeInt(u32, @ptrCast(buf.items[0..4]), crc, .little);
-    try file.writeAll(buf.items);
+    try file.writeStreamingAll(std.testing.io, buf.items);
 }
 
 fn allocTmpPathTest(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basename: []const u8) ![]u8 {
@@ -1131,7 +1153,7 @@ test "open succeeds for a new empty wal file" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-empty.wal");
     defer testing.allocator.free(path);
 
-    var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+    var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
     defer wal.close();
 }
 
@@ -1145,7 +1167,7 @@ test "replay restores standalone put delete and expire records" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const value = Value{ .string = "hello" };
@@ -1154,13 +1176,13 @@ test "replay restores standalone put delete and expire records" {
         try wal.appendExpire("gamma", 123);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 3), result.last_lsn);
     try testing.expectEqual(@as(usize, 3), result.records_applied);
     try testing.expectEqual(@as(usize, 3), collector.events.items.len);
@@ -1182,7 +1204,7 @@ test "append point records writes put delete and expire tags" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-point-records.wal");
     defer testing.allocator.free(path);
 
-    var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+    var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
     defer wal.close();
 
     const value = Value{ .string = "hello" };
@@ -1210,7 +1232,7 @@ test "append_put_group writes standalone put records in order" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1223,13 +1245,13 @@ test "append_put_group writes standalone put records in order" {
         });
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 3), result.last_lsn);
     try testing.expectEqual(@as(usize, 3), result.records_applied);
     try testing.expectEqual(@as(usize, 3), collector.events.items.len);
@@ -1255,7 +1277,7 @@ test "replay restores committed put batch atomically and in order" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1266,13 +1288,13 @@ test "replay restores committed put batch atomically and in order" {
         });
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 4), result.last_lsn);
     try testing.expectEqual(@as(usize, 2), result.records_applied);
     try testing.expectEqual(@as(usize, 2), collector.events.items.len);
@@ -1290,7 +1312,7 @@ test "replay truncates incomplete batch tails safely" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1302,23 +1324,23 @@ test "replay truncates incomplete batch tails safely" {
     }
 
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer file.close();
-        const size = try file.getEndPos();
-        try file.setEndPos(size - 3);
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        const size = try file.length(std.testing.io);
+        try file.setLength(std.testing.io, size - 3);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 1), result.last_lsn);
     try testing.expectEqual(@as(usize, 0), result.records_applied);
     try testing.expectEqual(@as(usize, 0), collector.events.items.len);
-    try testing.expectEqual(@as(u64, 0), try replay_file.getEndPos());
+    try testing.expectEqual(@as(u64, 0), try replay_file.length(std.testing.io));
 }
 
 test "replay truncates corrupt crc tails safely" {
@@ -1332,38 +1354,36 @@ test "replay truncates corrupt crc tails safely" {
 
     var second_start: u64 = 0;
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const value = Value{ .string = "hello" };
         try wal.appendPut("alpha", &value);
-        second_start = try wal.state.file.getEndPos();
+        second_start = try wal.state.file.length(std.testing.io);
         try wal.appendDelete("beta");
     }
 
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer file.close();
-        try file.seekTo(second_start);
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
         var byte: [1]u8 = undefined;
-        if ((try file.readAll(&byte)) != byte.len) return error.EndOfStream;
-        try file.seekTo(second_start);
+        if ((try file.readPositionalAll(std.testing.io, &byte, second_start)) != byte.len) return error.EndOfStream;
         byte[0] ^= 0xff;
-        try file.writeAll(&byte);
+        try file.writePositionalAll(std.testing.io, &byte, second_start);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 1), result.last_lsn);
     try testing.expectEqual(@as(usize, 1), result.records_applied);
     try testing.expectEqual(@as(usize, 1), collector.events.items.len);
     try testing.expectEqualStrings("alpha", collector.events.items[0].key);
-    try testing.expectEqual(second_start, try replay_file.getEndPos());
+    try testing.expectEqual(second_start, try replay_file.length(std.testing.io));
 }
 
 test "replay truncates invalid batch structures from the matching begin" {
@@ -1375,11 +1395,11 @@ test "replay truncates invalid batch structures from the matching begin" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step7-invalid-batch.wal");
     defer testing.allocator.free(path);
 
-    if (std.fs.path.dirname(path)) |dir_path| {
-        if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+    if (std.Io.Dir.path.dirname(path)) |dir_path| {
+        if (dir_path.len != 0) try std.Io.Dir.cwd().createDirPath(std.testing.io, dir_path);
     }
-    const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+    defer file.close(std.testing.io);
 
     var put_buf = std.ArrayList(u8).empty;
     defer put_buf.deinit(testing.allocator);
@@ -1393,23 +1413,23 @@ test "replay truncates invalid batch structures from the matching begin" {
     std.mem.writeInt(u32, @ptrCast(commit_payload[8..12]), 1, .little);
 
     try writeCraftedRecordTest(testing.allocator, file, 1, tag_put, "seed", put_buf.items);
-    const batch_begin_offset = try file.getEndPos();
+    const batch_begin_offset = try file.length(std.testing.io);
     try writeCraftedRecordTest(testing.allocator, file, 2, tag_batch_begin, "", &begin_payload);
     try writeCraftedRecordTest(testing.allocator, file, 3, tag_put, "alpha", put_buf.items);
     try writeCraftedRecordTest(testing.allocator, file, 4, tag_batch_commit, "", &commit_payload);
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 2), result.last_lsn);
     try testing.expectEqual(@as(usize, 1), result.records_applied);
     try testing.expectEqual(@as(usize, 1), collector.events.items.len);
     try testing.expectEqualStrings("seed", collector.events.items[0].key);
-    try testing.expectEqual(batch_begin_offset, try replay_file.getEndPos());
+    try testing.expectEqual(batch_begin_offset, try replay_file.length(std.testing.io));
 }
 
 test "replay honors min_lsn for standalone records and whole batches" {
@@ -1422,7 +1442,7 @@ test "replay honors min_lsn for standalone records and whole batches" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1436,13 +1456,13 @@ test "replay honors min_lsn for standalone records and whole batches" {
     }
 
     {
-        const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer replay_file.close();
+        const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer replay_file.close(std.testing.io);
 
         var collector = ReplayCollector.init(testing.allocator);
         defer collector.deinit();
 
-        const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 1);
+        const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 1);
         try testing.expectEqual(@as(u64, 5), result.last_lsn);
         try testing.expectEqual(@as(usize, 2), result.records_applied);
         try testing.expectEqual(@as(usize, 2), collector.events.items.len);
@@ -1451,13 +1471,13 @@ test "replay honors min_lsn for standalone records and whole batches" {
     }
 
     {
-        const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer replay_file.close();
+        const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer replay_file.close(std.testing.io);
 
         var collector = ReplayCollector.init(testing.allocator);
         defer collector.deinit();
 
-        const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 2);
+        const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 2);
         try testing.expectEqual(@as(u64, 5), result.last_lsn);
         try testing.expectEqual(@as(usize, 0), result.records_applied);
         try testing.expectEqual(@as(usize, 0), collector.events.items.len);
@@ -1474,7 +1494,7 @@ test "open on a non-empty wal replays and advances next_lsn" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const value = Value{ .integer = 1 };
@@ -1484,7 +1504,7 @@ test "open on a non-empty wal replays and advances next_lsn" {
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    var wal = try open(path, .{ .fsync_mode = .none }, collector.applier(), testing.allocator);
+    var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, collector.applier(), testing.allocator);
     defer wal.close();
 
     try testing.expectEqual(@as(usize, 1), collector.events.items.len);
@@ -1501,7 +1521,7 @@ test "fsync failure propagates from always mode append" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step7-fsync-failure.wal");
     defer testing.allocator.free(path);
 
-    var wal = try open(path, .{ .fsync_mode = .always }, noopApplier(), testing.allocator);
+    var wal = try open(std.testing.io, path, .{ .fsync_mode = .always }, noopApplier(), testing.allocator);
     defer wal.close();
 
     const value = Value{ .integer = 1 };
@@ -1519,7 +1539,7 @@ test "truncate_up_to_lsn drops standalone records at or below the cutoff" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1529,13 +1549,13 @@ test "truncate_up_to_lsn drops standalone records at or below the cutoff" {
         try wal.truncateUpToLsn(1);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 2), result.last_lsn);
     try testing.expectEqual(@as(usize, 1), result.records_applied);
     try testing.expectEqual(@as(usize, 1), collector.events.items.len);
@@ -1552,7 +1572,7 @@ test "truncate_up_to_lsn keeps committed batches by commit lsn" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1566,19 +1586,19 @@ test "truncate_up_to_lsn keeps committed batches by commit lsn" {
         try wal.truncateUpToLsn(4);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 5), result.last_lsn);
     try testing.expectEqual(@as(usize, 1), result.records_applied);
     try testing.expectEqual(@as(usize, 1), collector.events.items.len);
     try testing.expectEqualStrings("gamma", collector.events.items[0].key);
 
-    var reopened = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+    var reopened = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
     defer reopened.close();
     try testing.expectEqual(@as(u64, 6), reopened.next_lsn);
 }
@@ -1593,7 +1613,7 @@ test "truncate_up_to_lsn drops incomplete trailing batches instead of retaining 
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         const one = Value{ .integer = 1 };
@@ -1605,25 +1625,25 @@ test "truncate_up_to_lsn drops incomplete trailing batches instead of retaining 
     }
 
     {
-        const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-        defer file.close();
-        const size = try file.getEndPos();
-        try file.setEndPos(size - 2);
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        const size = try file.length(std.testing.io);
+        try file.setLength(std.testing.io, size - 2);
     }
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
         try wal.truncateUpToLsn(0);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 0), result.last_lsn);
     try testing.expectEqual(@as(usize, 0), result.records_applied);
     try testing.expectEqual(@as(usize, 0), collector.events.items.len);
@@ -1638,7 +1658,7 @@ test "append_put rejects oversized keys and values before writing records" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step12-oversized.wal");
     defer testing.allocator.free(path);
 
-    var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+    var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
     defer wal.close();
 
     const oversized_key = try testing.allocator.alloc(u8, codec.MAX_KEY_LEN + 1);
@@ -1664,7 +1684,7 @@ test "replay decodes allocated string and object values for put records" {
     defer testing.allocator.free(path);
 
     {
-        var wal = try open(path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+        var wal = try open(std.testing.io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
         defer wal.close();
 
         var object = std.StringHashMapUnmanaged(Value){};
@@ -1718,13 +1738,13 @@ test "replay decodes allocated string and object values for put records" {
         }
     };
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = Collector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(.{
+    const result = try storage_replay.replay(std.testing.io, .{
         .ctx = &collector,
         .put = Collector.put,
         .delete = Collector.delete,
@@ -1746,26 +1766,26 @@ test "replay truncates standalone records with partial key payloads safely" {
     defer testing.allocator.free(path);
 
     {
-        if (std.fs.path.dirname(path)) |dir_path| {
-            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        if (std.Io.Dir.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try std.Io.Dir.cwd().createDirPath(std.testing.io, dir_path);
         }
-        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        defer file.close(std.testing.io);
         try writeCraftedRecordTest(testing.allocator, file, 1, tag_delete, "alpha", "");
-        try file.setEndPos(4 + 8 + 1 + 2 + 3);
+        try file.setLength(std.testing.io, 4 + 8 + 1 + 2 + 3);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 0), result.last_lsn);
     try testing.expectEqual(@as(usize, 0), result.records_applied);
     try testing.expectEqual(@as(usize, 0), collector.events.items.len);
-    try testing.expectEqual(@as(u64, 0), try replay_file.getEndPos());
+    try testing.expectEqual(@as(u64, 0), try replay_file.length(std.testing.io));
 }
 
 test "replay truncates standalone records with partial value payloads safely" {
@@ -1782,25 +1802,152 @@ test "replay truncates standalone records with partial value payloads safely" {
     try codec.serializeValue(testing.allocator, &Value{ .string = "hello" }, &value_buf, 0);
 
     {
-        if (std.fs.path.dirname(path)) |dir_path| {
-            if (dir_path.len != 0) try std.fs.cwd().makePath(dir_path);
+        if (std.Io.Dir.path.dirname(path)) |dir_path| {
+            if (dir_path.len != 0) try std.Io.Dir.cwd().createDirPath(std.testing.io, dir_path);
         }
-        const file = try std.fs.cwd().createFile(path, .{ .read = true, .truncate = true });
-        defer file.close();
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, path, .{ .read = true, .truncate = true });
+        defer file.close(std.testing.io);
         try writeCraftedRecordTest(testing.allocator, file, 1, tag_put, "alpha", value_buf.items);
-        const size = try file.getEndPos();
-        try file.setEndPos(size - 1);
+        const size = try file.length(std.testing.io);
+        try file.setLength(std.testing.io, size - 1);
     }
 
-    const replay_file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer replay_file.close();
+    const replay_file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer replay_file.close(std.testing.io);
 
     var collector = ReplayCollector.init(testing.allocator);
     defer collector.deinit();
 
-    const result = try storage_replay.replay(collector.applier(), testing.allocator, replay_file, 0);
+    const result = try storage_replay.replay(std.testing.io, collector.applier(), testing.allocator, replay_file, 0);
     try testing.expectEqual(@as(u64, 0), result.last_lsn);
     try testing.expectEqual(@as(usize, 0), result.records_applied);
     try testing.expectEqual(@as(usize, 0), collector.events.items.len);
-    try testing.expectEqual(@as(u64, 0), try replay_file.getEndPos());
+    try testing.expectEqual(@as(u64, 0), try replay_file.length(std.testing.io));
+}
+
+test "fsync retains its file generation and publishes only the captured LSN" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try allocTmpPathTest(testing.allocator, tmp, "concurrent-sync.wal");
+    defer testing.allocator.free(path);
+    var wal = try open(io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+    defer wal.close();
+    const value = Value{ .integer = 42 };
+    try wal.appendPut("first", &value);
+    const captured_lsn = wal.state.last_appended_lsn.load(.acquire);
+
+    var probe = FsyncTestProbe{};
+    fsync_test_probe = &probe;
+    defer fsync_test_probe = null;
+    const Worker = struct {
+        fn run(handle: *Wal) !void {
+            try handle.fsync();
+        }
+    };
+    var syncing = try io.concurrent(Worker.run, .{&wal});
+    defer {
+        probe.resume_sync.set(io);
+        syncing.await(io) catch unreachable;
+    }
+    probe.entered.waitUncancelable(io);
+
+    // Compaction cannot replace or close this file until the captured sync ends.
+    const exclusive = wal.state.file_lifetime.tryLock(io);
+    if (exclusive) wal.state.file_lifetime.unlock(io);
+    try testing.expect(!exclusive);
+    try wal.appendPut("second", &value);
+    probe.resume_sync.set(io);
+    try syncing.await(io);
+    try testing.expectEqual(captured_lsn, wal.state.last_fsync_lsn.load(.acquire));
+    try testing.expect(wal.state.dirty.load(.acquire));
+
+    fsync_test_probe = null;
+    try wal.truncateUpToLsn(captured_lsn);
+    try wal.appendPut("third", &value);
+    try wal.fsync();
+    const replay_file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer replay_file.close(io);
+    var collector = ReplayCollector.init(testing.allocator);
+    defer collector.deinit();
+    const replayed = try storage_replay.replay(io, collector.applier(), testing.allocator, replay_file, 0);
+    try testing.expectEqual(@as(usize, 2), replayed.records_applied);
+}
+
+test "long interval background flush cancels its sleep before close" {
+    const testing = std.testing;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try allocTmpPathTest(testing.allocator, tmp, "cancel-sleep.wal");
+    defer testing.allocator.free(path);
+    var wal = try open(testing.io, path, .{ .fsync_mode = .batched_async, .fsync_interval_ms = 60_000 }, noopApplier(), testing.allocator);
+    const value = Value{ .integer = 7 };
+    try wal.appendPut("retained", &value);
+    const close_started = std.Io.Clock.awake.now(testing.io);
+    wal.close();
+    try testing.expect(close_started.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5_000);
+
+    const file = try std.Io.Dir.cwd().openFile(testing.io, path, .{ .mode = .read_write });
+    defer file.close(testing.io);
+    var collector = ReplayCollector.init(testing.allocator);
+    defer collector.deinit();
+    const replayed = try storage_replay.replay(testing.io, collector.applier(), testing.allocator, file, 0);
+    try testing.expectEqual(@as(usize, 1), replayed.records_applied);
+}
+
+test "compaction waits for an in-flight sync before replacing the WAL" {
+    const testing = std.testing;
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try allocTmpPathTest(testing.allocator, tmp, "compact-during-sync.wal");
+    defer testing.allocator.free(path);
+    var wal = try open(io, path, .{ .fsync_mode = .none }, noopApplier(), testing.allocator);
+    defer wal.close();
+    const value = Value{ .integer = 42 };
+    try wal.appendPut("checkpointed", &value);
+    const cutoff = wal.next_lsn - 1;
+    try wal.appendPut("retained", &value);
+
+    var probe = FsyncTestProbe{};
+    fsync_test_probe = &probe;
+    defer fsync_test_probe = null;
+    const Workers = struct {
+        fn sync(handle: *Wal) !void {
+            try handle.fsync();
+        }
+
+        fn compact(handle: *Wal, lsn: u64, entered: *std.Io.Event) !void {
+            entered.set(handle.state.io);
+            try handle.truncateUpToLsn(lsn);
+        }
+    };
+    var syncing = try io.concurrent(Workers.sync, .{&wal});
+    defer {
+        probe.resume_sync.set(io);
+        syncing.await(io) catch unreachable;
+    }
+    probe.entered.waitUncancelable(io);
+    var compact_entered: std.Io.Event = .unset;
+    var compacting = try io.concurrent(Workers.compact, .{ &wal, cutoff, &compact_entered });
+    defer {
+        probe.resume_sync.set(io);
+        compacting.await(io) catch unreachable;
+    }
+    compact_entered.waitUncancelable(io);
+    probe.resume_sync.set(io);
+    try syncing.await(io);
+    try compacting.await(io);
+    fsync_test_probe = null;
+    try wal.appendPut("after-replace", &value);
+    try wal.fsync();
+
+    const file = try std.Io.Dir.cwd().openFile(io, path, .{ .mode = .read_write });
+    defer file.close(io);
+    var collector = ReplayCollector.init(testing.allocator);
+    defer collector.deinit();
+    const result = try storage_replay.replay(io, collector.applier(), testing.allocator, file, 0);
+    try testing.expectEqual(@as(usize, 2), result.records_applied);
+    try testing.expectEqual(wal.next_lsn - 1, result.last_lsn);
 }

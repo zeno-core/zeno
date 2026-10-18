@@ -36,6 +36,7 @@ test "package root includes internal art module tests without exporting them" {
     _ = @import("core/engine/db.zig");
     _ = @import("core/storage/wal.zig");
     _ = @import("core/storage/snapshot.zig");
+    _ = @import("core/storage/compatibility.zig");
 }
 
 test "package root exposes contract modules" {

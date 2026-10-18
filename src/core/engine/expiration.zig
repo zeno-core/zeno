@@ -58,10 +58,10 @@ pub fn expireAt(
     shard.visibility_gate.lockExclusive();
     defer shard.visibility_gate.unlockExclusive();
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
     if (!internal_mutate.keyExistsUnlocked(shard, key)) {
         internal_ttl_index.clearTtlEntry(shard, key);
         return false;
@@ -114,8 +114,8 @@ fn tryCleanupIfPossible(
     if (!shard.visibility_gate.tryLockExclusive()) return;
     defer shard.visibility_gate.unlockExclusive();
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     switch (cleanup) {
         .none => {},
@@ -128,7 +128,7 @@ fn tryCleanupIfPossible(
                 return;
             }
 
-            const now = runtime_shard.unixNow();
+            const now = runtime_shard.unixNow(state.io);
             const stored_expire_at = internal_ttl_index.getExpireAt(shard, key) orelse return;
             if (!isExpired(stored_expire_at, now)) return;
 
@@ -158,10 +158,10 @@ pub fn ttl(state: *runtime_state.DatabaseState, key: []const u8) error_mod.Engin
         shard.visibility_gate.lockShared();
         defer shard.visibility_gate.unlockShared();
 
-        const now = runtime_shard.unixNow();
+        const now = runtime_shard.unixNow(state.io);
 
-        shard.lock.lockShared();
-        defer shard.lock.unlockShared();
+        shard.lock.lockSharedUncancelable(shard.io);
+        defer shard.lock.unlockShared(shard.io);
 
         if (!internal_mutate.keyExistsUnlocked(shard, key)) {
             cleanup = .missing_key;
@@ -208,13 +208,13 @@ pub fn sweepExpiredEntriesForShard(
     if (!shard.visibility_gate.tryLockExclusive()) return;
     defer shard.visibility_gate.unlockExclusive();
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     // Re-check under lock: another writer may have cleared all entries first
     if (!shard.has_ttl_entries) return;
 
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
 
     // First pass: collect keys of expired entries. Do not modify the map during iteration
     var expired = std.ArrayList([]const u8).empty;

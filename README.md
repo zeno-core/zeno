@@ -1,7 +1,7 @@
 # Zeno - Zig Engine for Node Operations
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![Zig Version](https://img.shields.io/badge/Zig-0.15.2-orange.svg)](https://ziglang.org)
+[![Zig Version](https://img.shields.io/badge/Zig-0.16.0-orange.svg)](https://ziglang.org)
 
 Zeno is a high-performance, embedded key-value storage engine written in pure Zig. Designed for modern workloads, it prioritizes predictable low latency, zero-implicit allocation, and efficient sharded concurrency. Its name (Node) reflects the core index and storage nodes that power each operation, not to be confused with Node.js.
 
@@ -22,7 +22,9 @@ Zeno began as a learning experiment into database storage internals and the Adap
 ## 📊 Performance Benchmarks
 
 Zeno is built for speed. Numbers below are from the current benchmark suite running
-on Ubuntu 24.04.4, AMD Ryzen 7 5700X, 32GB DDR4 @ 3200MHz.
+on Ubuntu 24.04.4, AMD Ryzen 7 5700X, 32GB DDR4 @ 3200MHz, using Zig 0.15.2.
+These are historical measurements; rerun the suite on your target hardware with
+Zig 0.16.0 before comparing performance.
 
 **Benchmark methodology:** steady-state benchmarks use 1,000 rotating keys, 2,000
 warmup iterations, and 100,000 measured iterations. Latency columns show p50/p99.
@@ -110,19 +112,13 @@ zig build bench -Doptimize=ReleaseFast
 
 ## 🛠 Usage
 
-Add `zeno` to your `build.zig.zon`:
+Zeno requires **Zig 0.16.0** (also recorded in `.zigversion`). Add the package with Zig's dependency manager, which records both its URL and content hash:
 
-```zig
-.{
-    .name = "my-project",
-    .version = "0.1.0",
-    .dependencies = .{
-        .zeno = .{
-            .url = "https://github.com/zeno-core/zeno/archive/refs/heads/main.tar.gz",
-        },
-    },
-}
+```bash
+zig fetch --save=zeno https://github.com/zeno-core/zeno/archive/refs/heads/main.tar.gz
 ```
+
+For reproducible upgrades, use a release tag or commit URL when choosing the dependency revision.
 
 Then, in your `build.zig`:
 
@@ -140,21 +136,20 @@ exe.root_module.addImport("zeno", zeno.module("zeno"));
 const std = @import("std");
 const zeno = @import("zeno");
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
-    defer _ = gpa.deinit();
-    const allocator = gpa.allocator();
+pub fn main(init: std.process.Init) !void {
+    const allocator = init.gpa;
 
     // In-memory engine (no persistence)
-    const db = try zeno.public.create(allocator);
-    defer db.close() catch {};
+    const db = try zeno.public.create(init.io, allocator);
+    defer db.close() catch unreachable;
 
     // Write a value
     const value = zeno.types.Value{ .string = "Alice" };
     try db.put("user:1", &value);
 
     // Read it back, caller owns the returned value
-    if (try db.get(allocator, "user:1")) |val| {
+    if (try db.get(allocator, "user:1")) |owned_value| {
+        var val = owned_value;
         defer val.deinit(allocator);
         std.debug.print("Found: {s}\n", .{val.string});
     }
@@ -164,15 +159,17 @@ pub fn main() !void {
 }
 ```
 
-For a persistent engine with WAL and snapshot recovery:
+The database borrows the `std.Io` context supplied at creation. Keep its provider alive until the database, its read views, and its background workers have been closed. The process context in `main` satisfies this lifetime. Database operations retain their existing error contracts and acquire locks without cancellation.
+
+For a persistent engine with WAL and snapshot recovery (inside the same `main`):
 
 ```zig
-const db = try zeno.public.open(allocator, .{
+const db = try zeno.public.open(init.io, allocator, .{
     .wal_path      = "./data.wal",
     .snapshot_path = "./data.snapshot",
     .fsync_mode    = .batched_async,
 });
-defer db.close() catch {};
+defer db.close() catch unreachable;
 ```
 
 ## 🏗 Architecture
@@ -189,3 +186,19 @@ This design gives strong single-key latency, good multicore scaling, and explici
 ## ⚖️ License
 
 Distributed under the MIT License. See `LICENSE` for more information.
+
+## Development
+
+Use the Zig version in `.zigversion`:
+
+```bash
+zig build test
+zig build test -Doptimize=ReleaseSafe
+zig build test -Dexpose_internals=true
+zig build check -Dtarget=x86_64-linux
+zig build bench -Doptimize=ReleaseFast
+```
+
+Benchmarks use zBench 0.13.0. Their timers use the monotonic awake clock;
+TTL deadlines remain Unix wall-clock seconds. Existing WAL records and snapshot
+versions 1 and 2 remain readable after migration to Zig 0.16.0.

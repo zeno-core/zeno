@@ -52,14 +52,14 @@ pub const Database = struct {
         in_progress: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
     };
 
-    /// Per-database state for the optional background TTL expiry sweep thread.
+    /// Per-database state for the optional background TTL expiry sweep task.
     const TtlSweeper = struct {
-        /// Sweep interval in milliseconds. Only meaningful when `thread != null`.
+        /// Sweep interval in milliseconds. Only meaningful when `task != null`.
         interval_ms: u32 = 1_000,
-        /// Set to `true` to signal the sweep thread to stop.
+        /// Set to `true` to signal the sweep task to stop.
         stop: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
-        /// The running sweep thread, or `null` when the sweeper is not active.
-        thread: ?std.Thread = null,
+        /// The concurrent sweep task, or `null` when the sweeper is not active.
+        task: ?std.Io.Future(void) = null,
     };
 
     /// Flushes and closes engine-owned resources.
@@ -277,39 +277,39 @@ pub const Database = struct {
         self.auto_wal_checkpoint.in_progress.store(false, .release);
     }
 
-    /// Starts the background TTL sweep thread with the given interval.
+    /// Starts the concurrent TTL sweep task with the given interval.
     ///
     /// Time Complexity: O(1).
     ///
-    /// Allocator: Does not allocate beyond the OS thread stack.
+    /// Allocator: The I/O provider owns the concurrent task resources.
     ///
     /// Thread Safety: Must be called before the engine handle is shared across threads.
     pub fn startTtlSweeper(self: *Database, interval_ms: u32) !void {
         self.ttl_sweeper.interval_ms = interval_ms;
         self.ttl_sweeper.stop.store(false, .release);
-        self.ttl_sweeper.thread = try std.Thread.spawn(.{}, ttlSweepThreadMain, .{self});
+        self.ttl_sweeper.task = try self.state.io.concurrent(ttlSweepTaskMain, .{self});
     }
 
-    /// Signals the sweep thread to stop and joins it.
+    /// Signals the sweep task to stop, cancels its sleep, and awaits completion.
     ///
-    /// Time Complexity: O(1) plus thread join latency (at most one sweep interval).
+    /// Time Complexity: O(1) coordination plus any in-progress sweep work.
     ///
     /// Allocator: Does not allocate.
     ///
     /// Thread Safety: Safe to call from the engine owner thread during close.
     pub fn stopTtlSweeper(self: *Database) void {
         self.ttl_sweeper.stop.store(true, .release);
-        if (self.ttl_sweeper.thread) |thread| {
-            thread.join();
-            self.ttl_sweeper.thread = null;
+        if (self.ttl_sweeper.task) |*task| {
+            task.cancel(self.state.io);
+            self.ttl_sweeper.task = null;
         }
     }
 
-    fn ttlSweepThreadMain(db: *Database) void {
+    fn ttlSweepTaskMain(db: *Database) void {
         const interval_ns = @as(u64, db.ttl_sweeper.interval_ms) * std.time.ns_per_ms;
 
         while (!db.ttl_sweeper.stop.load(.acquire)) {
-            std.Thread.sleep(interval_ns);
+            db.state.io.sleep(.fromNanoseconds(interval_ns), .awake) catch return;
             if (db.ttl_sweeper.stop.load(.acquire)) break;
 
             for (0..runtime_state.NUM_SHARDS) |shard_idx| {
@@ -507,8 +507,10 @@ pub const Database = struct {
 /// Time Complexity: O(s), where `s` is the runtime shard count.
 ///
 /// Allocator: Allocates the engine handle and runtime state from `allocator`.
-pub fn create(allocator: std.mem.Allocator) EngineError!*Database {
-    return lifecycle.create(allocator);
+///
+/// Ownership: Borrows `io`; its provider must outlive the database, read views, and background workers.
+pub fn create(io: std.Io, allocator: std.mem.Allocator) EngineError!*Database {
+    return lifecycle.create(io, allocator);
 }
 
 /// Opens an engine handle from the provided runtime options.
@@ -516,8 +518,10 @@ pub fn create(allocator: std.mem.Allocator) EngineError!*Database {
 /// Time Complexity: O(s + n + r + e), where `s` is the runtime shard count, `n` is snapshot load work, `r` is replayed WAL work, and `e` is post-recovery expired-key purge work when persistence is configured.
 ///
 /// Allocator: Allocates the engine handle from `allocator` and uses explicit allocator paths for snapshot load and WAL replay scratch when persistence is configured.
-pub fn open(allocator: std.mem.Allocator, options: types.DatabaseOptions) EngineError!*Database {
-    return lifecycle.open(allocator, options);
+///
+/// Ownership: Borrows `io`; its provider must outlive the database, read views, and background workers.
+pub fn open(io: std.Io, allocator: std.mem.Allocator, options: types.DatabaseOptions) EngineError!*Database {
+    return lifecycle.open(io, allocator, options);
 }
 
 /// Scans the next prefix page inside a consistent read view.
@@ -577,8 +581,8 @@ fn setTtlForTest(db: *Database, key: []const u8, expire_at_seconds: i64) !void {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
     try internal_ttl_index.setTtlEntry(shard, key, expire_at_seconds);
 }
 
@@ -586,8 +590,8 @@ fn hasTtlForTest(db: *Database, key: []const u8) bool {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lockShared();
-    defer shard.lock.unlockShared();
+    shard.lock.lockSharedUncancelable(shard.io);
+    defer shard.lock.unlockShared(shard.io);
     return internal_ttl_index.getExpireAt(shard, key) != null;
 }
 
@@ -595,8 +599,8 @@ fn hasStoredKeyForTest(db: *Database, key: []const u8) bool {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lockShared();
-    defer shard.lock.unlockShared();
+    shard.lock.lockSharedUncancelable(shard.io);
+    defer shard.lock.unlockShared(shard.io);
     return shard.tree.lookup(key) != null;
 }
 
@@ -604,17 +608,17 @@ fn valueIsHeapOwnedForTest(db: *Database, key: []const u8) bool {
     const shard_idx = runtime_shard.getShardIndex(key);
     const shard = &db.state.shards[shard_idx];
 
-    shard.lock.lockShared();
-    defer shard.lock.unlockShared();
+    shard.lock.lockSharedUncancelable(shard.io);
+    defer shard.lock.unlockShared(shard.io);
     return internal_mutate.valueIsHeapOwnedUnlocked(shard, key);
 }
 
 fn totalCommittedArenasForTest(db: *Database) usize {
     var total: usize = 0;
     for (&db.state.shards) |*shard| {
-        shard.lock.lockShared();
+        shard.lock.lockSharedUncancelable(shard.io);
         total += internal_mutate.countCommittedArenasUnlocked(shard);
-        shard.lock.unlockShared();
+        shard.lock.unlockShared(shard.io);
     }
     return total;
 }
@@ -660,15 +664,13 @@ fn currentCheckpointLsnForTest(db: *Database) u64 {
 }
 
 fn corruptFileByteForTest(path: []const u8, offset: u64, mask: u8) !void {
-    const file = try std.fs.cwd().openFile(path, .{ .mode = .read_write });
-    defer file.close();
+    const file = try std.Io.Dir.cwd().openFile(std.testing.io, path, .{ .mode = .read_write });
+    defer file.close(std.testing.io);
 
-    try file.seekTo(offset);
     var byte: [1]u8 = undefined;
-    if ((try file.readAll(&byte)) != byte.len) return error.EndOfStream;
+    if ((try file.readPositionalAll(std.testing.io, &byte, offset)) != byte.len) return error.EndOfStream;
     byte[0] ^= mask;
-    try file.seekTo(offset);
-    try file.writeAll(&byte);
+    try file.writePositionalAll(std.testing.io, &byte, offset);
 }
 
 fn allocTmpPathTest(allocator: std.mem.Allocator, tmp: std.testing.TmpDir, basename: []const u8) ![]u8 {
@@ -695,7 +697,7 @@ fn noopReplayExpire(ctx: *anyopaque, key: []const u8, expire_at_sec: i64) !void 
 }
 
 fn attachTestWal(db: *Database, path: []const u8, fsync_mode: types.FsyncMode) !void {
-    db.state.wal = try storage_wal.open(path, .{ .fsync_mode = fsync_mode }, .{
+    db.state.wal = try storage_wal.open(db.state.io, path, .{ .fsync_mode = fsync_mode }, .{
         .ctx = &noop_replay_ctx,
         .put = noopReplayPut,
         .delete = noopReplayDelete,
@@ -723,7 +725,7 @@ fn runCheckpointInThread(state: *CheckpointThreadState) void {
 test "create initializes runtime-owned database state" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     try testing.expectEqual(@as(usize, runtime_state.NUM_SHARDS), db.state.shards.len);
@@ -740,19 +742,19 @@ test "snapshot-only open restores values and ttl metadata without incrementing c
     defer testing.allocator.free(snapshot_path);
 
     {
-        const db = try create(testing.allocator);
+        const db = try create(std.testing.io, testing.allocator);
         defer db.close() catch unreachable;
 
         const alpha = types.Value{ .string = "alive" };
         const beta = types.Value{ .integer = 7 };
         try db.put("alpha", &alpha);
         try db.put("beta", &beta);
-        try setTtlForTest(db, "alpha", runtime_shard.unixNow() + 60);
+        try setTtlForTest(db, "alpha", runtime_shard.unixNow(std.testing.io) + 60);
 
         _ = try storage_snapshot.write(&db.state, testing.allocator, snapshot_path, 33);
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer reopened.close() catch unreachable;
@@ -781,7 +783,7 @@ test "wal-only open replays recovered keys deletes and ttl metadata without incr
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -794,10 +796,10 @@ test "wal-only open replays recovered keys deletes and ttl metadata without incr
         try db.put("beta", &beta);
         try db.put("gamma", &gamma);
         try testing.expect(try db.delete("beta"));
-        try testing.expect(try db.expireAt("gamma", runtime_shard.unixNow() + 60));
+        try testing.expect(try db.expireAt("gamma", runtime_shard.unixNow(std.testing.io) + 60));
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .none,
     });
@@ -826,7 +828,7 @@ test "snapshot-backed open replays wal delta after the snapshot lsn" {
     defer testing.allocator.free(snapshot_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -844,10 +846,10 @@ test "snapshot-backed open replays wal delta after the snapshot lsn" {
         try db.put("alpha", &replacement);
         try testing.expect(try db.delete("beta"));
         try db.put("gamma", &gamma);
-        try testing.expect(try db.expireAt("gamma", runtime_shard.unixNow() + 60));
+        try testing.expect(try db.expireAt("gamma", runtime_shard.unixNow(std.testing.io) + 60));
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -880,7 +882,7 @@ test "corrupted snapshot falls back to full wal replay when wal is non-empty" {
     defer testing.allocator.free(snapshot_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -895,7 +897,7 @@ test "corrupted snapshot falls back to full wal replay when wal is non-empty" {
 
     try corruptFileByteForTest(snapshot_path, 0, 0xff);
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -927,7 +929,7 @@ test "corrupted snapshot with missing wal returns snapshot corrupted" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try create(testing.allocator);
+        const db = try create(std.testing.io, testing.allocator);
         defer db.close() catch unreachable;
 
         const alpha = types.Value{ .integer = 1 };
@@ -937,7 +939,7 @@ test "corrupted snapshot with missing wal returns snapshot corrupted" {
 
     try corruptFileByteForTest(snapshot_path, 0, 0xff);
 
-    try testing.expectError(error.SnapshotCorrupted, open(testing.allocator, .{
+    try testing.expectError(error.SnapshotCorrupted, open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -956,7 +958,7 @@ test "corrupted snapshot with empty wal returns snapshot corrupted" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try create(testing.allocator);
+        const db = try create(std.testing.io, testing.allocator);
         defer db.close() catch unreachable;
 
         const alpha = types.Value{ .integer = 1 };
@@ -965,12 +967,12 @@ test "corrupted snapshot with empty wal returns snapshot corrupted" {
     }
 
     {
-        const file = try std.fs.cwd().createFile(wal_path, .{ .truncate = true });
-        file.close();
+        const file = try std.Io.Dir.cwd().createFile(std.testing.io, wal_path, .{ .truncate = true });
+        file.close(std.testing.io);
     }
     try corruptFileByteForTest(snapshot_path, 0, 0xff);
 
-    try testing.expectError(error.SnapshotCorrupted, open(testing.allocator, .{
+    try testing.expectError(error.SnapshotCorrupted, open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -989,7 +991,7 @@ test "open purges expired keys recovered from snapshot and wal replay" {
     defer testing.allocator.free(snapshot_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -998,14 +1000,14 @@ test "open purges expired keys recovered from snapshot and wal replay" {
         const snapshot_value = types.Value{ .integer = 1 };
         const wal_value = types.Value{ .integer = 2 };
         try db.put("snapshot:expired", &snapshot_value);
-        try setTtlForTest(db, "snapshot:expired", runtime_shard.unixNow() - 10);
+        try setTtlForTest(db, "snapshot:expired", runtime_shard.unixNow(std.testing.io) - 10);
         _ = try storage_snapshot.write(&db.state, testing.allocator, snapshot_path, currentCheckpointLsnForTest(db));
 
         try db.state.wal.?.appendPut("wal:expired", &wal_value);
-        try db.state.wal.?.appendExpire("wal:expired", runtime_shard.unixNow() - 10);
+        try db.state.wal.?.appendExpire("wal:expired", runtime_shard.unixNow(std.testing.io) - 10);
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -1028,7 +1030,7 @@ test "open purges expired keys recovered from snapshot and wal replay" {
 test "checkpoint without a configured snapshot path returns no snapshot path" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .metrics = .{ .mode = .full },
     });
     defer db.close() catch unreachable;
@@ -1045,7 +1047,7 @@ test "checkpoint without a configured snapshot path returns no snapshot path" {
 test "compact memory without a configured snapshot path returns no snapshot path" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .metrics = .{ .mode = .full },
     });
     defer db.close() catch unreachable;
@@ -1056,7 +1058,7 @@ test "compact memory without a configured snapshot path returns no snapshot path
 test "compact_shard validates shard index" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     try testing.expectError(error.InvalidShardIndex, db.compactShard(runtime_shard.NUM_SHARDS));
@@ -1072,7 +1074,7 @@ test "checkpoint writes a snapshot and reopens the same visible state" {
     defer testing.allocator.free(snapshot_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .snapshot_path = snapshot_path,
         });
         defer db.close() catch unreachable;
@@ -1081,7 +1083,7 @@ test "checkpoint writes a snapshot and reopens the same visible state" {
         const beta_value = types.Value{ .integer = 7 };
         try db.put("alpha", &alpha_value);
         try db.put("beta", &beta_value);
-        try testing.expect(try db.expireAt("beta", runtime_shard.unixNow() + 60));
+        try testing.expect(try db.expireAt("beta", runtime_shard.unixNow(std.testing.io) + 60));
         try db.checkpoint();
         const stats = db.state.statsSnapshot();
         try testing.expectEqual(@as(u64, 1), stats.checkpoint_count_total);
@@ -1089,7 +1091,7 @@ test "checkpoint writes a snapshot and reopens the same visible state" {
         try testing.expectEqual(@as(u64, 0), stats.checkpoint_lsn_last);
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer reopened.close() catch unreachable;
@@ -1116,7 +1118,7 @@ test "checkpoint preserves post-snapshot wal delta on reopen" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .snapshot_path = snapshot_path,
             .wal_path = wal_path,
             .fsync_mode = .none,
@@ -1131,7 +1133,7 @@ test "checkpoint preserves post-snapshot wal delta on reopen" {
         try testing.expect(try db.delete("alpha"));
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -1154,7 +1156,7 @@ test "compact memory preserves visible state and reclaims committed arenas" {
     const snapshot_path = try allocTmpPathTest(testing.allocator, tmp, "compact-memory.snapshot");
     defer testing.allocator.free(snapshot_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer db.close() catch unreachable;
@@ -1188,7 +1190,7 @@ test "compact memory preserves visible state and reclaims committed arenas" {
 test "compact_shard clears retained heavy estimate and preserves visible value" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var payload_a = [_]u8{'a'} ** 1024;
@@ -1220,7 +1222,7 @@ test "compact_shard clears retained heavy estimate and preserves visible value" 
 test "compact_all clears retained heavy estimate across shards" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var payload_a = [_]u8{'x'} ** 1024;
@@ -1246,7 +1248,7 @@ test "compact_all clears retained heavy estimate across shards" {
 test "heavy overwrite retained estimate stays low with heap-owned overwrites" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const payload_bytes: usize = 1024;
@@ -1287,7 +1289,7 @@ test "heavy overwrite retained estimate stays low with heap-owned overwrites" {
 test "heavy_overwrite_compact_every triggers automatic maintenance on heavy overwrites" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .heavy_overwrite_compact_every = 1,
     });
     defer db.close() catch unreachable;
@@ -1312,7 +1314,7 @@ test "heavy_overwrite_compact_every triggers automatic maintenance on heavy over
 test "heavy overwrite cadence counts per-overwrite events inside one put_group" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .heavy_overwrite_compact_every = 2,
     });
     defer db.close() catch unreachable;
@@ -1339,7 +1341,7 @@ test "heavy overwrite cadence counts per-overwrite events inside one put_group" 
 test "heavy to scalar overwrite still records retained heavy estimate" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var payload = [_]u8{'z'} ** 1024;
@@ -1357,7 +1359,7 @@ test "heavy to scalar overwrite still records retained heavy estimate" {
 test "engine boundary latency sampling records one sample per call including errors" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .metrics = .{ .mode = .full },
     });
     defer db.close() catch unreachable;
@@ -1374,7 +1376,7 @@ test "engine boundary latency sampling records one sample per call including err
     expected += 1;
     try testing.expectEqual(expected, latencySamplesForTest(db));
 
-    try testing.expect(!try db.expireAt("missing", runtime_shard.unixNow() + 30));
+    try testing.expect(!try db.expireAt("missing", runtime_shard.unixNow(std.testing.io) + 30));
     expected += 1;
     try testing.expectEqual(expected, latencySamplesForTest(db));
 
@@ -1455,7 +1457,7 @@ test "wal-only restart preserves committed batch semantics" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -1471,7 +1473,7 @@ test "wal-only restart preserves committed batch semantics" {
         });
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .none,
     });
@@ -1496,7 +1498,7 @@ test "recovered expired ttl metadata remains invisible after wal-only restart" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -1504,12 +1506,12 @@ test "recovered expired ttl metadata remains invisible after wal-only restart" {
 
         const value = types.Value{ .integer = 7 };
         try db.put("alpha", &value);
-        try testing.expect(try db.expireAt("alpha", runtime_shard.unixNow() + 1));
+        try testing.expect(try db.expireAt("alpha", runtime_shard.unixNow(std.testing.io) + 1));
     }
 
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    std.testing.io.sleep(.fromNanoseconds(1100 * std.time.ns_per_ms), .awake) catch unreachable;
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .none,
     });
@@ -1533,7 +1535,7 @@ test "truncated batch tail does not become visible after wal-only reopen" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -1548,13 +1550,13 @@ test "truncated batch tail does not become visible after wal-only reopen" {
     }
 
     {
-        const file = try std.fs.cwd().openFile(wal_path, .{ .mode = .read_write });
-        defer file.close();
-        const size = try file.getEndPos();
-        try file.setEndPos(size - 1);
+        const file = try std.Io.Dir.cwd().openFile(std.testing.io, wal_path, .{ .mode = .read_write });
+        defer file.close(std.testing.io);
+        const size = try file.length(std.testing.io);
+        try file.setLength(std.testing.io, size - 1);
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .none,
     });
@@ -1567,7 +1569,7 @@ test "truncated batch tail does not become visible after wal-only reopen" {
 test "plain point operations store clone and delete values" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const original = types.Value{ .string = "hello" };
@@ -1593,7 +1595,7 @@ test "plain point operations store clone and delete values" {
 test "put overwrites existing plain value" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try open(std.testing.io, testing.allocator, .{ .metrics = .{ .mode = .counters_only } });
     defer db.close() catch unreachable;
 
     const first = types.Value{ .integer = 7 };
@@ -1616,7 +1618,7 @@ test "scalar point overwrites avoid allocator growth in steady state" {
     var counting_state = std.testing.FailingAllocator.init(testing.allocator, .{});
     const counting_allocator = counting_state.allocator();
 
-    const db = try create(counting_allocator);
+    const db = try create(std.testing.io, counting_allocator);
     defer db.close() catch unreachable;
 
     const initial = types.Value{ .integer = 0 };
@@ -1642,7 +1644,7 @@ test "put leaves state unchanged when wal append fails" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-put-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
     try attachTestWal(db, path, .none);
 
@@ -1655,7 +1657,7 @@ test "put leaves state unchanged when wal append fails" {
 test "put_group writes all provided entries" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -1689,7 +1691,7 @@ test "put_group keeps state unchanged when wal append fails" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-put-group-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
     try attachTestWal(db, path, .none);
 
@@ -1713,7 +1715,7 @@ test "delete returns a durability error and keeps the key when wal append fails"
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-delete-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -1731,23 +1733,23 @@ test "delete returns a durability error and keeps the key when wal append fails"
 test "expire_at returns false for missing keys and increments the expire counter" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try open(std.testing.io, testing.allocator, .{ .metrics = .{ .mode = .counters_only } });
     defer db.close() catch unreachable;
 
-    try testing.expect(!try db.expireAt("missing", runtime_shard.unixNow() + 30));
+    try testing.expect(!try db.expireAt("missing", runtime_shard.unixNow(std.testing.io) + 30));
     try testing.expectEqual(@as(u64, 1), db.state.counters.ops_expire_total.load(.monotonic));
 }
 
 test "expire_at null clears existing ttl while keeping the stored value" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .string = "value" };
     try db.put("ttl:key", &value);
 
-    const expire_at_seconds = runtime_shard.unixNow() + 30;
+    const expire_at_seconds = runtime_shard.unixNow(std.testing.io) + 30;
     try testing.expect(try db.expireAt("ttl:key", expire_at_seconds));
     const ttl_before_clear = try db.ttl("ttl:key");
     try testing.expect(ttl_before_clear >= 0);
@@ -1764,13 +1766,13 @@ test "expire_at null clears existing ttl while keeping the stored value" {
 test "expire_at at or before now deletes the key immediately" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 9 };
     try db.put("gone", &value);
 
-    try testing.expect(try db.expireAt("gone", runtime_shard.unixNow()));
+    try testing.expect(try db.expireAt("gone", runtime_shard.unixNow(std.testing.io)));
     try testing.expect((try db.get(testing.allocator, "gone")) == null);
     try testing.expectEqual(@as(i64, -2), try db.ttl("gone"));
     try testing.expect(!hasTtlForTest(db, "gone"));
@@ -1785,16 +1787,16 @@ test "expire_at future leaves ttl unchanged when wal append fails" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-expire-future-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
     try db.put("wal:expire-future", &value);
-    try setTtlForTest(db, "wal:expire-future", runtime_shard.unixNow() + 30);
+    try setTtlForTest(db, "wal:expire-future", runtime_shard.unixNow(std.testing.io) + 30);
     try attachTestWal(db, path, .none);
 
     storage_wal.test_hooks.failNextWrite();
-    try testing.expectError(error.PersistenceIoFailure, db.expireAt("wal:expire-future", runtime_shard.unixNow() + 90));
+    try testing.expectError(error.PersistenceIoFailure, db.expireAt("wal:expire-future", runtime_shard.unixNow(std.testing.io) + 90));
     try testing.expect(hasTtlForTest(db, "wal:expire-future"));
     try testing.expect((try db.ttl("wal:expire-future")) <= 30);
 }
@@ -1808,7 +1810,7 @@ test "expire_at immediate delete leaves key visible when wal append fails" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-expire-delete-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 9 };
@@ -1816,7 +1818,7 @@ test "expire_at immediate delete leaves key visible when wal append fails" {
     try attachTestWal(db, path, .none);
 
     storage_wal.test_hooks.failNextWrite();
-    try testing.expectError(error.PersistenceIoFailure, db.expireAt("wal:expire-delete", runtime_shard.unixNow()));
+    try testing.expectError(error.PersistenceIoFailure, db.expireAt("wal:expire-delete", runtime_shard.unixNow(std.testing.io)));
 
     var stored = (try db.get(testing.allocator, "wal:expire-delete")).?;
     defer stored.deinit(testing.allocator);
@@ -1833,12 +1835,12 @@ test "expire_at null leaves ttl intact when wal append fails" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-expire-clear-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
     try db.put("wal:expire-clear", &value);
-    try setTtlForTest(db, "wal:expire-clear", runtime_shard.unixNow() + 30);
+    try setTtlForTest(db, "wal:expire-clear", runtime_shard.unixNow(std.testing.io) + 30);
     try attachTestWal(db, path, .none);
 
     storage_wal.test_hooks.failNextWrite();
@@ -1850,12 +1852,12 @@ test "expire_at null leaves ttl intact when wal append fails" {
 test "ttl eagerly cleans up expired keys while get remains lazily invisible" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .string = "stale" };
     try db.put("stale:key", &value);
-    try setTtlForTest(db, "stale:key", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "stale:key", runtime_shard.unixNow(std.testing.io) - 1);
 
     try testing.expect(hasTtlForTest(db, "stale:key"));
     try testing.expect((try db.get(testing.allocator, "stale:key")) == null);
@@ -1869,7 +1871,7 @@ test "ttl eagerly cleans up expired keys while get remains lazily invisible" {
 test "read view holds the visibility gate until released" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var view = try db.readView();
@@ -1891,7 +1893,7 @@ test "checkpoint returns busy while a read view holds global visibility gates" {
     const snapshot_path = try allocTmpPathTest(testing.allocator, tmp, "checkpoint-busy-read-view.snapshot");
     defer testing.allocator.free(snapshot_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer db.close() catch unreachable;
@@ -1915,7 +1917,7 @@ test "compact memory returns busy while a read view holds global visibility gate
     const snapshot_path = try allocTmpPathTest(testing.allocator, tmp, "compact-memory-busy.snapshot");
     defer testing.allocator.free(snapshot_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer db.close() catch unreachable;
@@ -1939,7 +1941,7 @@ test "checkpoint succeeds after read view release following busy result" {
     const snapshot_path = try allocTmpPathTest(testing.allocator, tmp, "checkpoint-busy-then-success.snapshot");
     defer testing.allocator.free(snapshot_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer db.close() catch unreachable;
@@ -1966,7 +1968,7 @@ test "concurrent checkpoint attempts while read view held report busy" {
     const snapshot_path = try allocTmpPathTest(testing.allocator, tmp, "checkpoint-busy-concurrent.snapshot");
     defer testing.allocator.free(snapshot_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
     });
     defer db.close() catch unreachable;
@@ -1993,7 +1995,7 @@ test "concurrent checkpoint attempts while read view held report busy" {
 test "read view copies release the visibility gate only once" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var view = try db.readView();
@@ -2014,7 +2016,7 @@ test "read view copies release the visibility gate only once" {
 test "in-view scans reject stale read view copies" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -2032,7 +2034,7 @@ test "in-view scans reject stale read view copies" {
 test "close fails while a read view is still active" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var view = try db.readView();
@@ -2050,7 +2052,7 @@ test "close surfaces final wal flush failure for batched async mode" {
     const wal_path = try allocTmpPathTest(testing.allocator, tmp, "step7-close-fsync.wal");
     defer testing.allocator.free(wal_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .batched_async,
         .fsync_interval_ms = 1,
@@ -2067,7 +2069,7 @@ test "close surfaces final wal flush failure for batched async mode" {
 test "apply_batch keeps the final value in declared key order" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2098,7 +2100,7 @@ test "apply_batch leaves survivor writes unapplied when wal append fails" {
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-batch-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
     try attachTestWal(db, path, .none);
 
@@ -2117,7 +2119,7 @@ test "apply_batch leaves survivor writes unapplied when wal append fails" {
 test "apply_checked_batch keeps state unchanged when a guard fails" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const original = types.Value{ .string = "original" };
@@ -2152,7 +2154,7 @@ test "apply_checked_batch leaves survivor writes unapplied when wal append fails
     const path = try allocTmpPathTest(testing.allocator, tmp, "step6-checked-batch-failure.wal");
     defer testing.allocator.free(path);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const existing = types.Value{ .integer = 1 };
@@ -2181,7 +2183,7 @@ test "apply_checked_batch validates guard keys and expected values" {
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     try testing.expectError(error.KeyTooLarge, applyCheckedBatch(db, .{
@@ -2210,19 +2212,19 @@ test "apply_checked_batch validates guard keys and expected values" {
 test "put and delete clear prior ttl metadata" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const first = types.Value{ .integer = 1 };
     try db.put("ttl:put", &first);
-    try setTtlForTest(db, "ttl:put", runtime_shard.unixNow() + 30);
+    try setTtlForTest(db, "ttl:put", runtime_shard.unixNow(std.testing.io) + 30);
 
     const replacement = types.Value{ .integer = 2 };
     try db.put("ttl:put", &replacement);
     try testing.expectEqual(@as(i64, -1), try db.ttl("ttl:put"));
     try testing.expect(!hasTtlForTest(db, "ttl:put"));
 
-    try setTtlForTest(db, "ttl:put", runtime_shard.unixNow() + 30);
+    try setTtlForTest(db, "ttl:put", runtime_shard.unixNow(std.testing.io) + 30);
     try testing.expect(try db.delete("ttl:put"));
     try testing.expect(!hasTtlForTest(db, "ttl:put"));
     try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:put"));
@@ -2231,12 +2233,12 @@ test "put and delete clear prior ttl metadata" {
 test "delete returns false for expired keys that are already invisible" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
     try db.put("ttl:expired-delete", &value);
-    try setTtlForTest(db, "ttl:expired-delete", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "ttl:expired-delete", runtime_shard.unixNow(std.testing.io) - 1);
 
     try testing.expect(!try db.delete("ttl:expired-delete"));
     try testing.expect((try db.get(testing.allocator, "ttl:expired-delete")) == null);
@@ -2246,14 +2248,14 @@ test "delete returns false for expired keys that are already invisible" {
 test "batch writes clear prior ttl metadata" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const original = types.Value{ .integer = 1 };
     try db.put("ttl:batch", &original);
     try db.put("ttl:checked", &original);
-    try setTtlForTest(db, "ttl:batch", runtime_shard.unixNow() + 30);
-    try setTtlForTest(db, "ttl:checked", runtime_shard.unixNow() + 30);
+    try setTtlForTest(db, "ttl:batch", runtime_shard.unixNow(std.testing.io) + 30);
+    try setTtlForTest(db, "ttl:checked", runtime_shard.unixNow(std.testing.io) + 30);
 
     const batch_value = types.Value{ .integer = 2 };
     try db.applyBatch(&.{
@@ -2278,12 +2280,12 @@ test "batch writes clear prior ttl metadata" {
 test "checked batch guards treat expired keys as absent" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const stale = types.Value{ .integer = 1 };
     try db.put("ttl:guarded", &stale);
-    try setTtlForTest(db, "ttl:guarded", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "ttl:guarded", runtime_shard.unixNow(std.testing.io) - 1);
 
     const fresh = types.Value{ .integer = 2 };
     try applyCheckedBatch(db, .{
@@ -2324,7 +2326,7 @@ test "checked batch guards treat expired keys as absent" {
 test "checked batch uses one expiration timestamp across all guards" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const pathological_key = try testing.allocator.alloc(u8, write.MAX_KEY_LEN);
@@ -2333,7 +2335,7 @@ test "checked batch uses one expiration timestamp across all guards" {
 
     const original = types.Value{ .integer = 1 };
     try db.put(pathological_key, &original);
-    try testing.expect(try db.expireAt(pathological_key, runtime_shard.unixNow() + 2));
+    try testing.expect(try db.expireAt(pathological_key, runtime_shard.unixNow(std.testing.io) + 2));
 
     const guards = try testing.allocator.alloc(types.CheckedBatchGuard, 128);
     defer testing.allocator.free(guards);
@@ -2357,7 +2359,7 @@ test "checked batch uses one expiration timestamp across all guards" {
 test "scan_prefix returns lexicographically ordered owned entries" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const alpha = types.Value{ .integer = 1 };
@@ -2380,7 +2382,7 @@ test "scan_prefix returns lexicographically ordered owned entries" {
 test "scan operations omit expired keys while preserving lexicographic order" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const a = types.Value{ .integer = 1 };
@@ -2389,7 +2391,7 @@ test "scan operations omit expired keys while preserving lexicographic order" {
     try db.put("alpha", &a);
     try db.put("beta", &b);
     try db.put("gamma", &c);
-    try setTtlForTest(db, "beta", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "beta", runtime_shard.unixNow(std.testing.io) - 1);
 
     var prefix_result = try db.scanPrefix(testing.allocator, "");
     defer prefix_result.deinit();
@@ -2410,7 +2412,7 @@ test "scan operations omit expired keys while preserving lexicographic order" {
 test "scan_range uses inclusive start and exclusive end" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const a = types.Value{ .integer = 1 };
@@ -2434,7 +2436,7 @@ test "scan_range uses inclusive start and exclusive end" {
 test "scan_prefix_from_in_view paginates in key order" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2486,7 +2488,7 @@ test "scan_prefix_from_in_view merges cross-shard heads in global key order" {
 
     try testing.expectEqual(@as(usize, chosen.len), chosen_count);
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2521,7 +2523,7 @@ test "scan_prefix_from_in_view merges cross-shard heads in global key order" {
 test "scan_prefix_from_in_view cursor records the last emitted key" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2542,7 +2544,7 @@ test "scan_prefix_from_in_view cursor records the last emitted key" {
 test "scan_prefix matches and merges shard results in order" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const values = [_]types.Value{
@@ -2570,7 +2572,7 @@ test "scan_prefix matches and merges shard results in order" {
 test "scan_prefix_from_in_view omits keys expired before the view opens" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2579,7 +2581,7 @@ test "scan_prefix_from_in_view omits keys expired before the view opens" {
     try db.put("alpha", &one);
     try db.put("alpha:1", &two);
     try db.put("alpha:2", &three);
-    try setTtlForTest(db, "alpha", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "alpha", runtime_shard.unixNow(std.testing.io) - 1);
 
     var view = try db.readView();
     defer view.deinit();
@@ -2601,17 +2603,17 @@ test "scan_prefix_from_in_view omits keys expired before the view opens" {
 test "read view freezes expiration time at open" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 7 };
     try db.put("alpha", &value);
-    try testing.expect(try db.expireAt("alpha", runtime_shard.unixNow() + 1));
+    try testing.expect(try db.expireAt("alpha", runtime_shard.unixNow(std.testing.io) + 1));
 
     var view = try db.readView();
     defer view.deinit();
 
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    std.testing.io.sleep(.fromNanoseconds(1100 * std.time.ns_per_ms), .awake) catch unreachable;
 
     var in_view = try scanPrefixFromInView(&view, testing.allocator, "alpha", null, 10);
     defer in_view.deinit();
@@ -2626,17 +2628,17 @@ test "read view freezes expiration time at open" {
 test "ttl does not deadlock under an active read view and defers cleanup" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 7 };
     try db.put("ttl:view", &value);
-    try testing.expect(try db.expireAt("ttl:view", runtime_shard.unixNow() + 1));
+    try testing.expect(try db.expireAt("ttl:view", runtime_shard.unixNow(std.testing.io) + 1));
 
     var view = try db.readView();
     defer view.deinit();
 
-    std.Thread.sleep(1100 * std.time.ns_per_ms);
+    std.testing.io.sleep(.fromNanoseconds(1100 * std.time.ns_per_ms), .awake) catch unreachable;
 
     try testing.expectEqual(@as(i64, -2), try db.ttl("ttl:view"));
     try testing.expect(hasTtlForTest(db, "ttl:view"));
@@ -2654,7 +2656,7 @@ test "ttl does not deadlock under an active read view and defers cleanup" {
 test "scan page can promote one borrowed continuation cursor into owned storage" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2702,7 +2704,7 @@ test "owned scan cursor clone makes an independent continuation owner" {
 test "point operation boundaries reject empty keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -2710,7 +2712,7 @@ test "point operation boundaries reject empty keys" {
     try testing.expectError(error.KeyTooLarge, db.put("", &value));
     try testing.expectError(error.KeyTooLarge, db.get(testing.allocator, ""));
     try testing.expectError(error.KeyTooLarge, db.delete(""));
-    try testing.expectError(error.KeyTooLarge, db.expireAt("", runtime_shard.unixNow() + 60));
+    try testing.expectError(error.KeyTooLarge, db.expireAt("", runtime_shard.unixNow(std.testing.io) + 60));
     try testing.expectError(error.KeyTooLarge, db.ttl(""));
 }
 
@@ -2718,7 +2720,7 @@ test "apply_batch rejects invalid keys and oversized values before changing stat
     const testing = std.testing;
     const allocator = testing.allocator;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const sentinel = types.Value{ .integer = 7 };
@@ -2747,7 +2749,7 @@ test "apply_batch rejects invalid keys and oversized values before changing stat
 test "empty batches are no-ops and checked empty batches still validate guards" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -2769,7 +2771,7 @@ test "empty batches are no-ops and checked empty batches still validate guards" 
 test "shard reset reclaims committed batch arenas" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2781,8 +2783,8 @@ test "shard reset reclaims committed batch arenas" {
 
     const shard_idx = runtime_shard.getShardIndex("arena:one");
     const shard = &db.state.shards[shard_idx];
-    shard.lock.lock();
-    defer shard.lock.unlock();
+    shard.lock.lockUncancelable(shard.io);
+    defer shard.lock.unlock(shard.io);
 
     try testing.expect(shard.committed_arenas_head != null);
     shard.resetUnlocked();
@@ -2795,7 +2797,7 @@ test "shard reset reclaims committed batch arenas" {
 test "overwrite-only batches avoid retaining new committed arenas and remain reclaimable" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var values: [64]types.Value = undefined;
@@ -2837,7 +2839,7 @@ test "overwrite-only batches avoid retaining new committed arenas and remain rec
 test "scan_prefix includes the exact key and its subkeys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2862,7 +2864,7 @@ test "scan_prefix includes the exact key and its subkeys" {
 test "scan_range_from_in_view paginates binary keys in global order and terminates cleanly" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -2901,7 +2903,7 @@ test "scan_range_from_in_view paginates binary keys in global order and terminat
 test "batch visibility-gate pause hook blocks completion until resumed" {
     const testing = std.testing;
 
-    const db = try create(std.heap.page_allocator);
+    const db = try create(std.testing.io, std.heap.page_allocator);
     defer db.close() catch unreachable;
 
     const initial = types.Value{ .integer = 1 };
@@ -2935,10 +2937,10 @@ test "batch visibility-gate pause hook blocks completion until resumed" {
             pause_seen = true;
             break;
         }
-        std.Thread.sleep(std.time.ns_per_ms);
+        std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake) catch unreachable;
     }
     try testing.expect(pause_seen);
-    std.Thread.sleep(20 * std.time.ns_per_ms);
+    std.testing.io.sleep(.fromNanoseconds(20 * std.time.ns_per_ms), .awake) catch unreachable;
     try testing.expect(!batch_state.finished.load(.acquire));
 
     batch_ops.test_hooks.resumeBatchAfterVisibilityGate();
@@ -2949,7 +2951,7 @@ test "batch visibility-gate pause hook blocks completion until resumed" {
             completed = true;
             break;
         }
-        std.Thread.sleep(std.time.ns_per_ms);
+        std.testing.io.sleep(.fromNanoseconds(std.time.ns_per_ms), .awake) catch unreachable;
     }
     batch_thread.join();
 
@@ -2960,7 +2962,7 @@ test "batch visibility-gate pause hook blocks completion until resumed" {
 test "concurrent unique-key writers keep all committed values visible" {
     const testing = std.testing;
 
-    const db = try create(std.heap.page_allocator);
+    const db = try create(std.testing.io, std.heap.page_allocator);
     defer db.close() catch unreachable;
 
     const Writer = struct {
@@ -3000,7 +3002,7 @@ test "concurrent unique-key writers keep all committed values visible" {
 test "concurrent put and delete on one key leave the key in a well-formed state" {
     const testing = std.testing;
 
-    const db = try create(std.heap.page_allocator);
+    const db = try create(std.testing.io, std.heap.page_allocator);
     defer db.close() catch unreachable;
 
     const Mutator = struct {
@@ -3059,7 +3061,7 @@ test "snapshot floor at a batch commit skips already-checkpointed batch records 
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .snapshot_path = snapshot_path,
             .wal_path = wal_path,
             .fsync_mode = .none,
@@ -3078,7 +3080,7 @@ test "snapshot floor at a batch commit skips already-checkpointed batch records 
         _ = try storage_snapshot.write(&db.state, testing.allocator, snapshot_path, checkpoint_lsn);
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -3106,7 +3108,7 @@ test "checkpointed restart keeps wal next_lsn monotonic for later writes" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .snapshot_path = snapshot_path,
             .wal_path = wal_path,
             .fsync_mode = .none,
@@ -3119,7 +3121,7 @@ test "checkpointed restart keeps wal next_lsn monotonic for later writes" {
     }
 
     {
-        const reopened = try open(testing.allocator, .{
+        const reopened = try open(std.testing.io, testing.allocator, .{
             .snapshot_path = snapshot_path,
             .wal_path = wal_path,
             .fsync_mode = .none,
@@ -3132,7 +3134,7 @@ test "checkpointed restart keeps wal next_lsn monotonic for later writes" {
         try testing.expectEqual(@as(u64, 3), reopened.state.wal.?.next_lsn);
     }
 
-    const final = try open(testing.allocator, .{
+    const final = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -3159,7 +3161,7 @@ test "max_wal_bytes triggers automatic checkpoint when threshold is exceeded" {
     defer testing.allocator.free(wal_path);
 
     // Threshold pequeno para que o primeiro put ja dispare o checkpoint.
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -3191,7 +3193,7 @@ test "max_wal_bytes without snapshot_path does not trigger checkpoint" {
     defer testing.allocator.free(wal_path);
 
     // max_wal_bytes configurado, mas snapshot_path ausente; auto-checkpoint nao deve armar.
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .none,
         .max_wal_bytes = 1,
@@ -3216,7 +3218,7 @@ test "max_wal_bytes null leaves checkpoint scheduling fully manual" {
     const wal_path = try allocTmpPathTest(testing.allocator, tmp, "auto-wal-null.wal");
     defer testing.allocator.free(wal_path);
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .snapshot_path = snapshot_path,
         .wal_path = wal_path,
         .fsync_mode = .none,
@@ -3234,7 +3236,7 @@ test "max_wal_bytes null leaves checkpoint scheduling fully manual" {
 test "sweep_expired_entries_for_shard removes expired keys from art and ttl index" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -3242,8 +3244,8 @@ test "sweep_expired_entries_for_shard removes expired keys from art and ttl inde
     try db.put("sweep:beta", &value);
 
     // Set both keys as already expired.
-    try setTtlForTest(db, "sweep:alpha", runtime_shard.unixNow() - 10);
-    try setTtlForTest(db, "sweep:beta", runtime_shard.unixNow() - 10);
+    try setTtlForTest(db, "sweep:alpha", runtime_shard.unixNow(std.testing.io) - 10);
+    try setTtlForTest(db, "sweep:beta", runtime_shard.unixNow(std.testing.io) - 10);
 
     const shard_idx_alpha = runtime_shard.getShardIndex("sweep:alpha");
     const shard_idx_beta = runtime_shard.getShardIndex("sweep:beta");
@@ -3262,12 +3264,12 @@ test "sweep_expired_entries_for_shard removes expired keys from art and ttl inde
 test "sweep_expired_entries_for_shard preserves non-expired keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 7 };
     try db.put("sweep:live", &value);
-    try setTtlForTest(db, "sweep:live", runtime_shard.unixNow() + 60);
+    try setTtlForTest(db, "sweep:live", runtime_shard.unixNow(std.testing.io) + 60);
 
     const shard_idx = runtime_shard.getShardIndex("sweep:live");
     expiration.sweepExpiredEntriesForShard(&db.state, shard_idx, testing.allocator);
@@ -3283,7 +3285,7 @@ test "sweep_expired_entries_for_shard preserves non-expired keys" {
 test "sweep_expired_entries_for_shard skips shards with no ttl entries" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -3301,17 +3303,17 @@ test "sweep_expired_entries_for_shard skips shards with no ttl entries" {
 test "ttl_sweep_interval_ms starts background cleanup of expired keys" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .ttl_sweep_interval_ms = 20,
     });
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 3 };
     try db.put("sweep:bg", &value);
-    try setTtlForTest(db, "sweep:bg", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "sweep:bg", runtime_shard.unixNow(std.testing.io) - 1);
 
     // Wait for at least two sweep cycles
-    std.Thread.sleep(80 * std.time.ns_per_ms);
+    std.testing.io.sleep(.fromNanoseconds(80 * std.time.ns_per_ms), .awake) catch unreachable;
 
     try testing.expect(!hasStoredKeyForTest(db, "sweep:bg"));
     try testing.expect(!hasTtlForTest(db, "sweep:bg"));
@@ -3320,14 +3322,14 @@ test "ttl_sweep_interval_ms starts background cleanup of expired keys" {
 test "ttl_sweep_interval_ms null leaves cleanup lazy only" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .ttl_sweep_interval_ms = null,
     });
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
     try db.put("sweep:lazy", &value);
-    try setTtlForTest(db, "sweep:lazy", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "sweep:lazy", runtime_shard.unixNow(std.testing.io) - 1);
 
     // No background sweep; key should still be in ttl_index and ART
     try testing.expect(hasTtlForTest(db, "sweep:lazy"));
@@ -3339,7 +3341,7 @@ test "ttl_sweep_interval_ms null leaves cleanup lazy only" {
 test "close stops the sweep thread cleanly" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .ttl_sweep_interval_ms = 50,
     });
     // Verify close does not hang or deadlock with a running sweep thread
@@ -3349,7 +3351,7 @@ test "close stops the sweep thread cleanly" {
 test "exists returns true for a present key" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -3361,7 +3363,7 @@ test "exists returns true for a present key" {
 test "exists returns false for a missing key" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     try testing.expect(!try db.exists("exists:missing"));
@@ -3370,12 +3372,12 @@ test "exists returns false for a missing key" {
 test "exists returns false for an expired key" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
     try db.put("exists:expired", &value);
-    try setTtlForTest(db, "exists:expired", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "exists:expired", runtime_shard.unixNow(std.testing.io) - 1);
 
     try testing.expect(!try db.exists("exists:expired"));
 }
@@ -3383,12 +3385,12 @@ test "exists returns false for an expired key" {
 test "exists returns true for a key with a future ttl" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
     try db.put("exists:live", &value);
-    try setTtlForTest(db, "exists:live", runtime_shard.unixNow() + 60);
+    try setTtlForTest(db, "exists:live", runtime_shard.unixNow(std.testing.io) + 60);
 
     try testing.expect(try db.exists("exists:live"));
 }
@@ -3396,7 +3398,7 @@ test "exists returns true for a key with a future ttl" {
 test "exists returns false after delete" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 1 };
@@ -3410,7 +3412,7 @@ test "exists returns false after delete" {
 test "exists rejects empty and oversized keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     try testing.expectError(error.KeyTooLarge, db.exists(""));
@@ -3419,7 +3421,7 @@ test "exists rejects empty and oversized keys" {
 test "engine boundary latency sampling counts exists calls" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .metrics = .{ .mode = .full },
     });
     defer db.close() catch unreachable;
@@ -3432,7 +3434,7 @@ test "engine boundary latency sampling counts exists calls" {
 test "delete_prefix removes all matching keys and returns count" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
@@ -3456,7 +3458,7 @@ test "delete_prefix removes all matching keys and returns count" {
 test "delete_prefix returns zero when no keys match" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
@@ -3473,13 +3475,13 @@ test "delete_prefix returns zero when no keys match" {
 test "delete_prefix skips expired keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
     try db.put("ttl:live", &v);
     try db.put("ttl:dead", &v);
-    try setTtlForTest(db, "ttl:dead", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "ttl:dead", runtime_shard.unixNow(std.testing.io) - 1);
 
     const deleted = try db.deletePrefix("ttl:");
     try testing.expectEqual(@as(u64, 1), deleted);
@@ -3490,7 +3492,7 @@ test "delete_prefix skips expired keys" {
 test "delete_prefix frees heap-owned values without leaking" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     // Write a large payload so overwrite promotes value to heap_allocation.
@@ -3517,7 +3519,7 @@ test "delete_prefix with wal records deletes and survives reopen" {
     defer testing.allocator.free(wal_path);
 
     {
-        const db = try open(testing.allocator, .{
+        const db = try open(std.testing.io, testing.allocator, .{
             .wal_path = wal_path,
             .fsync_mode = .none,
         });
@@ -3532,7 +3534,7 @@ test "delete_prefix with wal records deletes and survives reopen" {
         try testing.expectEqual(@as(u64, 2), deleted);
     }
 
-    const reopened = try open(testing.allocator, .{
+    const reopened = try open(std.testing.io, testing.allocator, .{
         .wal_path = wal_path,
         .fsync_mode = .none,
     });
@@ -3549,7 +3551,7 @@ test "delete_prefix with wal records deletes and survives reopen" {
 test "delete_prefix on empty database returns zero" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const deleted = try db.deletePrefix("any:");
@@ -3559,7 +3561,7 @@ test "delete_prefix on empty database returns zero" {
 test "get_many returns values at matching indices" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const one = types.Value{ .integer = 1 };
@@ -3579,12 +3581,12 @@ test "get_many returns values at matching indices" {
 test "get_many returns null for expired keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const value = types.Value{ .integer = 7 };
     try db.put("many:expired", &value);
-    try setTtlForTest(db, "many:expired", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "many:expired", runtime_shard.unixNow(std.testing.io) - 1);
 
     var result = try db.getMany(testing.allocator, &.{"many:expired"});
     defer result.deinit(testing.allocator);
@@ -3595,7 +3597,7 @@ test "get_many returns null for expired keys" {
 test "get_many empty slice returns empty result" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var result = try db.getMany(testing.allocator, &.{});
@@ -3607,7 +3609,7 @@ test "get_many empty slice returns empty result" {
 test "get_many rejects invalid keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     try testing.expectError(error.KeyTooLarge, db.getMany(testing.allocator, &.{ "valid", "" }));
@@ -3616,7 +3618,7 @@ test "get_many rejects invalid keys" {
 test "get_many preserves index correspondence across shards" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     // Build keys guaranteed to land on distinct shards.
@@ -3656,7 +3658,7 @@ test "get_many preserves index correspondence across shards" {
 test "get_many latency sampling records one sample per call" {
     const testing = std.testing;
 
-    const db = try open(testing.allocator, .{
+    const db = try open(std.testing.io, testing.allocator, .{
         .metrics = .{ .mode = .full },
     });
     defer db.close() catch unreachable;
@@ -3670,7 +3672,7 @@ test "get_many latency sampling records one sample per call" {
 test "scanIterator yields all prefix keys in order" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
@@ -3701,7 +3703,7 @@ test "scanIterator yields all prefix keys in order" {
 test "scanIterator with small page_size paginates correctly" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
@@ -3723,7 +3725,7 @@ test "scanIterator with small page_size paginates correctly" {
 test "scanIterator returns nothing for empty prefix" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var it = try db.scanIterator(testing.allocator, "nothing:", null);
@@ -3735,13 +3737,13 @@ test "scanIterator returns nothing for empty prefix" {
 test "scanIterator skips expired keys" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
     try db.put("exp:live", &v);
     try db.put("exp:dead", &v);
-    try setTtlForTest(db, "exp:dead", runtime_shard.unixNow() - 1);
+    try setTtlForTest(db, "exp:dead", runtime_shard.unixNow(std.testing.io) - 1);
 
     var it = try db.scanIterator(testing.allocator, "exp:", null);
     defer it.deinit();
@@ -3754,7 +3756,7 @@ test "scanIterator skips expired keys" {
 test "rangeIterator yields keys within inclusive start exclusive end bounds" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
@@ -3783,7 +3785,7 @@ test "rangeIterator yields keys within inclusive start exclusive end bounds" {
 test "rangeIterator with small page_size paginates correctly" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     const v = types.Value{ .integer = 1 };
@@ -3804,10 +3806,18 @@ test "rangeIterator with small page_size paginates correctly" {
 test "scanIterator deinit is safe after next returned null" {
     const testing = std.testing;
 
-    const db = try create(testing.allocator);
+    const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
     var it = try db.scanIterator(testing.allocator, "safe:", null);
     try testing.expect(try it.next() == null);
     it.deinit();
+}
+
+test "long interval TTL sweeper cancels its sleep before close" {
+    const testing = std.testing;
+    const db = try open(testing.io, testing.allocator, .{ .ttl_sweep_interval_ms = 60_000 });
+    const close_started = std.Io.Clock.awake.now(testing.io);
+    try db.close();
+    try testing.expect(close_started.durationTo(std.Io.Clock.awake.now(testing.io)).toMilliseconds() < 5_000);
 }

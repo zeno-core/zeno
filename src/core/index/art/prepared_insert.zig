@@ -120,7 +120,7 @@ const ShadowInternal = struct {
     prefix: [MAX_PREFIX_LEN]u8,
     exemplar_key: []const u8,
     leaf_value_key: ?[]const u8,
-    children: std.ArrayListUnmanaged(ShadowChild) = .{},
+    children: std.ArrayList(ShadowChild) = .empty,
 };
 
 /// Returns the child-capacity reservation the shadow planner should keep for one node class.
@@ -726,7 +726,7 @@ fn createShadowInternal(
         .prefix = prefix,
         .exemplar_key = exemplar_key,
         .leaf_value_key = leaf_value_key,
-        .children = .{},
+        .children = .empty,
     };
     try internal.children.ensureTotalCapacity(
         allocator,

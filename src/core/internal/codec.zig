@@ -87,25 +87,25 @@ pub fn serializeValue(
 pub fn deserializeValue(reader: anytype, allocator: std.mem.Allocator, depth: usize) !Value {
     if (depth > MAX_DEPTH) return error.MaxDepthExceeded;
 
-    const tag = try reader.readByte();
+    const tag = try reader.takeByte();
     return switch (tag) {
         val_null => Value{ .null_val = {} },
-        val_bool => Value{ .boolean = (try reader.readByte()) != 0 },
+        val_bool => Value{ .boolean = (try reader.takeByte()) != 0 },
         val_int => blk: {
             var tmp: [8]u8 = undefined;
-            try reader.readNoEof(&tmp);
+            try reader.readSliceAll(&tmp);
             break :blk Value{ .integer = std.mem.readInt(i64, &tmp, .little) };
         },
         val_float => blk: {
             var tmp: [8]u8 = undefined;
-            try reader.readNoEof(&tmp);
+            try reader.readSliceAll(&tmp);
             break :blk Value{ .float = @bitCast(std.mem.readInt(u64, &tmp, .little)) };
         },
         val_string => blk: {
             const len = try readU32Le(reader);
             const payload = try allocator.alloc(u8, len);
             errdefer allocator.free(payload);
-            try reader.readNoEof(payload);
+            try reader.readSliceAll(payload);
             break :blk Value{ .string = payload };
         },
         val_array => blk: {
@@ -133,7 +133,7 @@ pub fn deserializeValue(reader: anytype, allocator: std.mem.Allocator, depth: us
                 const key_len = try readU32Le(reader);
                 const key = try allocator.alloc(u8, key_len);
                 errdefer allocator.free(key);
-                try reader.readNoEof(key);
+                try reader.readSliceAll(key);
                 const value = try deserializeValue(reader, allocator, depth + 1);
                 entries.putAssumeCapacity(key, value);
             }
@@ -151,7 +151,7 @@ fn writeU32Le(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: u32)
 
 fn readU32Le(reader: anytype) !u32 {
     var tmp: [4]u8 = undefined;
-    try reader.readNoEof(&tmp);
+    try reader.readSliceAll(&tmp);
     return std.mem.readInt(u32, &tmp, .little);
 }
 
@@ -176,8 +176,8 @@ test "serialize_value and deserialize_value roundtrip nested payloads" {
     const original = Value{ .object = nested };
     try serializeValue(allocator, &original, &buf, 0);
 
-    var stream = std.io.fixedBufferStream(buf.items);
-    var decoded = try deserializeValue(stream.reader(), allocator, 0);
+    var stream = std.Io.Reader.fixed(buf.items);
+    var decoded = try deserializeValue(&stream, allocator, 0);
     defer decoded.deinit(allocator);
 
     switch (decoded) {

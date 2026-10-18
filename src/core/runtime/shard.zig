@@ -48,8 +48,8 @@ pub fn getShardIndex(key: []const u8) usize {
 /// Time Complexity: O(1).
 ///
 /// Allocator: Does not allocate.
-pub fn unixNow() i64 {
-    return std.time.timestamp();
+pub fn unixNow(io: std.Io) i64 {
+    return @intCast(@divFloor(std.Io.Clock.real.now(io).nanoseconds, std.time.ns_per_s));
 }
 
 /// One committed batch delta arena linked into shard lifetime after a successful apply.
@@ -60,8 +60,9 @@ pub const CommittedArena = struct {
 
 /// One shard of runtime state owned by the engine.
 pub const Shard = struct {
-    lock: std.Thread.RwLock align(64) = .{},
-    visibility_gate: runtime_visibility.VisibilityGate align(64) = .{},
+    io: std.Io,
+    lock: std.Io.RwLock align(64) = .init,
+    visibility_gate: runtime_visibility.VisibilityGate align(64),
     seq: std.atomic.Value(u64) align(64) = .init(0),
     base_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
@@ -88,10 +89,14 @@ pub const Shard = struct {
     ///
     /// Allocator: Initializes one shard-local arena and empty TTL index while storing `base_allocator` for future committed-delta ownership.
     ///
+    /// Ownership: Borrows `io`; its provider must outlive this shard.
+    ///
     /// Thread Safety: Must be called before the shard is shared across threads.
-    pub fn init(base_allocator: std.mem.Allocator) Shard {
+    pub fn init(io: std.Io, base_allocator: std.mem.Allocator) Shard {
         const arena = std.heap.ArenaAllocator.init(base_allocator);
         var shard: Shard = .{
+            .io = io,
+            .visibility_gate = .{ .io = io },
             .base_allocator = base_allocator,
             .arena = arena,
             .committed_arenas_head = null,
@@ -231,15 +236,36 @@ test "get_shard_index is stable for the same hash tag" {
 test "unix_now returns a recent unix timestamp" {
     const testing = std.testing;
 
-    const now = unixNow();
+    const now = unixNow(std.testing.io);
     try testing.expect(now > 0);
+}
+
+test "unix_now preserves floor rounding on both sides of the epoch" {
+    const testing = std.testing;
+    var nanoseconds: i96 = -1;
+    var vtable = std.Io.failing.vtable.*;
+    vtable.now = struct {
+        fn now(userdata: ?*anyopaque, clock: std.Io.Clock) std.Io.Timestamp {
+            std.debug.assert(clock == .real);
+            const value: *const i96 = @ptrCast(@alignCast(userdata.?));
+            return .fromNanoseconds(value.*);
+        }
+    }.now;
+    const io = std.Io{ .userdata = &nanoseconds, .vtable = &vtable };
+    try testing.expectEqual(@as(i64, -1), unixNow(io));
+    nanoseconds = -std.time.ns_per_s - 1;
+    try testing.expectEqual(@as(i64, -2), unixNow(io));
+    nanoseconds = std.time.ns_per_s - 1;
+    try testing.expectEqual(@as(i64, 0), unixNow(io));
+    nanoseconds = std.time.ns_per_s;
+    try testing.expectEqual(@as(i64, 1), unixNow(io));
 }
 
 test "reset_unlocked leaves the shard empty and reusable" {
     const testing = std.testing;
     const Value = @import("../types/value.zig").Value;
 
-    var shard = Shard.init(testing.allocator);
+    var shard = Shard.init(std.testing.io, testing.allocator);
     defer shard.deinit();
     shard.rebindTreeAllocator();
 

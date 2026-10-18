@@ -86,7 +86,7 @@ const ReplayBatchState = struct {
     member_record_count: u32,
     seen_mutations: u32,
     mode: ReplayBatchMode,
-    mutations: std.ArrayListUnmanaged(BufferedBatchMutation),
+    mutations: std.ArrayList(BufferedBatchMutation),
     arena: std.heap.ArenaAllocator,
 
     /// Initializes one pending-batch state rooted at one `BEGIN` record.
@@ -107,7 +107,7 @@ const ReplayBatchState = struct {
             .member_record_count = member_record_count,
             .seen_mutations = 0,
             .mode = mode,
-            .mutations = .{},
+            .mutations = .empty,
             .arena = std.heap.ArenaAllocator.init(allocator),
         };
     }
@@ -156,11 +156,13 @@ const CompactBatchState = struct {
 ///
 /// Allocator: Uses `allocator` for reusable scan scratch, decoded PUT values, and temporary committed-batch buffering.
 ///
-/// Ownership: Borrows `file` and the `applier` callbacks for the duration of the call only.
+/// Ownership: Borrows `io`, `source`, and the `applier` callbacks for the duration of the call only.
 ///
 /// Thread Safety: Not safe to call concurrently with WAL appends or other replay passes against the same file.
-pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: std.fs.File, min_lsn: u64) !ReplayResult {
-    try file.seekTo(0);
+pub fn replay(io: std.Io, applier: anytype, allocator: std.mem.Allocator, source: std.Io.File, min_lsn: u64) !ReplayResult {
+    var read_buffer: [4096]u8 = undefined;
+    var file_reader = source.reader(io, &read_buffer);
+    const file = &file_reader;
 
     var result = ReplayResult{
         .last_lsn = 0,
@@ -287,14 +289,17 @@ pub fn replay(applier: anytype, allocator: std.mem.Allocator, file: std.fs.File,
 ///
 /// Allocator: Uses `allocator` for reusable scan scratch and temporary copied-record buffers.
 ///
-/// Ownership: Borrows `src_file` and `dst_file` for the duration of the rewrite only.
+/// Ownership: Borrows `io`, `source`, and `dst_file` for the duration of the rewrite only.
 pub fn compactUpToLsn(
+    io: std.Io,
     allocator: std.mem.Allocator,
-    src_file: std.fs.File,
-    dst_file: std.fs.File,
+    source: std.Io.File,
+    dst_file: std.Io.File,
     max_lsn_inclusive: u64,
 ) !void {
-    try src_file.seekTo(0);
+    var read_buffer: [4096]u8 = undefined;
+    var source_reader = source.reader(io, &read_buffer);
+    const src_file = &source_reader;
 
     var record = std.ArrayList(u8).empty;
     defer record.deinit(allocator);
@@ -347,7 +352,7 @@ pub fn compactUpToLsn(
 
                 try pending_bytes.appendSlice(allocator, record.items);
                 if (record_item.lsn > max_lsn_inclusive) {
-                    try dst_file.writeAll(pending_bytes.items);
+                    try dst_file.writeStreamingAll(io, pending_bytes.items);
                 }
                 pending_batch = null;
                 pending_bytes.clearRetainingCapacity();
@@ -358,7 +363,7 @@ pub fn compactUpToLsn(
                     if (pending_batch.?.seen_mutations > pending_batch.?.member_record_count) break;
                     try pending_bytes.appendSlice(allocator, record.items);
                 } else if (record_item.lsn > max_lsn_inclusive) {
-                    try dst_file.writeAll(record.items);
+                    try dst_file.writeStreamingAll(io, record.items);
                 }
             },
         }
@@ -370,8 +375,8 @@ pub fn compactUpToLsn(
 /// Time Complexity: O(1) CPU work plus filesystem truncate latency.
 ///
 /// Allocator: Does not allocate.
-fn truncateAt(file: std.fs.File, offset: u64) !void {
-    try file.setEndPos(offset);
+fn truncateAt(file: *std.Io.File.Reader, offset: u64) !void {
+    try file.file.setLength(file.io, offset);
     try file.seekTo(offset);
 }
 
@@ -403,19 +408,15 @@ fn maybeDropReplayScratch(
 ///
 /// Allocator: Resizes `buf` through its owned allocator; caller retains ownership of the copied bytes.
 fn loadRecordBytes(
-    file: std.fs.File,
+    file: *std.Io.File.Reader,
     allocator: std.mem.Allocator,
     buf: *std.ArrayList(u8),
     start_offset: u64,
     end_offset: u64,
 ) !void {
-    const restore_offset = try file.getPos();
-    defer file.seekTo(restore_offset) catch {};
-
     const record_len: usize = @intCast(end_offset - start_offset);
     try buf.resize(allocator, record_len);
-    try file.seekTo(start_offset);
-    if ((try file.readAll(buf.items)) != record_len) return error.EndOfStream;
+    if ((try file.file.readPositionalAll(file.io, buf.items, start_offset)) != record_len) return error.EndOfStream;
 }
 
 /// Applies one validated physical replay mutation to the target applier.
@@ -430,14 +431,14 @@ fn applyReplayMutation(
     decode_arena: *std.heap.ArenaAllocator,
     result: *ReplayResult,
     record: *const ScannedRecord,
-    file: std.fs.File,
+    file: *std.Io.File.Reader,
     truncate_offset: u64,
 ) !bool {
     switch (record.payload) {
         .put => {
-            var fbs = std.io.fixedBufferStream(record.value);
+            var fbs = std.Io.Reader.fixed(record.value);
             const decode_allocator = decode_arena.allocator();
-            const value = codec.deserializeValue(fbs.reader(), decode_allocator, 0) catch |err| switch (err) {
+            const value = codec.deserializeValue(&fbs, decode_allocator, 0) catch |err| switch (err) {
                 error.MaxDepthExceeded, error.UnknownValueTag => {
                     try truncateAt(file, truncate_offset);
                     return false;
@@ -467,7 +468,7 @@ fn applyBufferedBatch(
     allocator: std.mem.Allocator,
     result: *ReplayResult,
     batch: *const ReplayBatchState,
-    file: std.fs.File,
+    file: *std.Io.File.Reader,
 ) !bool {
     var decode_arena = std.heap.ArenaAllocator.init(allocator);
     defer decode_arena.deinit();
@@ -501,12 +502,12 @@ fn applyBufferedBatch(
 ///
 /// Ownership: Returned `key` and `value` slices borrow `key_buf` and `val_buf` storage until the next scan.
 fn scanNextRecord(
-    file: std.fs.File,
+    file: *std.Io.File.Reader,
     allocator: std.mem.Allocator,
     key_buf: *std.ArrayList(u8),
     val_buf: *std.ArrayList(u8),
 ) !RecordScan {
-    const record_start = try file.getPos();
+    const record_start = file.logicalPos();
 
     var crc_buf: [4]u8 = undefined;
     switch (try readExactClassifiedFile(file, &crc_buf)) {
@@ -514,7 +515,7 @@ fn scanNextRecord(
         .eof => return .{ .class = .eof, .record = null },
         .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = 0,
             .tag = 0,
             .key = "",
@@ -529,7 +530,7 @@ fn scanNextRecord(
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = 0,
             .tag = 0,
             .key = "",
@@ -544,7 +545,7 @@ fn scanNextRecord(
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = 0,
             .key = "",
@@ -556,7 +557,7 @@ fn scanNextRecord(
     if (!isKnownTag(tag)) {
         return .{ .class = .corrupt, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = "",
@@ -570,7 +571,7 @@ fn scanNextRecord(
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = "",
@@ -582,7 +583,7 @@ fn scanNextRecord(
     if (key_len > codec.MAX_KEY_LEN) {
         return .{ .class = .corrupt, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = "",
@@ -596,7 +597,7 @@ fn scanNextRecord(
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = key_buf.items,
@@ -610,7 +611,7 @@ fn scanNextRecord(
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = key_buf.items,
@@ -622,7 +623,7 @@ fn scanNextRecord(
     if (val_len > codec.MAX_VAL_LEN) {
         return .{ .class = .corrupt, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = key_buf.items,
@@ -636,7 +637,7 @@ fn scanNextRecord(
         .ok => {},
         .eof, .partial => return .{ .class = .partial_eof, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = key_buf.items,
@@ -655,7 +656,7 @@ fn scanNextRecord(
     if (hasher.final() != stored_crc) {
         return .{ .class = .corrupt, .record = .{
             .start_offset = record_start,
-            .end_offset = try file.getPos(),
+            .end_offset = file.logicalPos(),
             .lsn = lsn,
             .tag = tag,
             .key = key_buf.items,
@@ -666,7 +667,7 @@ fn scanNextRecord(
 
     const payload = decodeRecordPayload(tag, key_buf.items, val_buf.items) orelse return .{ .class = .corrupt, .record = .{
         .start_offset = record_start,
-        .end_offset = try file.getPos(),
+        .end_offset = file.logicalPos(),
         .lsn = lsn,
         .tag = tag,
         .key = key_buf.items,
@@ -676,7 +677,7 @@ fn scanNextRecord(
 
     return .{ .class = .valid, .record = .{
         .start_offset = record_start,
-        .end_offset = try file.getPos(),
+        .end_offset = file.logicalPos(),
         .lsn = lsn,
         .tag = tag,
         .key = key_buf.items,
@@ -739,9 +740,9 @@ const ReadClass = enum {
 /// Allocator: Does not allocate.
 ///
 /// Ownership: Fills the caller-owned `buf` in place.
-fn readExactClassifiedFile(file: std.fs.File, buf: []u8) !ReadClass {
+fn readExactClassifiedFile(file: *std.Io.File.Reader, buf: []u8) !ReadClass {
     if (buf.len == 0) return .ok;
-    const read_count = try file.readAll(buf);
+    const read_count = try file.interface.readSliceShort(buf);
     if (read_count == 0) return .eof;
     if (read_count < buf.len) return .partial;
     return .ok;

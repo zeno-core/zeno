@@ -776,11 +776,11 @@ pub const Node4 = struct {
 };
 
 /// Node16 represents an ART node containing up to 16 child pointers.
-/// It uses a vectorized approach for keys and children, enabling SIMD-based searches.
-/// Memory Footprint: 128 bytes (24 byte header + 16 bytes keys + 128 bytes children + padding).
+/// Keys are stored as an array for dynamic updates and compared as a SIMD vector.
+/// Memory Footprint: `@sizeOf(Node16)`, including the header, 16 key bytes, and 16 tagged children.
 pub const Node16 = struct {
     header: NodeHeader,
-    keys: @Vector(16, u8) = @splat(0),
+    keys: [16]u8 = @splat(0),
     children: [16]Node = undefined,
 
     /// Initializes a new, empty Node16 with the correct NodeType header.
@@ -797,7 +797,7 @@ pub const Node16 = struct {
     /// Allocator: Does not allocate.
     pub fn findChild(self: *const Node16, key_byte: u8) ?*Node {
         const mask: @Vector(16, u8) = @splat(key_byte);
-        const match_mask = @as(u16, @bitCast(self.keys == mask));
+        const match_mask = @as(u16, @bitCast(@as(@Vector(16, u8), self.keys) == mask));
         const n = @atomicLoad(u16, &self.header.num_children, .acquire);
         const valid_mask = @as(u16, @intCast((@as(u32, 1) << @as(u5, @intCast(n))) - 1));
         const bitmask = match_mask & valid_mask;

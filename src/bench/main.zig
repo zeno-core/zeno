@@ -3,6 +3,8 @@
 //! Allocator: Uses the benchmark-provided allocator for caller-owned result teardown and a process-wide page allocator for steady-state engine fixtures.
 
 const std = @import("std");
+
+var bench_io: std.Io = undefined;
 const zbench = @import("zbench");
 const zeno = @import("zeno");
 
@@ -115,7 +117,7 @@ const HeavyOverwriteProfile = struct {
 };
 
 fn openBenchDb(allocator: std.mem.Allocator) !*engine.Database {
-    return engine.open(allocator, .{
+    return engine.open(bench_io, allocator, .{
         .metrics = bench_metrics_config,
     });
 }
@@ -462,14 +464,20 @@ const WalAppendGroupedBenchmark = struct {
     }
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+/// Runs the benchmark suite with process-owned I/O and explicit benchmark allocators.
+///
+/// Time Complexity: Depends on the selected workloads and iteration counts.
+///
+/// Allocator: Owns temporary CLI and measurement storage; workload fixtures have explicit teardown.
+pub fn main(init: std.process.Init) !void {
+    bench_io = init.io;
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
 
     const allocator = gpa.allocator();
     var stdout_buffer: [4 * 1024]u8 = undefined;
-    var stdout = std.fs.File.stdout().writer(&stdout_buffer);
-    const cli_config = try parseCliConfig(allocator);
+    var stdout = std.Io.File.stdout().writerStreaming(bench_io, &stdout_buffer);
+    const cli_config = try parseCliConfig(try init.minimal.args.toSlice(init.arena.allocator()));
 
     if (cli_config.scan_allocation_profile) {
         try runScanAllocationProfile(&stdout.interface, cli_config.metrics_config);
@@ -732,9 +740,9 @@ fn runAndPrintThroughput(
 
     var total_elapsed: u128 = 0;
     for (0..iterations) |i| {
-        var op_timer = try std.time.Timer.start();
+        const op_timer = std.Io.Clock.awake.now(bench_io);
         func(allocator);
-        const op_elapsed = op_timer.read();
+        const op_elapsed = @as(u64, @intCast(op_timer.durationTo(std.Io.Clock.awake.now(bench_io)).toNanoseconds()));
         latencies[i] = op_elapsed;
         total_elapsed += op_elapsed;
     }
@@ -798,7 +806,7 @@ const ScalingWorkerContext = struct {
 };
 
 fn scalingWorker(ctx: ScalingWorkerContext) void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
@@ -935,7 +943,7 @@ fn runScalingForContention(
         var threads = try allocator.alloc(std.Thread, t_count);
         defer allocator.free(threads);
 
-        var timer = try std.time.Timer.start();
+        const timer = std.Io.Clock.awake.now(bench_io);
         for (0..t_count) |i| {
             const key = switch (contention) {
                 .none => maybe_worker_keys.?[i],
@@ -956,7 +964,7 @@ fn runScalingForContention(
         }
 
         for (threads) |thread| thread.join();
-        const elapsed = timer.read();
+        const elapsed = @as(u64, @intCast(timer.durationTo(std.Io.Clock.awake.now(bench_io)).toNanoseconds()));
 
         const throughput = @as(f64, @floatFromInt(ops_per_test)) /
             (@as(f64, @floatFromInt(elapsed)) / @as(f64, @floatFromInt(std.time.ns_per_s)));
@@ -1005,10 +1013,7 @@ fn runScalingBenchmarks(allocator: std.mem.Allocator, writer: anytype) !void {
     }
 }
 
-fn parseCliConfig(allocator: std.mem.Allocator) !BenchCliConfig {
-    const args = try std.process.argsAlloc(allocator);
-    defer std.process.argsFree(allocator, args);
-
+fn parseCliConfig(args: []const [:0]const u8) !BenchCliConfig {
     var cli = BenchCliConfig{};
     var saw_metrics_mode = false;
     var saw_latency_sample_shift = false;
@@ -1140,7 +1145,7 @@ fn formatBytesShort(buf: []u8, bytes: u64) ![]const u8 {
 fn profileHeavyOverwriteCase(compact_every_n: ?usize) !HeavyOverwriteProfile {
     const iterations: usize = 50_000;
 
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(gpa.deinit() == .ok);
     const allocator = gpa.allocator();
 
@@ -1160,16 +1165,16 @@ fn profileHeavyOverwriteCase(compact_every_n: ?usize) !HeavyOverwriteProfile {
     var latencies = try allocator.alloc(u64, iterations);
     defer allocator.free(latencies);
 
-    var total_timer = try std.time.Timer.start();
+    const total_timer = std.Io.Clock.awake.now(bench_io);
     for (0..iterations) |i| {
         const key_index = i % put_overwrite_key_cardinality;
         const key = try std.fmt.bufPrint(&key_buf, "bench:put:ovrheavy:{d:0>2}", .{key_index});
         @memset(payload[0..], @as(u8, 'a' + @as(u8, @intCast((key_index + i) % 26))));
         const value = types.Value{ .string = payload[0..] };
 
-        var op_timer = try std.time.Timer.start();
+        const op_timer = std.Io.Clock.awake.now(bench_io);
         try db.put(key, &value);
-        latencies[i] = op_timer.read();
+        latencies[i] = @as(u64, @intCast(op_timer.durationTo(std.Io.Clock.awake.now(bench_io)).toNanoseconds()));
 
         if (compact_every_n) |interval| {
             if (((i + 1) % interval) == 0) {
@@ -1177,7 +1182,7 @@ fn profileHeavyOverwriteCase(compact_every_n: ?usize) !HeavyOverwriteProfile {
             }
         }
     }
-    const elapsed_ns = total_timer.read();
+    const elapsed_ns = @as(u64, @intCast(total_timer.durationTo(std.Io.Clock.awake.now(bench_io)).toNanoseconds()));
 
     std.sort.heap(u64, latencies, {}, comptime std.sort.asc(u64));
 
@@ -1270,14 +1275,14 @@ fn profileScanAllocations(
     comptime fixture_items: usize,
     mode: ScanProfileMode,
 ) !ScanAllocationProfile {
-    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var db_gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(db_gpa.deinit() == .ok);
 
     const db = try openBenchDb(db_gpa.allocator());
     defer db.close() catch unreachable;
     loadScanFixture(fixture_items, db);
 
-    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var result_gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(result_gpa.deinit() == .ok);
 
     var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
@@ -1316,22 +1321,22 @@ fn profileScanAllocations(
 }
 
 fn profilePublicFullScan(comptime fixture_items: usize) !ScanCandidateProfile {
-    var db_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var db_gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(db_gpa.deinit() == .ok);
 
     const db = try openBenchDb(db_gpa.allocator());
     defer db.close() catch unreachable;
     loadScanFixture(fixture_items, db);
 
-    var result_gpa = std.heap.GeneralPurposeAllocator(.{}){};
+    var result_gpa = std.heap.DebugAllocator(.{}){};
     defer std.debug.assert(result_gpa.deinit() == .ok);
 
     var counting_state = FailingAllocator.init(result_gpa.allocator(), .{});
     const counting_allocator = counting_state.allocator();
 
-    var timer = try std.time.Timer.start();
+    const timer = std.Io.Clock.awake.now(bench_io);
     var result = try db.scanPrefix(counting_allocator, "scan:");
-    const elapsed_ns = timer.read();
+    const elapsed_ns = @as(u64, @intCast(timer.durationTo(std.Io.Clock.awake.now(bench_io)).toNanoseconds()));
 
     const emitted_entries = result.entries.items.len;
     std.debug.assert(emitted_entries == fixture_items);
@@ -1418,10 +1423,12 @@ fn runBenchSuite(
     try stable_bench.addParam("wal append grouped16", &WalAppendGroupedBenchmark{}, .{});
 
     try printMetricsConfig(writer, metrics_config);
-    try stable_bench.run(writer);
+    try writer.flush();
+    try stable_bench.run(bench_io, std.Io.File.stdout());
     try writer.print("\n", .{});
     try writer.print("growing workloads\n", .{});
-    try growing_bench.run(writer);
+    try writer.flush();
+    try growing_bench.run(bench_io, std.Io.File.stdout());
 }
 
 fn printMetricsConfig(writer: anytype, metrics_config: types.MetricsConfig) !void {
@@ -1498,7 +1505,7 @@ fn initSteadyStateBenches() !void {
             const value = types.Value{ .integer = @intCast(i) };
             try steady_get_ttl_mixed_db.?.put(key, &value);
         }
-        _ = try steady_get_ttl_mixed_db.?.expireAt("bench:get:ttl-mixed:0", internal.runtime_shard.unixNow() + 3600);
+        _ = try steady_get_ttl_mixed_db.?.expireAt("bench:get:ttl-mixed:0", internal.runtime_shard.unixNow(bench_io) + 3600);
         steady_get_ttl_mixed_seed.store(0, .monotonic);
     }
 
@@ -1539,8 +1546,8 @@ fn initSteadyStateBenches() !void {
     steady_art_tree = internal.art.Tree.init(std.heap.page_allocator);
     loadScanFixtureToArt(scan_item_count, &steady_art_tree.?);
 
-    wal_bench_path = try std.fmt.allocPrint(std.heap.page_allocator, "/tmp/zeno-bench-{d}.wal", .{std.time.timestamp()});
-    steady_wal = try internal.wal.Wal.open(wal_bench_path.?, .{ .fsync_mode = .batched_async }, .{
+    wal_bench_path = try std.fmt.allocPrint(std.heap.page_allocator, "/tmp/zeno-bench-{d}.wal", .{std.Io.Clock.real.now(bench_io).toSeconds()});
+    steady_wal = try internal.wal.Wal.open(bench_io, wal_bench_path.?, .{ .fsync_mode = .batched_async }, .{
         .ctx = undefined,
         .put = struct {
             fn func(_: *anyopaque, _: []const u8, _: *const types.Value) anyerror!void {}
@@ -1575,7 +1582,7 @@ fn deinitSteadyStateBenches() void {
     if (steady_wal) |*wal| {
         wal.close();
         if (wal_bench_path) |path| {
-            std.fs.cwd().deleteFile(path) catch {};
+            std.Io.Dir.cwd().deleteFile(bench_io, path) catch {};
             std.heap.page_allocator.free(path);
         }
         steady_wal = null;

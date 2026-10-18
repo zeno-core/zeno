@@ -202,8 +202,8 @@ fn fetchNextVisibleHead(
     const mutable_shard = @constCast(shard);
     var resume_after = start_after_key;
 
-    mutable_shard.lock.lockShared();
-    defer mutable_shard.lock.unlockShared();
+    mutable_shard.lock.lockSharedUncancelable(shard.io);
+    defer mutable_shard.lock.unlockShared(shard.io);
 
     while (true) {
         const borrowed_entry = switch (query) {
@@ -231,7 +231,7 @@ fn addHeadOrFree(
     heap: *std.PriorityQueue(ShardHead, void, shardHeadOrder),
     head: ShardHead,
 ) error_mod.EngineError!void {
-    heap.add(head) catch |err| {
+    heap.push(allocator, head) catch |err| {
         freeEntry(allocator, head.entry);
         return err;
     };
@@ -257,10 +257,10 @@ fn mergePageFromShards(
 
     try page.entries.ensureTotalCapacity(allocator, limit);
 
-    var heap = std.PriorityQueue(ShardHead, void, shardHeadOrder).init(allocator, {});
+    var heap = std.PriorityQueue(ShardHead, void, shardHeadOrder).empty;
     defer {
-        while (heap.removeOrNull()) |head| freeEntry(allocator, head.entry);
-        heap.deinit();
+        while (heap.pop()) |head| freeEntry(allocator, head.entry);
+        heap.deinit(allocator);
     }
 
     var prefix_scratch = std.ArrayList(art.ScanEntry).empty;
@@ -283,7 +283,7 @@ fn mergePageFromShards(
     var last_emitted_key: ?[]const u8 = null;
 
     while (page.entries.items.len < limit) {
-        const head = heap.removeOrNull() orelse break;
+        const head = heap.pop() orelse break;
         page.entries.appendAssumeCapacity(head.entry);
         last_emitted_key = head.entry.key;
 
@@ -381,7 +381,7 @@ const PrefixShardIteratorMergeState = struct {
         errdefer self.deinit(allocator);
 
         for (&state.shards) |*shard| {
-            @constCast(shard).lock.lockShared();
+            @constCast(shard).lock.lockSharedUncancelable(shard.io);
         }
 
         for (&state.shards, 0..) |*shard, shard_idx| {
@@ -400,7 +400,7 @@ const PrefixShardIteratorMergeState = struct {
             it.deinit();
         }
         for (&self.state.shards) |*shard| {
-            @constCast(shard).lock.unlockShared();
+            @constCast(shard).lock.unlockShared(shard.io);
         }
         self.* = undefined;
     }
@@ -485,9 +485,9 @@ pub fn scanPrefix(
     prefix: []const u8,
 ) error_mod.EngineError!types.ScanResult {
     state.lockAllShardsShared();
-    
+
     defer state.unlockAllShardsShared();
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
     state.recordOperation(.scan, 1);
 
     return materializePrefixFromShardIterator(state, allocator, prefix, now);
@@ -508,9 +508,9 @@ pub fn scanRange(
     range: types.KeyRange,
 ) error_mod.EngineError!types.ScanResult {
     state.lockAllShardsShared();
-    
+
     defer state.unlockAllShardsShared();
-    const now = runtime_shard.unixNow();
+    const now = runtime_shard.unixNow(state.io);
     state.recordOperation(.scan, 1);
 
     const collected = try collectEntriesPaginated(state, allocator, .{ .range = range }, now);
@@ -519,7 +519,6 @@ pub fn scanRange(
         .allocator = allocator,
     };
 }
-
 
 /// Scans one prefix page inside a consistent read view.
 ///

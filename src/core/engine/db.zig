@@ -1193,8 +1193,8 @@ test "compact_shard clears retained heavy estimate and preserves visible value" 
     const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
-    var payload_a = [_]u8{'a'} ** 1024;
-    var payload_b = [_]u8{'b'} ** 1024;
+    var payload_a: [1024]u8 = @splat('a');
+    var payload_b: [1024]u8 = @splat('b');
 
     var first = types.Value{ .string = payload_a[0..] };
     var second = types.Value{ .string = payload_b[0..] };
@@ -1225,8 +1225,8 @@ test "compact_all clears retained heavy estimate across shards" {
     const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
-    var payload_a = [_]u8{'x'} ** 1024;
-    var payload_b = [_]u8{'y'} ** 1024;
+    var payload_a: [1024]u8 = @splat('x');
+    var payload_b: [1024]u8 = @splat('y');
 
     var first = types.Value{ .string = payload_a[0..] };
     var second = types.Value{ .string = payload_b[0..] };
@@ -1259,8 +1259,8 @@ test "heavy overwrite retained estimate stays low with heap-owned overwrites" {
     const low_retention_factor: u64 = 4;
     const low_retention_ceiling = epsilon_bytes * low_retention_factor;
 
-    var payload_a = [_]u8{'m'} ** payload_bytes;
-    var payload_b = [_]u8{'n'} ** payload_bytes;
+    var payload_a: [payload_bytes]u8 = @splat('m');
+    var payload_b: [payload_bytes]u8 = @splat('n');
 
     var first = types.Value{ .string = payload_a[0..] };
     var second = types.Value{ .string = payload_b[0..] };
@@ -1294,8 +1294,8 @@ test "heavy_overwrite_compact_every triggers automatic maintenance on heavy over
     });
     defer db.close() catch unreachable;
 
-    var payload_a = [_]u8{'h'} ** 1024;
-    var payload_b = [_]u8{'i'} ** 1024;
+    var payload_a: [1024]u8 = @splat('h');
+    var payload_b: [1024]u8 = @splat('i');
 
     var first = types.Value{ .string = payload_a[0..] };
     var second = types.Value{ .string = payload_b[0..] };
@@ -1319,8 +1319,8 @@ test "heavy overwrite cadence counts per-overwrite events inside one put_group" 
     });
     defer db.close() catch unreachable;
 
-    var payload_a = [_]u8{'a'} ** 1024;
-    var payload_b = [_]u8{'b'} ** 1024;
+    var payload_a: [1024]u8 = @splat('a');
+    var payload_b: [1024]u8 = @splat('b');
 
     var first = types.Value{ .string = payload_a[0..] };
     var second = types.Value{ .string = payload_b[0..] };
@@ -1344,7 +1344,7 @@ test "heavy to scalar overwrite still records retained heavy estimate" {
     const db = try create(std.testing.io, testing.allocator);
     defer db.close() catch unreachable;
 
-    var payload = [_]u8{'z'} ** 1024;
+    var payload: [1024]u8 = @splat('z');
     var heavy = types.Value{ .string = payload[0..] };
     const scalar = types.Value{ .integer = 7 };
 
@@ -2474,7 +2474,7 @@ test "scan_prefix_from_in_view merges cross-shard heads in global key order" {
     var candidate_storage: [256][16]u8 = undefined;
     var chosen: [3][]const u8 = undefined;
     var chosen_count: usize = 0;
-    var seen_shards = [_]bool{false} ** runtime_shard.NUM_SHARDS;
+    var seen_shards: [runtime_shard.NUM_SHARDS]bool = @splat(false);
 
     for (0..candidate_storage.len) |index| {
         const candidate = try std.fmt.bufPrint(&candidate_storage[index], "merge:{d:0>3}", .{index});
@@ -3496,8 +3496,8 @@ test "delete_prefix frees heap-owned values without leaking" {
     defer db.close() catch unreachable;
 
     // Write a large payload so overwrite promotes value to heap_allocation.
-    var buf_a = [_]u8{'a'} ** 1024;
-    var buf_b = [_]u8{'b'} ** 1024;
+    var buf_a: [1024]u8 = @splat('a');
+    var buf_b: [1024]u8 = @splat('b');
     var first = types.Value{ .string = buf_a[0..] };
     var second = types.Value{ .string = buf_b[0..] };
 
@@ -3625,7 +3625,7 @@ test "get_many preserves index correspondence across shards" {
     var candidate_storage: [512][16]u8 = undefined;
     var chosen: [4][]const u8 = undefined;
     var chosen_count: usize = 0;
-    var seen_shards = [_]bool{false} ** runtime_state.NUM_SHARDS;
+    var seen_shards: [runtime_state.NUM_SHARDS]bool = @splat(false);
 
     for (0..candidate_storage.len) |i| {
         const candidate = try std.fmt.bufPrint(&candidate_storage[i], "many:shard:{d:0>3}", .{i});

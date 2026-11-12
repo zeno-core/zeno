@@ -215,13 +215,13 @@ pub fn getMany(
     }
 
     // Count keys per shard
-    var shard_counts = [_]u32{0} ** runtime_state.NUM_SHARDS;
+    var shard_counts: [runtime_state.NUM_SHARDS]u32 = @splat(0);
     for (keys) |key| {
         shard_counts[runtime_shard.getShardIndex(key)] += 1;
     }
 
     // Prefix sums, bucket start positions
-    var shard_starts = [_]u32{0} ** runtime_state.NUM_SHARDS;
+    var shard_starts: [runtime_state.NUM_SHARDS]u32 = @splat(0);
     var running: u32 = 0;
     for (0..runtime_state.NUM_SHARDS) |s| {
         shard_starts[s] = running;

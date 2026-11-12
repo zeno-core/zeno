@@ -6,6 +6,7 @@
 const std = @import("std");
 const codec = @import("../internal/codec.zig");
 const Value = @import("../types/value.zig").Value;
+const Crc32 = std.hash.crc.@"CRC-32/ISO-HDLC";
 
 const tag_put: u8 = 0x01;
 const tag_delete: u8 = 0x02;
@@ -646,7 +647,7 @@ fn scanNextRecord(
         } },
     }
 
-    var hasher = std.hash.crc.Crc32.init();
+    var hasher = Crc32.init();
     hasher.update(&lsn_buf);
     hasher.update(&tag_buf);
     hasher.update(&key_len_buf);

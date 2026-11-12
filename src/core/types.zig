@@ -111,11 +111,11 @@ pub const ScanIterator = scan_iterator.ScanIterator;
 pub const ReadView = readView.ReadView;
 
 fn defaultMetricsMode() MetricsMode {
-    return if (builtin.mode == .ReleaseFast) .disabled else .sampled_latency;
+    return if (builtin.mode == .fast) .disabled else .sampled_latency;
 }
 
 fn defaultLatencySampleShift() u8 {
-    return if (builtin.mode == .ReleaseFast) 0 else 10;
+    return if (builtin.mode == .fast) 0 else 10;
 }
 
 /// Returns the default runtime metrics configuration for the current build mode.
@@ -130,13 +130,13 @@ pub fn defaultMetricsConfig() MetricsConfig {
     };
 }
 
-test "default metrics config uses sampled latency outside ReleaseFast" {
+test "default metrics config uses sampled latency outside fast release mode" {
     const std = @import("std");
     const testing = std.testing;
 
     const config = defaultMetricsConfig();
-    const expected: MetricsMode = if (builtin.mode == .ReleaseFast) .disabled else .sampled_latency;
-    const expected_shift: u8 = if (builtin.mode == .ReleaseFast) 0 else 10;
+    const expected: MetricsMode = if (builtin.mode == .fast) .disabled else .sampled_latency;
+    const expected_shift: u8 = if (builtin.mode == .fast) 0 else 10;
     try testing.expectEqual(expected, config.mode);
     try testing.expectEqual(expected_shift, config.latency_sample_shift);
 }

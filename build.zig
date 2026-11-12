@@ -57,10 +57,12 @@ pub fn build(b: *std.Build) void {
             .root_source_file = b.path("src/bench/main.zig"),
             .target = target,
             .optimize = optimize,
+            .imports = &.{
+                .{ .name = "zeno", .module = bench_zeno_module },
+                .{ .name = "zbench", .module = zbench_dep.module("zbench") },
+            },
         }),
     });
-    bench_exe.root_module.addImport("zeno", bench_zeno_module);
-    bench_exe.root_module.addImport("zbench", zbench_dep.module("zbench"));
 
     const check_step = b.step("check", "Compile tests and benchmarks without running them");
     check_step.dependOn(&module_tests.step);
@@ -68,8 +70,6 @@ pub fn build(b: *std.Build) void {
 
     const run_bench = b.addRunArtifact(bench_exe);
     const bench_step = b.step("bench", "Run zeno-core benchmarks");
-    if (b.args) |args| {
-        run_bench.addArgs(args);
-    }
+    run_bench.addPassthruArgs();
     bench_step.dependOn(&run_bench.step);
 }

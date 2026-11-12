@@ -76,15 +76,15 @@ pub const PreparedInsert = struct {
     expected_target_node_type: ?NodeType = null,
     expected_target_num_children: u16 = 0,
     expected_target_prefix_len: u16 = 0,
-    expected_target_prefix: [MAX_PREFIX_LEN]u8 = [_]u8{0} ** MAX_PREFIX_LEN,
+    expected_target_prefix: [MAX_PREFIX_LEN]u8 = @splat(0),
     expected_target_exemplar_key: ?[]const u8 = null,
     expected_target_leaf_value_present: bool = false,
     expected_target_leaf_key: ?[]const u8 = null,
 
     new_prefix_len: u16 = 0,
-    new_prefix: [MAX_PREFIX_LEN]u8 = [_]u8{0} ** MAX_PREFIX_LEN,
+    new_prefix: [MAX_PREFIX_LEN]u8 = @splat(0),
     rewritten_old_prefix_len: u16 = 0,
-    rewritten_old_prefix: [MAX_PREFIX_LEN]u8 = [_]u8{0} ** MAX_PREFIX_LEN,
+    rewritten_old_prefix: [MAX_PREFIX_LEN]u8 = @splat(0),
     old_edge_byte: ?u8 = null,
     new_edge_byte: ?u8 = null,
 };
@@ -314,14 +314,14 @@ pub const ShadowTree = struct {
                     if (prefix_state.mismatch_idx < shadow.prefix_len) {
                         const old_exemplar = shadow.exemplar_key;
                         const new_parent_prefix_len: u16 = @intCast(prefix_state.mismatch_idx);
-                        var new_parent_prefix = [_]u8{0} ** MAX_PREFIX_LEN;
+                        var new_parent_prefix: [MAX_PREFIX_LEN]u8 = @splat(0);
                         copyPrefixBytes(&new_parent_prefix, key, depth, new_parent_prefix_len);
 
                         const old_edge_byte = old_exemplar[depth + prefix_state.mismatch_idx];
                         const new_edge_byte: ?u8 = if (depth + prefix_state.mismatch_idx < key.len) key[depth + prefix_state.mismatch_idx] else null;
 
                         const rewritten_old_prefix_len: u16 = shadow.prefix_len - @as(u16, @intCast(prefix_state.mismatch_idx + 1));
-                        var rewritten_old_prefix = [_]u8{0} ** MAX_PREFIX_LEN;
+                        var rewritten_old_prefix: [MAX_PREFIX_LEN]u8 = @splat(0);
                         copyPrefixBytes(&rewritten_old_prefix, old_exemplar, depth + prefix_state.mismatch_idx + 1, rewritten_old_prefix_len);
 
                         shadow.prefix_len = rewritten_old_prefix_len;
@@ -588,7 +588,7 @@ fn shadowPrefixBeforeRewrite(
     old_rewritten_len: u16,
 ) [MAX_PREFIX_LEN]u8 {
     _ = old_rewritten_len;
-    var prefix = [_]u8{0} ** MAX_PREFIX_LEN;
+    var prefix: [MAX_PREFIX_LEN]u8 = @splat(0);
     const original_prefix_len = @as(u16, @intCast(mismatch_idx + 1)) + rewritten_prefix_len;
     const stored_len = @min(original_prefix_len, MAX_PREFIX_LEN);
     if (stored_len > 0) {
@@ -771,7 +771,7 @@ fn leafSplitDetails(old_key: []const u8, new_key: []const u8, depth: usize) stru
     while (i < min_len and old_key[i] == new_key[i]) : (i += 1) {}
 
     const prefix_len: u16 = @intCast(i - depth);
-    var prefix = [_]u8{0} ** MAX_PREFIX_LEN;
+    var prefix: [MAX_PREFIX_LEN]u8 = @splat(0);
     copyPrefixBytes(&prefix, new_key, depth, prefix_len);
     const old_edge: ?u8 = if (i < old_key.len) old_key[i] else null;
     const new_edge: ?u8 = if (i < new_key.len) new_key[i] else null;

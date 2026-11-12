@@ -307,8 +307,9 @@ fn applyPlan(
 
     var scratch_arena = std.heap.ArenaAllocator.init(allocator);
     defer scratch_arena.deinit();
-    var scratch_fallback = std.heap.stackFallback(PUT_BATCH_APPLY_STACK_BYTES, scratch_arena.allocator());
-    const scratch_allocator = scratch_fallback.get();
+    var buf: [PUT_BATCH_APPLY_STACK_BYTES]u8 = undefined;
+    var scratch_fallback: std.heap.BufferFirstAllocator = .init(@ptrCast(&buf), scratch_arena.allocator());
+    const scratch_allocator = scratch_fallback.allocator();
     const reservations = try scratch_allocator.alloc(ReservedShard, plan.groups.len);
 
     var initialized: usize = 0;

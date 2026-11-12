@@ -820,7 +820,7 @@ pub const Node48 = struct {
     /// Sentinel stored in `child_index` for bytes that have no child edge.
     pub const EMPTY_INDEX: u8 = 255;
     header: NodeHeader,
-    child_index: [256]u8 = [_]u8{EMPTY_INDEX} ** 256,
+    child_index: [256]u8 = @splat(EMPTY_INDEX),
     children: [48]Node = undefined,
     present: u64 = 0,
 
@@ -830,7 +830,7 @@ pub const Node48 = struct {
     pub fn init() Node48 {
         return .{
             .header = NodeHeader.init(.node48),
-            .child_index = [_]u8{EMPTY_INDEX} ** 256,
+            .child_index = @splat(EMPTY_INDEX),
         };
     }
 
@@ -851,7 +851,7 @@ pub const Node48 = struct {
 /// Memory Footprint: 288 bytes (24 byte header + 256 bytes children + padding).
 pub const Node256 = struct {
     header: NodeHeader,
-    children: [256]Node = [_]Node{nodeEmpty()} ** 256,
+    children: [256]Node = @splat(nodeEmpty()),
 
     /// Initializes a new, empty Node256 with the correct NodeType header.
     /// Time Complexity: O(1).
@@ -859,7 +859,7 @@ pub const Node256 = struct {
     pub fn init() Node256 {
         return .{
             .header = NodeHeader.init(.node256),
-            .children = [_]Node{nodeEmpty()} ** 256,
+            .children = @splat(nodeEmpty()),
         };
     }
 

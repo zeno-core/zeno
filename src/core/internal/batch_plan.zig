@@ -79,7 +79,7 @@ pub fn planPutBatch(allocator: std.mem.Allocator, writes: []const batch.PutWrite
     const survivor_flags = try arena_allocator.alloc(bool, writes.len);
     @memset(survivor_flags, false);
     var last_by_key = std.StringHashMapUnmanaged(usize){};
-    var shard_counts: [runtime_shard.NUM_SHARDS]usize = [_]usize{0} ** runtime_shard.NUM_SHARDS;
+    var shard_counts: [runtime_shard.NUM_SHARDS]usize = @splat(0);
     var survivor_count: usize = 0;
 
     for (writes, 0..) |write, index| {
@@ -120,7 +120,7 @@ pub fn planPutBatch(allocator: std.mem.Allocator, writes: []const batch.PutWrite
     }
     const groups = try arena_allocator.alloc(ShardWriteGroup, non_empty_groups);
 
-    var write_offsets: [runtime_shard.NUM_SHARDS]usize = [_]usize{0} ** runtime_shard.NUM_SHARDS;
+    var write_offsets: [runtime_shard.NUM_SHARDS]usize = @splat(0);
     var running_offset: usize = 0;
     var group_index: usize = 0;
     for (shard_counts, 0..) |count, shard_idx| {

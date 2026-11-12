@@ -94,7 +94,7 @@ pub fn putGroup(state: *runtime_state.DatabaseState, writes: []const types.PutWr
     var wal_writes = state.base_allocator.alloc(durability.PutBatchWrite, writes.len) catch return error.OutOfMemory;
     defer state.base_allocator.free(wal_writes);
 
-    var touched = std.StaticBitSet(runtime_shard.NUM_SHARDS).initEmpty();
+    var touched = std.bit_set.Static(runtime_shard.NUM_SHARDS).empty;
     for (writes, 0..) |write_entry, i| {
         if (write_entry.key.len == 0 or write_entry.key.len > MAX_KEY_LEN) return error.KeyTooLarge;
         wal_writes[i] = .{ .key = write_entry.key, .value = write_entry.value };

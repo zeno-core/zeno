@@ -39,9 +39,9 @@ pub const StatsCounters = struct {
     pub fn fromRuntime(counters: *const RuntimeCounters) StatsCounters {
         var result: StatsCounters = undefined;
 
-        inline for (std.meta.fields(StatsCounters)) |field| {
-            @field(result, field.name) =
-                @field(counters.*, field.name).load(.monotonic);
+        inline for (@typeInfo(StatsCounters).@"struct".field_names) |field| {
+            @field(result, field) =
+                @field(counters.*, field).load(.monotonic);
         }
 
         return result;
@@ -74,8 +74,8 @@ pub const RuntimeCounters = struct {
     /// Initializes all runtime counters to zero.
     fn init() RuntimeCounters {
         var counters: RuntimeCounters = undefined;
-        inline for (std.meta.fields(RuntimeCounters)) |field| {
-            @field(counters, field.name) = @TypeOf(@field(counters, field.name)).init(0);
+        inline for (@typeInfo(RuntimeCounters).@"struct".field_names) |field| {
+            @field(counters, field) = @TypeOf(@field(counters, field)).init(0);
         }
         return counters;
     }

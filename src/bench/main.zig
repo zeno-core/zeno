@@ -858,7 +858,7 @@ fn allocateDistinctShardWorkerKeys(allocator: std.mem.Allocator, thread_count: u
         allocator.free(keys);
     }
 
-    var used_shards = std.StaticBitSet(internal.runtime_shard.NUM_SHARDS).initEmpty();
+    var used_shards = std.bit_set.Static(internal.runtime_shard.NUM_SHARDS).empty;
     var candidate: usize = 0;
 
     for (0..thread_count) |worker_idx| {

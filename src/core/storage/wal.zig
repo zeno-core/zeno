@@ -8,6 +8,7 @@ const builtin = @import("builtin");
 const codec = @import("../internal/codec.zig");
 const storage_replay = @import("replay.zig");
 const Value = @import("../types/value.zig").Value;
+const Crc32 = std.hash.crc.@"CRC-32/ISO-HDLC";
 
 /// Record tag for insert and update payload records.
 const tag_put: u8 = 0x01;
@@ -590,7 +591,7 @@ pub const Wal = struct {
         try writeU32Le(self.allocator, &buf, @intCast(value_bytes.len));
         try buf.appendSlice(self.allocator, value_bytes);
 
-        const crc = std.hash.crc.Crc32.hash(buf.items[4..]);
+        const crc = Crc32.hash(buf.items[4..]);
         std.mem.writeInt(u32, @ptrCast(buf.items[0..4]), crc, .little);
 
         try writeAllTracked(self.state, buf.items);
@@ -655,7 +656,7 @@ fn encodeRecordInto(dst: []u8, lsn: u64, tag: u8, key: []const u8, value_bytes: 
     @memcpy(dst[cursor .. cursor + value_bytes.len], value_bytes);
     cursor += value_bytes.len;
 
-    const crc = std.hash.crc.Crc32.hash(dst[4..cursor]);
+    const crc = Crc32.hash(dst[4..cursor]);
     std.mem.writeInt(u32, @ptrCast(dst[0..4]), crc, .little);
     return dst[0..cursor];
 }
@@ -801,7 +802,7 @@ fn appendEncodedRecordPlaceholder(
 /// Allocator: Does not allocate.
 fn patchEncodedRecord(buf: []u8, record: EncodedAppendRecord, lsn: u64) void {
     std.mem.writeInt(u64, @ptrCast(buf[record.lsn_offset .. record.lsn_offset + 8]), lsn, .little);
-    const crc = std.hash.crc.Crc32.hash(buf[record.start_offset + 4 .. record.end_offset]);
+    const crc = Crc32.hash(buf[record.start_offset + 4 .. record.end_offset]);
     std.mem.writeInt(u32, @ptrCast(buf[record.start_offset .. record.start_offset + 4]), crc, .little);
 }
 
@@ -1135,7 +1136,7 @@ fn writeCraftedRecordTest(
     try writeU32Le(allocator, &buf, @intCast(value_bytes.len));
     try buf.appendSlice(allocator, value_bytes);
 
-    const crc = std.hash.crc.Crc32.hash(buf.items[4..]);
+    const crc = Crc32.hash(buf.items[4..]);
     std.mem.writeInt(u32, @ptrCast(buf.items[0..4]), crc, .little);
     try file.writeStreamingAll(std.testing.io, buf.items);
 }

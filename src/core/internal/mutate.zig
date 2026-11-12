@@ -388,7 +388,9 @@ test "validate_key rejects empty and oversized keys" {
     const testing = std.testing;
 
     try testing.expectError(error.EmptyKey, validateKey(""));
-    try testing.expectError(error.KeyTooLarge, validateKey(&[_]u8{'a'} ** (codec.MAX_KEY_LEN + 1)));
+
+    var keybuf: [codec.MAX_KEY_LEN + 1]u8 = @splat('a');
+    try testing.expectError(error.KeyTooLarge, validateKey(&keybuf));
 }
 
 test "values_equal compares nested values by content" {

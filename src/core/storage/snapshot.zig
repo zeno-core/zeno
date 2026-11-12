@@ -9,6 +9,7 @@ const art = @import("../index/art/tree.zig");
 const runtime_shard = @import("../runtime/shard.zig");
 const runtime_state = @import("../runtime/state.zig");
 const Value = @import("../types/value.zig").Value;
+const Crc32 = std.hash.crc.@"CRC-32/ISO-HDLC";
 
 /// Snapshot file magic header used for format identification.
 const MAGIC = [4]u8{ 'Z', 'E', 'N', 'S' };
@@ -52,7 +53,7 @@ const LoadedShard = struct {
 const CrcFileWriter = struct {
     io: std.Io,
     file: std.Io.File,
-    hasher: std.hash.crc.Crc32,
+    hasher: Crc32,
 
     /// Initializes a CRC-aware file writer.
     ///
@@ -63,7 +64,7 @@ const CrcFileWriter = struct {
         return .{
             .io = io,
             .file = file,
-            .hasher = std.hash.crc.Crc32.init(),
+            .hasher = Crc32.init(),
         };
     }
 
@@ -184,7 +185,7 @@ pub fn load(
 
     const data_len = file_bytes.len - 4;
     const stored_crc = std.mem.readInt(u32, file_bytes[data_len..][0..4], .little);
-    const computed_crc = std.hash.crc.Crc32.hash(file_bytes[0..data_len]);
+    const computed_crc = Crc32.hash(file_bytes[0..data_len]);
     if (stored_crc != computed_crc) return error.SnapshotCorrupted;
 
     var stream = std.Io.Reader.fixed(file_bytes[0..data_len]);
@@ -586,7 +587,7 @@ fn writeSnapshotPayloadWithCrcTest(path: []const u8, payload: []const u8) !void 
     try file.writeStreamingAll(std.testing.io, payload);
 
     var crc_buf: [4]u8 = undefined;
-    std.mem.writeInt(u32, &crc_buf, std.hash.crc.Crc32.hash(payload), .little);
+    std.mem.writeInt(u32, &crc_buf, Crc32.hash(payload), .little);
     try file.writeStreamingAll(std.testing.io, &crc_buf);
 }
 
